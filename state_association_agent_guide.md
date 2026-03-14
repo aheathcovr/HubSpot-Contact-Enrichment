@@ -93,26 +93,26 @@ sources:
 ```yaml
 state: Montana
 sources:
-  - type: SNF
-    association_name: Montana Health Care Association (MHCA)
-    association_url: https://www.montanahealthcareassociation.org
-    directory_url: https://www.montanahealthcareassociation.org/skilled-nursing-facilities.html
-    login_required: false
-    contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: All SNF facilities are listed inline on a single page. Scrape the page and match by facility name.
-    verified: true
-  - type: ALF
-    association_name: Montana Health Care Association (MHCA)
-    association_url: https://www.montanahealthcareassociation.org
-    directory_url: https://www.montanahealthcareassociation.org/assisted-living-facilities.html
-    login_required: false
-    contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: All ALF facilities are listed inline on a single page. Scrape the page and match by facility name.
-    verified: true
+- type: SNF
+  association_name: Montana Health Care Association (MHCA)
+  association_url: https://www.montanahealthcareassociation.org
+  directory_url: https://www.montanahealthcareassociation.org/skilled-nursing-facilities.html
+  login_required: false
+  contacts_available:
+  - administrator_name
+  url_pattern: null
+  access_notes: 'All SNF facilities are listed inline on a single page. Scrape the page and match by facility name. [Auto-updated: URL verified/fixed on "Found the skilled nursing facilities directory page with administrator names visible."]'
+  verified: true
+- type: ALF
+  association_name: Montana Health Care Association (MHCA)
+  association_url: https://www.montanahealthcareassociation.org
+  directory_url: https://www.montanahealthcareassociation.org/assisted-living-facilities.html
+  login_required: false
+  contacts_available:
+  - administrator_name
+  url_pattern: null
+  access_notes: All ALF facilities are listed inline on a single page. Scrape the page and match by facility name.
+  verified: true
 ```
 
 ```yaml
@@ -379,51 +379,51 @@ sources:
 ```yaml
 state: New Jersey
 sources:
-  - type: SNF
-    association_name: Health Care Association of New Jersey (HCANJ)
-    association_url: https://hcanj.org
-    directory_url: https://www.hcanj.org/facility-finder/
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Directory lists facility info only. No named contacts.
-    verified: true
-  - type: ALF/IL
-    association_name: LeadingAge New Jersey & Delaware
-    association_url: https://leadingagenjde.org
-    directory_url: https://leadingagenjde.org/consumer-resources/find-a-provider/
-    login_required: false
-    contacts_available:
-      - executive_director_name
-      - administrator_name
-      - director_of_nursing_name
-    url_pattern: null
-    access_notes: Directory lists contacts for ALFs and CCRCs/ILs.
-    verified: true
+- type: SNF
+  association_name: Health Care Association of New Jersey (HCANJ)
+  association_url: https://hcanj.org
+  directory_url: https://www.hcanj.org/facility-finder/
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Directory lists facility info only. No named contacts.
+  verified: true
+- type: ALF/IL
+  association_name: LeadingAge New Jersey & Delaware
+  association_url: https://leadingagenjde.org
+  directory_url: https://leadingagenjde.org/?post_type=providers&s=&all=Y
+  login_required: false
+  contacts_available:
+  - executive_director_name
+  - administrator_name
+  - director_of_nursing_name
+  url_pattern: null
+  access_notes: 'Directory lists contacts for ALFs and CCRCs/ILs. [Auto-updated: URL verified/fixed on "Found a working directory page with named Executive Directors listed for each provider."]'
+  verified: true
 ```
 
 ```yaml
 state: Rhode Island
 sources:
-  - type: SNF
-    association_name: Rhode Island Health Care Association (RIHCA)
-    association_url: https://www.rihca.com
-    directory_url: https://www.rihca.com/membership/facility-members/
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Directory lists facility info only. No named contacts.
-    verified: true
-  - type: ALF
-    association_name: Rhode Island Assisted Living Association (RIALA)
-    association_url: https://www.riala.org
-    directory_url: https://www.riala.org/find-assisted-living#/
-    login_required: false
-    contacts_available:
-      - executive_director_name
-    url_pattern: null
-    access_notes: Directory lists Executive Director per ALF facility.
-    verified: true
+- type: SNF
+  association_name: Rhode Island Health Care Association (RIHCA)
+  association_url: https://www.rihca.com
+  directory_url: https://www.rihca.com/membership/facility-members/
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Directory lists facility info only. No named contacts.
+  verified: true
+- type: ALF
+  association_name: Rhode Island Assisted Living Association (RIALA)
+  association_url: https://www.riala.org
+  directory_url: https://riala.memberclicks.net/find-assisted-living#/
+  login_required: false
+  contacts_available:
+  - executive_director_name
+  url_pattern: null
+  access_notes: 'Directory lists Executive Director per ALF facility. [Auto-updated: URL verified/fixed on "Found the working directory page with primary contact names listed for each facility. The original broken URL redirected to a working directory page."]'
+  verified: true
 ```
 
 ```yaml
@@ -477,50 +477,50 @@ sources:
 ```yaml
 state: Alabama
 sources:
-  - type: SNF
-    association_name: Alabama Nursing Home Association (ANHA)
-    association_url: https://anha.org
-    directory_url: https://anha.org/facility-locator/
-    login_required: false
-    contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: Facility locator lists Administrator per SNF. Verify individual facility pages.
-    verified: false
-  - type: ALF
-    association_name: Assisted Living Association of Alabama (ALAA)
-    association_url: https://alaaweb.org
-    directory_url: null
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: No public online directory. Contact the association directly for a member list.
-    verified: true
+- type: SNF
+  association_name: Alabama Nursing Home Association (ANHA)
+  association_url: https://anha.org
+  directory_url: https://anha.org/facility-locator/
+  login_required: false
+  contacts_available:
+  - administrator_name
+  url_pattern: null
+  access_notes: 'Facility locator lists Administrator per SNF. Verify individual facility pages. [Auto-updated: URL verified/fixed on "The provided URL works and lists facilities with Administrator and Director of Nursing names."]'
+  verified: false
+- type: ALF
+  association_name: Assisted Living Association of Alabama (ALAA)
+  association_url: https://alaaweb.org
+  directory_url: null
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: No public online directory. Contact the association directly for a member list.
+  verified: true
 ```
 
 ```yaml
 state: Hawaii
 sources:
-  - type: SNF
-    association_name: Healthcare Association of Hawaii (HAH)
-    association_url: https://www.hah.org
-    directory_url: https://www.hah.org/membership-list
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only. No named contacts.
-    verified: true
-  - type: ALF
-    association_name: Association of Residential Care Administrators (ARCA)
-    association_url: https://carehomeshawaii.com
-    directory_url: https://carehomeshawaii.com/wp-content/uploads/2025/05/CAREHOMES.pdf
-    login_required: false
-    contacts_available:
-      - administrator_name
-      - administrator_phone
-    url_pattern: null
-    access_notes: PDF document listing Adult Residential Care Homes with admin name and phone. Download and parse the PDF.
-    verified: true
+- type: SNF
+  association_name: Healthcare Association of Hawaii (HAH)
+  association_url: https://www.hah.org
+  directory_url: https://www.hah.org/membership-list
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Lists facility info only. No named contacts.
+  verified: true
+- type: ALF
+  association_name: Association of Residential Care Administrators (ARCA)
+  association_url: https://carehomeshawaii.com
+  directory_url: https://carehomeshawaii.com/wp-content/uploads/2025/05/CAREHOMES.pdf
+  login_required: false
+  contacts_available:
+  - administrator_name
+  - administrator_phone
+  url_pattern: null
+  access_notes: 'PDF document listing Adult Residential Care Homes with admin name and phone. Download and parse the PDF. [Auto-updated: URL verified/fixed on "Found a working PDF link with a list of care homes including last name and first name, which likely correspond to administrator/executive director names. The URL is current."]'
+  verified: true
 ```
 
 ---
@@ -532,32 +532,26 @@ The following states have directories that list contact data but require a membe
 ```yaml
 state: Florida
 sources:
-  - type: SNF
-    association_name: Florida Health Care Association (FHCA)
-    association_url: https://www.fhca.org
-    directory_url: https://www.fhcadirectory.org/directory/?ill_mobiledir_main=1
-    login_required: true
-    contacts_available:
-      - administrator_name
-      - administrator_email
-    url_pattern: https://www.fhcadirectory.org/directory/{slug}/
-    access_notes: >
-      Login is required via https://www.fhca.org/membership/directory before accessing
-      the directory app at fhcadirectory.org. A pre-authenticated browser session
-      (stored cookies) can bypass the login gate. Once authenticated, individual
-      facility pages list Administrator name and email. Note: Not all operators are
-      FHCA members. Verify the target facility appears in the directory before
-      attempting to scrape.
-    verified: true
-  - type: ALF
-    association_name: Florida Assisted Living Association (FALA)
-    association_url: https://www.fala.org
-    directory_url: https://www.fala.org/facility-members
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only. No named contacts.
-    verified: true
+- type: SNF
+  association_name: Florida Health Care Association (FHCA)
+  association_url: https://www.fhca.org
+  directory_url: https://www.fhca.org/membership/directory
+  login_required: true
+  contacts_available:
+  - administrator_name
+  - administrator_email
+  url_pattern: https://www.fhcadirectory.org/directory/{slug}/
+  access_notes: 'Login is required via https://www.fhca.org/membership/directory before accessing the directory app at fhcadirectory.org. A pre-authenticated browser session (stored cookies) can bypass the login gate. Once authenticated, individual facility pages list Administrator name and email. Note: Not all operators are FHCA members. Verify the target facility appears in the directory before attempting to scrape. [Auto-updated: URL verified/fixed on "The original directory URL is broken. The new official digital member directory requires a login to view details, including administrator/executive director names."]'
+  verified: true
+- type: ALF
+  association_name: Florida Assisted Living Association (FALA)
+  association_url: https://www.fala.org
+  directory_url: https://www.fala.org/facility-members
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Lists facility info only. No named contacts.
+  verified: true
 ```
 
 ```yaml
@@ -587,40 +581,39 @@ sources:
 ```yaml
 state: South Dakota
 sources:
-  - type: SNF/ALF
-    association_name: South Dakota Health Care Association (SDHCA)
-    association_url: https://www.sdhca.org
-    directory_url: https://www.sdhca.org/membership
-    login_required: true
-    contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: Membership directory requires a login. The public Dakota@Home state directory lists facility info only.
-    verified: false
+- type: SNF/ALF
+  association_name: South Dakota Health Care Association (SDHCA)
+  association_url: https://www.sdhca.org
+  directory_url: ''
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: 'Membership directory requires a login. The public Dakota@Home state directory lists facility info only. [Auto-updated: URL verified/fixed on "The association''s website and related state government sites do not provide a public-facing directory with administrator/executive director names. The membership directory requires a login."]'
+  verified: false
 ```
 
 ```yaml
 state: Utah
 sources:
-  - type: SNF
-    association_name: Utah Health Care Association (UHCA)
-    association_url: https://uthca.org
-    directory_url: https://uthca.org/membership/find-a-facility
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Public finder lists facility info only. No named contacts.
-    verified: true
-  - type: ALF
-    association_name: Utah Assisted Living Association (UALA)
-    association_url: https://utahassistedliving.org
-    directory_url: https://utahassistedliving.org/find_a_preferred_community.php
-    login_required: true
-    contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: Full directory requires a member login. Public version lists facility info only.
-    verified: false
+- type: SNF
+  association_name: Utah Health Care Association (UHCA)
+  association_url: https://uthca.org
+  directory_url: https://uthca.org/membership/find-a-facility
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Public finder lists facility info only. No named contacts.
+  verified: true
+- type: ALF
+  association_name: Utah Assisted Living Association (UALA)
+  association_url: https://utahassistedliving.org
+  directory_url: https://members.utahassistedliving.org/members/directory/search_bootstrap.php?org_id=UALA
+  login_required: true
+  contacts_available:
+  - administrator_name
+  url_pattern: null
+  access_notes: 'Full directory requires a member login. Public version lists facility info only. [Auto-updated: URL verified/fixed on "The directory of preferred communities is now behind a member login wall. There is no public directory available."]'
+  verified: false
 ```
 
 ---
@@ -695,24 +688,24 @@ sources:
 ```yaml
 state: California
 sources:
-  - type: SNF
-    association_name: California Association of Health Facilities (CAHF)
-    association_url: https://www.cahf.org
-    directory_url: https://www.cahfbuyersguide.com/member-directory
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only.
-    verified: true
-  - type: ALF
-    association_name: California Assisted Living Association (CALA)
-    association_url: https://caassistedliving.org
-    directory_url: https://www.caassistedliving.org/CALA/Residents___Families/Find_a_CALA_Community.aspx
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Directory was blocked by CAPTCHA during research. Likely lists facility info only.
-    verified: false
+- type: SNF
+  association_name: California Association of Health Facilities (CAHF)
+  association_url: https://www.cahf.org
+  directory_url: https://www.cahfbuyersguide.com/member-directory
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: 'Lists facility info only. [Auto-updated: URL verified/fixed on "The member directory lists facilities with contact information (phone, website) but does not explicitly show administrator/executive director names."]'
+  verified: true
+- type: ALF
+  association_name: California Assisted Living Association (CALA)
+  association_url: https://caassistedliving.org
+  directory_url: https://www.caassistedliving.org/CALA/Residents___Families/Find_a_CALA_Community.aspx
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Directory was blocked by CAPTCHA during research. Likely lists facility info only.
+  verified: false
 ```
 
 ```yaml
@@ -741,24 +734,24 @@ sources:
 ```yaml
 state: Georgia
 sources:
-  - type: SNF
-    association_name: Georgia Health Care Association (GHCA)
-    association_url: https://www.ghca.info
-    directory_url: https://directory.ghca.info/
-    login_required: false
-    contacts_available: []
-    url_pattern: https://directory.ghca.info/listing/{slug}/
-    access_notes: Individual facility pages exist but do not consistently display named contacts. Verify before use.
-    verified: true
-  - type: ALF
-    association_name: Georgia Senior Living Association (GSLA)
-    association_url: https://www.gasla.org
-    directory_url: https://web.gasla.org/prod/search
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only.
-    verified: true
+- type: SNF
+  association_name: Georgia Health Care Association (GHCA)
+  association_url: https://www.ghca.info
+  directory_url: https://directory.ghca.info/directory/
+  login_required: false
+  contacts_available: []
+  url_pattern: https://directory.ghca.info/listing/{slug}/
+  access_notes: 'Individual facility pages exist but do not consistently display named contacts. Verify before use. [Auto-updated: URL verified/fixed on "The directory page loads and lists facilities, but does not show administrator/executive director names. The provided working URL is correct."]'
+  verified: true
+- type: ALF
+  association_name: Georgia Senior Living Association (GSLA)
+  association_url: https://www.gasla.org
+  directory_url: https://web.gasla.org/prod/search
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Lists facility info only.
+  verified: true
 ```
 
 ```yaml
@@ -787,24 +780,24 @@ sources:
 ```yaml
 state: Louisiana
 sources:
-  - type: SNF
-    association_name: Louisiana Nursing Home Association (LNHA)
-    association_url: https://lnha.org
-    directory_url: https://www.lnha.org/findafacility/
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only.
-    verified: true
-  - type: ALF
-    association_name: Mississippi-Louisiana Assisted Living Association (MSLALA)
-    association_url: https://mslala.org
-    directory_url: null
-    login_required: true
-    contacts_available: []
-    url_pattern: null
-    access_notes: Member directory is not publicly accessible.
-    verified: false
+- type: SNF
+  association_name: Louisiana Nursing Home Association (LNHA)
+  association_url: https://lnha.org
+  directory_url: https://www.lnha.org/findafacility/#/action/AdvancedSearch/cid/534/id/401/listingtype/O/category/118
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: 'Lists facility info only. [Auto-updated: URL verified/fixed on "The facility directory page is working and lists facilities with addresses and phone numbers. However, no named administrator or executive director contacts are visible on the page."]'
+  verified: true
+- type: ALF
+  association_name: Mississippi-Louisiana Assisted Living Association (MSLALA)
+  association_url: https://mslala.org
+  directory_url: null
+  login_required: true
+  contacts_available: []
+  url_pattern: null
+  access_notes: Member directory is not publicly accessible.
+  verified: false
 ```
 
 ```yaml
@@ -922,24 +915,24 @@ sources:
 ```yaml
 state: New Hampshire
 sources:
-  - type: SNF
-    association_name: New Hampshire Health Care Association (NHHCA)
-    association_url: https://www.nhhca.org
-    directory_url: https://www.nhhca.org/find-care/
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only.
-    verified: true
-  - type: ALF
-    association_name: New Hampshire Association of Residential Care Homes (NHARCH)
-    association_url: https://nharch.org
-    directory_url: https://nharch.org/member-directory/
-    login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Lists facility info only.
-    verified: true
+- type: SNF
+  association_name: New Hampshire Health Care Association (NHHCA)
+  association_url: https://www.nhhca.org
+  directory_url: https://www.nhhca.org/find-care/
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: 'Lists facility info only. [Auto-updated: URL verified/fixed on "The ''Find Care'' page loads and lists facilities by city, but does not display administrator/executive director names. It provides a search function and a list of facilities."]'
+  verified: true
+- type: ALF
+  association_name: New Hampshire Association of Residential Care Homes (NHARCH)
+  association_url: https://nharch.org
+  directory_url: https://nharch.org/member-directory/
+  login_required: false
+  contacts_available: []
+  url_pattern: null
+  access_notes: Lists facility info only.
+  verified: true
 ```
 
 ```yaml
