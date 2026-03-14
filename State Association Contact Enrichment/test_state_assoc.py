@@ -108,6 +108,7 @@ def main():
         lookup_hubspot_contact_enhanced,
         _format_hubspot_matches_enhanced,
         RATE_LIMIT_SECONDS,
+        RESEARCH_SYSTEM_PROMPT,
     )
     
     results = []
@@ -135,7 +136,7 @@ def main():
         hubspot_match_summary = ""
         
         try:
-            prompt = _build_facility_research_prompt(
+            prompt, source_tier = _build_facility_research_prompt(
                 facility_name=facility_name,
                 city=city,
                 state=state,
@@ -143,7 +144,7 @@ def main():
                 corporation_name=corp_name,
             )
             print(f"  → Calling Perplexity Sonar Pro...")
-            research_result = call_openrouter(prompt)
+            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
             print(f"  ✓ Response received ({len(research_result)} chars)")
             
             # Parse the found name (now includes email and phone)

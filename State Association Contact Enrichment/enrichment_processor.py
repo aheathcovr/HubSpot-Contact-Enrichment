@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -39,6 +40,7 @@ from state_association_matcher import (
     parse_found_name,
     workflow_2_research_contacts,
     RATE_LIMIT_SECONDS,
+    RESEARCH_SYSTEM_PROMPT,
 )
 from utils.bigquery_client import init_bigquery_client
 
@@ -81,6 +83,11 @@ class ContactAction:
     target_company_id: str = ""
     detail: str = ""
     source_urls: list[str] = field(default_factory=list)
+    # Research metadata — used to build the salesperson-readable note
+    confidence: str = ""        # "high" | "medium" | "low" | "not_found"
+    source_tier: str = ""       # "1" | "2" | "3" — state association tier
+    found_email: str = ""
+    found_phone: str = ""
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -159,29 +166,32 @@ def _process_found_contact(
     target_company_id: str,
     facility_name: str,
     research_findings: str,
+    source_tier: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
     """
     source_urls = _extract_urls(research_findings)[:20]
 
+    _base = dict(
+        confidence=confidence,
+        source_tier=source_tier,
+        found_email=found_email,
+        found_phone=found_phone,
+        source_urls=source_urls,
+        facility_name=facility_name,
+        target_company_id=target_company_id,
+    )
+
     if not found_name or confidence == "not_found":
-        return ContactAction(
-            action="no_contact_found",
-            facility_name=facility_name,
-            target_company_id=target_company_id,
-            detail="No contact identified by research",
-            source_urls=source_urls,
-        )
+        return ContactAction(action="no_contact_found", detail="No contact identified by research", **_base)
 
     first, last = _split_name(found_name)
     if not first:
         return ContactAction(
             action="no_contact_found",
-            facility_name=facility_name,
-            target_company_id=target_company_id,
             detail=f"Could not parse name: '{found_name}'",
-            source_urls=source_urls,
+            **_base,
         )
 
     # ── Pre-populated IDs from BigQuery HubSpot lookup (W1) ──────────────────
@@ -195,10 +205,8 @@ def _process_found_contact(
                     contact_id=contact_id,
                     contact_name=found_name,
                     contact_title=found_title,
-                    facility_name=facility_name,
-                    target_company_id=target_company_id,
                     detail=f"Added association to existing contact #{contact_id}",
-                    source_urls=source_urls,
+                    **_base,
                 )
             except HubSpotError as exc:
                 logger.warning(f"Association failed for contact {contact_id}: {exc}")
@@ -215,10 +223,8 @@ def _process_found_contact(
                         contact_id=contact["id"],
                         contact_name=found_name,
                         contact_title=found_title,
-                        facility_name=facility_name,
-                        target_company_id=target_company_id,
                         detail=f"Email match → added association to existing #{contact['id']}",
-                        source_urls=source_urls,
+                        **_base,
                     )
                 except HubSpotError as exc:
                     logger.warning(f"Email-match association failed: {exc}")
@@ -238,10 +244,8 @@ def _process_found_contact(
             contact_id=new_id,
             contact_name=found_name,
             contact_title=found_title,
-            facility_name=facility_name,
-            target_company_id=target_company_id,
             detail=f"Created new contact #{new_id} and associated with company {target_company_id}",
-            source_urls=source_urls,
+            **_base,
         )
     except HubSpotError as exc:
         logger.error(f"Failed to create contact for '{found_name}': {exc}")
@@ -249,10 +253,8 @@ def _process_found_contact(
             action="error",
             contact_name=found_name,
             contact_title=found_title,
-            facility_name=facility_name,
-            target_company_id=target_company_id,
             detail=f"HubSpot API error: {exc}",
-            source_urls=source_urls,
+            **_base,
         )
 
 
@@ -265,12 +267,14 @@ def _run_workflow1_single_facility(
     company_id: str,
     props: dict,
     parent_corp_name: str,
+    missing: "pd.DataFrame | None" = None,
 ) -> list[dict]:
     """
     Run Workflow 1 research on a single child facility.
 
     Checks whether the facility already has an Administrator or Executive Director
-    in HubSpot. If not, calls OpenRouter to find one via state association sites.
+    in HubSpot (unless `missing` is pre-supplied by the caller). If not found,
+    calls OpenRouter to find one via state association sites.
 
     Returns a list of result dicts matching the schema of
     workflow_1_research_facilities() so the rest of the pipeline is identical.
@@ -298,7 +302,9 @@ def _run_workflow1_single_facility(
     }])
 
     # Check whether this facility already has an Admin/ED in HubSpot
-    missing = find_facilities_missing_leadership(bq_client, facility_df)
+    # (use pre-computed result if caller ran this concurrently)
+    if missing is None:
+        missing = find_facilities_missing_leadership(bq_client, facility_df)
     if missing.empty:
         logger.info(f"  ✅ {facility_name} already has an Admin/ED in HubSpot — skipping")
         return []
@@ -339,7 +345,7 @@ def _run_workflow1_single_facility(
         result["source_tier"] = source_tier
 
         logger.info(f"  Calling OpenRouter for {facility_name}...")
-        research_result = call_openrouter(prompt)
+        research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 
@@ -386,6 +392,27 @@ def _run_workflow1_single_facility(
 # ── Note builder ──────────────────────────────────────────────────────────────
 
 
+_CONFIDENCE_LABELS = {
+    "high":      "HIGH  — found on official association directory or CMS listing",
+    "medium":    "MED   — found on facility/operator website",
+    "low":       "LOW   — found on LinkedIn or potentially outdated source",
+    "not_found": "—     — not found",
+}
+
+_TIER_LABELS = {
+    "1": "Tier 1 — public directory (no login required)",
+    "2": "Tier 2 — login-required or members-only directory",
+    "3": "Tier 3 — no state directory available; web search only",
+}
+
+_ACTION_LABELS = {
+    "created_new":       "✚ Created new HubSpot contact",
+    "associated_existing": "🔗 Linked to existing HubSpot contact",
+    "no_contact_found":  "○ No contact identified",
+    "error":             "✗ Error",
+}
+
+
 def _build_note(
     company_name: str,
     workflow_label: str,
@@ -393,56 +420,117 @@ def _build_note(
     actions: list[ContactAction],
     errors: list[str],
 ) -> str:
-    """Build the summary note body for the company record."""
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d UTC")
+    """
+    Build the salesperson-readable summary note for the company record.
 
-    n_found = sum(1 for a in actions if a.action != "no_contact_found")
+    Designed to answer three questions at a glance:
+      1. What did the automation look for and where?
+      2. Who did it find (and how reliable is that information)?
+      3. How can I quickly verify or disprove the finding?
+    """
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    divider = "─" * 66
+
+    n_found = sum(1 for a in actions if a.action not in ("no_contact_found", "error"))
     n_created = sum(1 for a in actions if a.action == "created_new")
     n_associated = sum(1 for a in actions if a.action == "associated_existing")
+    n_missed = sum(1 for a in actions if a.action == "no_contact_found")
 
     lines: list[str] = [
-        f"RevOps Enrichment — {company_name}",
-        f"Date: {now_str}",
-        f"Workflow: {workflow_label}",
+        f"RevOps Contact Enrichment  ·  {company_name}",
+        f"Run date:  {now_str}",
+        f"Workflow:  {workflow_label}",
         "",
-        f"Records researched: {len(results)} | "
-        f"Contacts found: {n_found} | "
-        f"Created: {n_created} | "
-        f"Associated: {n_associated}",
+        f"Summary:  {len(results)} researched  ·  {n_found} found  ·  "
+        f"{n_created} created  ·  {n_associated} linked  ·  {n_missed} not found",
         "",
+        divider,
+        "WHAT WAS SEARCHED",
+        divider,
     ]
 
-    for action in actions:
-        if action.action == "no_contact_found":
-            label = action.facility_name or action.contact_name or "Unknown"
-            lines.append(f"  • {label} — No administrator/ED identified")
-        else:
-            label = action.facility_name or action.contact_name or "Unknown"
-            if action.action == "created_new":
-                status = f"Created new contact #{action.contact_id}"
-            elif action.action == "associated_existing":
-                status = f"Added association to existing contact #{action.contact_id}"
-            else:
-                status = f"Error: {action.detail}"
-            lines.append(f"  • {label} — {action.contact_name}, {action.contact_title}")
-            lines.append(f"    Action: {status}")
+    # Describe data sources consulted
+    lines.append("  Data sources (checked in this order):")
+    lines.append("    1. Definitive Healthcare Executives table (BigQuery)")
+    lines.append("    2. Definitive Healthcare Contact Full Feed (BigQuery)")
 
-    # Source URLs
+    # Pull tier info from first result that has it
+    tier_str = ""
+    for r in results:
+        t = str(r.get("source_tier", ""))
+        if t:
+            tier_str = t
+            break
+    if tier_str:
+        tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
+        lines.append(f"    3. State association directory — {tier_label}")
+    else:
+        lines.append("    3. State association directory")
+    lines.append("    4. Web search via Perplexity Sonar Pro (live internet search)")
+    lines.append("")
+
+    # ── Per-contact results ─────────────────────────────────────────────────
+    lines += [divider, "RESULTS", divider]
+
+    for action in actions:
+        label = action.facility_name or action.contact_name or "Unknown"
+        lines.append(f"  ● {label}")
+
+        if action.action in ("created_new", "associated_existing"):
+            conf_label = _CONFIDENCE_LABELS.get(action.confidence, action.confidence)
+            lines.append(f"    Contact:    {action.contact_name},  {action.contact_title}")
+            lines.append(f"    Confidence: {conf_label}")
+            if action.found_email:
+                lines.append(f"    Email:      {action.found_email}")
+            if action.found_phone:
+                lines.append(f"    Phone:      {action.found_phone}")
+            act_label = _ACTION_LABELS.get(action.action, action.action)
+            contact_ref = f" #{action.contact_id}" if action.contact_id else ""
+            lines.append(f"    HubSpot:    {act_label}{contact_ref}")
+
+        elif action.action == "no_contact_found":
+            lines.append(f"    Result:     No administrator or Executive Director identified")
+            if action.detail and action.detail != "No contact identified by research":
+                lines.append(f"    Detail:     {action.detail}")
+
+        else:  # error
+            lines.append(f"    Result:     Error — {action.detail}")
+
+        lines.append("")
+
+    # ── How to verify ────────────────────────────────────────────────────────
+    # Collect all source URLs across all actions
     all_urls: list[str] = []
-    seen: set[str] = set()
+    seen_urls: set[str] = set()
     for action in actions:
         for url in action.source_urls:
-            if url not in seen:
-                seen.add(url)
+            if url not in seen_urls:
+                seen_urls.add(url)
                 all_urls.append(url)
 
-    if all_urls:
-        lines += ["", "── SOURCES ───────────────────────────────────────────────────────────"]
-        for url in all_urls[:20]:
-            lines.append(f"  {url}")
+    lines += [divider, "HOW TO VERIFY", divider]
+    lines.append("  Quick checks to confirm or disprove these findings:")
+    lines.append("")
+    lines.append("  • CMS Care Compare (search by facility name for current leadership):")
+    lines.append("    https://www.medicare.gov/care-compare/")
+    lines.append("")
 
+    if all_urls:
+        lines.append("  • Sources cited by the web search agent:")
+        for url in all_urls[:15]:
+            lines.append(f"    {url}")
+        lines.append("")
+
+    if tier_str == "1":
+        lines.append("  • State association directory was public — check the URL in sources above")
+    elif tier_str == "2":
+        lines.append("  • State association directory requires login — verify through direct outreach")
+    else:
+        lines.append("  • No state directory available for this state — web search was primary source")
+
+    # ── Errors ───────────────────────────────────────────────────────────────
     if errors:
-        lines += ["", "── ERRORS ────────────────────────────────────────────────────────────"]
+        lines += ["", divider, "ERRORS / WARNINGS", divider]
         for err in errors:
             lines.append(f"  {err}")
 
@@ -513,14 +601,39 @@ def run_enrichment(company_id: str) -> None:
         # ── Workflow 1: research this specific child facility ─────────────────
         workflow_label = "Workflow 1 — Facility Leadership Research"
         if bq_client:
-            # Get parent corp name for the research prompt
-            parent_corp_name = company_name  # fallback
-            if parent_company_id:
+            # Build the facility DataFrame here (no I/O) so both concurrent
+            # tasks below can use it immediately.
+            facility_df = pd.DataFrame([{
+                "hubspot_id": company_id,
+                "facility_name": props.get("name", "Unknown Facility"),
+                "facility_type": props.get("facility_type", "") or "",
+                "hierarchy_type": props.get("hierarchy_type", ""),
+                "city": props.get("city", "") or "",
+                "state": props.get("state", "") or "",
+                "address": "",
+                "zip": "",
+                "phone": "",
+                "definitive_id": props.get("definitive_healthcare_id", "") or "",
+            }])
+
+            def _fetch_parent_name() -> str:
+                if not parent_company_id:
+                    return company_name
                 try:
                     parent_props = hs.get_company_properties(parent_company_id)
-                    parent_corp_name = parent_props.get("name") or company_name
+                    return parent_props.get("name") or company_name
                 except HubSpotError:
-                    pass
+                    return company_name
+
+            # Run parent name fetch (HubSpot API) and BQ leadership check
+            # concurrently — both are I/O-bound and independent of each other.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_parent  = executor.submit(_fetch_parent_name)
+                future_missing = executor.submit(
+                    find_facilities_missing_leadership, bq_client, facility_df
+                )
+            parent_corp_name = future_parent.result()
+            missing_df       = future_missing.result()
 
             try:
                 results = _run_workflow1_single_facility(
@@ -529,6 +642,7 @@ def run_enrichment(company_id: str) -> None:
                     company_id=company_id,
                     props=props,
                     parent_corp_name=parent_corp_name,
+                    missing=missing_df,
                 )
             except Exception as exc:
                 logger.exception(f"Workflow 1 failed: {exc}")
@@ -598,6 +712,7 @@ def run_enrichment(company_id: str) -> None:
             target_company_id=target_id,
             facility_name=result.get("facility_name", "") or result.get("contact_name", ""),
             research_findings=result.get("research_findings", ""),
+            source_tier=str(result.get("source_tier", "")),
         )
         actions.append(action)
         if action.action == "error":

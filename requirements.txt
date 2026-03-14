@@ -7,6 +7,7 @@ requests==2.32.3
 
 # Google Cloud
 google-cloud-bigquery==3.27.0
+google-cloud-storage==2.19.0
 google-auth==2.37.0
 pandas==2.2.3
 pyarrow==18.1.0

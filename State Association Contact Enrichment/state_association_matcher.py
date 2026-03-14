@@ -42,15 +42,23 @@ Environment Variables
   GOOGLE_APPLICATION_CREDENTIALS  Path to GCP service account key file
 """
 
+import hashlib
+import json
+import logging
 import os
 import re
 import sys
 import time
 import csv
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 
 # ─── PyYAML (for state association guide parsing) ─────────────────────────────
@@ -97,11 +105,118 @@ DH_TABLES = {
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "perplexity/sonar-pro")
+GCS_CACHE_BUCKET    = os.getenv("GCS_CACHE_BUCKET", "")
 
 # Titles that identify facility-level leadership we care about
 TARGET_TITLES = {"executive director", "administrator"}
 
 RATE_LIMIT_SECONDS = 2.5  # Pause between OpenRouter calls to avoid rate-limiting
+
+# ─── LLM helpers ──────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
+
+# Stable system prompt shared by both research workflows.
+# Kept here so the user portions returned by the prompt builders stay variable-only,
+# enabling safe response caching (temperature=0).
+RESEARCH_SYSTEM_PROMPT = """\
+You are a healthcare market research specialist finding verified contact information \
+for facility leadership (Administrator, Executive Director, Director of Nursing) at \
+US senior care facilities.
+
+Search methodology — follow this order for every lookup:
+1. Check the specific association directory or URL listed in the request
+2. Search CMS Care Compare (medicare.gov/care-compare) for the facility or person
+3. Check the facility or operator's own website for a staff/leadership page
+4. Search LinkedIn as a last resort: "[Facility Name] administrator site:linkedin.com"
+
+Accuracy rules (strictly enforced):
+- Report ONLY names found directly on a verifiable source — do not infer or combine partial information
+- confidence="high"      → name appears on an official association directory or CMS listing
+- confidence="medium"    → name found on facility website or operator site only
+- confidence="low"       → found on LinkedIn, a news mention, or a source that may be outdated
+- confidence="not_found" → no verified name located; never guess or hallucinate a name
+
+Always cite the exact URL where you found the name.
+Always end your response with the JSON block specified in the user message.\
+"""
+
+# Disk cache for LLM responses — used as fallback when GCS_CACHE_BUCKET is not set.
+# Safe because all calls use temperature=0. Delete to force fresh lookups.
+_LLM_CACHE_DIR = Path(__file__).parent / ".llm_cache"
+
+# GCS cache client — lazily initialized on first use, shared across all threads.
+_gcs_client_lock     = threading.Lock()
+_gcs_client_instance = None   # google.cloud.storage.Client or False (unavailable)
+
+
+def _get_gcs_client():
+    """Return a shared GCS client, or False if GCS is unavailable/unconfigured."""
+    global _gcs_client_instance
+    if _gcs_client_instance is None:
+        with _gcs_client_lock:
+            if _gcs_client_instance is None:
+                try:
+                    from google.cloud import storage as _gcs
+                    _gcs_client_instance = _gcs.Client()
+                except Exception as exc:
+                    logger.warning("GCS client unavailable (%s) — using disk cache", exc)
+                    _gcs_client_instance = False
+    return _gcs_client_instance
+
+
+def _gcs_cache_get(key: str) -> Optional[str]:
+    """Return cached LLM response from GCS, or None on miss/error."""
+    client = _get_gcs_client()
+    if not client:
+        return None
+    try:
+        blob = client.bucket(GCS_CACHE_BUCKET).blob(f"llm_cache/{key}.json")
+        if blob.exists():
+            logger.info("GCS LLM cache hit (key=%s)", key)
+            return json.loads(blob.download_as_text())["response"]
+    except Exception as exc:
+        logger.warning("GCS cache get failed (key=%s): %s", key, exc)
+    return None
+
+
+def _gcs_cache_set(key: str, response: str) -> None:
+    """Write LLM response to GCS cache. Fails silently."""
+    client = _get_gcs_client()
+    if not client:
+        return
+    try:
+        blob = client.bucket(GCS_CACHE_BUCKET).blob(f"llm_cache/{key}.json")
+        blob.upload_from_string(
+            json.dumps({"response": response}),
+            content_type="application/json",
+        )
+    except Exception as exc:
+        logger.warning("GCS cache set failed (key=%s): %s", key, exc)
+
+
+# Persistent HTTP session for OpenRouter — reuses TCP connections across calls.
+def _build_openrouter_session() -> requests.Session:
+    retry = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.headers.update({
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/HubSpot-Definitive-Matching",
+        "X-Title":       "State Association Matcher",
+    })
+    return session
+
+
+_OPENROUTER_SESSION = _build_openrouter_session()
+
+# Concurrency settings for workflow loops.
+# _MAX_WORKERS threads run simultaneously; the semaphore limits live API calls
+# to the same number so rate limiting stays predictable.
+_MAX_WORKERS        = 3
+_OPENROUTER_SEMAPHORE = threading.Semaphore(_MAX_WORKERS)
 
 # Output filenames (timestamped so successive runs never overwrite each other)
 _TS                = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -133,9 +248,18 @@ _GUIDE_CACHE: tuple[list[dict], list[dict]] | None = None
 
 # ─── OpenRouter helpers ───────────────────────────────────────────────────────
 
-def call_openrouter(prompt: str, model: str = OPENROUTER_MODEL) -> str:
+def call_openrouter(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = OPENROUTER_MODEL,
+) -> str:
     """
     Call the OpenRouter chat-completions endpoint and return the response text.
+
+    Uses temperature=0 for deterministic structured output and a shared persistent
+    HTTP session (TCP connection reuse).  Responses are cached:
+      - In GCS (cross-instance, persistent) when GCS_CACHE_BUCKET env var is set.
+      - On disk (.llm_cache/) as a fallback for local development.
 
     Raises:
         RuntimeError: if OPENROUTER_API_KEY is not set or the request fails.
@@ -146,31 +270,55 @@ def call_openrouter(prompt: str, model: str = OPENROUTER_MODEL) -> str:
             "Export it as an environment variable before running this script."
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/HubSpot-Definitive-Matching",
-        "X-Title":       "State Association Matcher",
-    }
+    # ── Cache key (shared between GCS and disk backends) ─────────────────────
+    cache_key = hashlib.sha256(
+        (system_prompt + user_prompt + model).encode()
+    ).hexdigest()[:20]
+
+    # ── GCS cache lookup (production) ────────────────────────────────────────
+    if GCS_CACHE_BUCKET:
+        cached = _gcs_cache_get(cache_key)
+        if cached is not None:
+            return cached
+    else:
+        # ── Disk cache fallback (local dev) ───────────────────────────────────
+        cache_file = _LLM_CACHE_DIR / f"{cache_key}.json"
+        if cache_file.exists():
+            logger.info("Disk LLM cache hit (key=%s)", cache_key)
+            return json.loads(cache_file.read_text())["response"]
+
+    # ── Call OpenRouter via shared session ───────────────────────────────────
     payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "model":       model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
     }
 
     try:
-        response = requests.post(
+        response = _OPENROUTER_SESSION.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers=headers,
             json=payload,
             timeout=90,
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        result = data["choices"][0]["message"]["content"].strip()
     except requests.HTTPError as e:
         raise RuntimeError(f"OpenRouter HTTP error: {e.response.status_code} — {e.response.text}") from e
     except Exception as e:
         raise RuntimeError(f"OpenRouter call failed: {e}") from e
+
+    # ── Cache write ───────────────────────────────────────────────────────────
+    if GCS_CACHE_BUCKET:
+        _gcs_cache_set(cache_key, result)
+    else:
+        _LLM_CACHE_DIR.mkdir(exist_ok=True)
+        ((_LLM_CACHE_DIR / f"{cache_key}.json")).write_text(json.dumps({"response": result}))
+
+    return result
 
 
 def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
@@ -197,10 +345,17 @@ def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
             conf  = str(data.get("confidence",  "not_found") or "not_found").strip().lower()
             email = str(data.get("found_email", "") or "").strip()
             phone = str(data.get("found_phone", "") or "").strip()
+            if conf not in ("high", "medium", "low", "not_found"):
+                logger.warning("parse_found_name: unexpected confidence value %r — treating as not_found", conf)
+                conf = "not_found"
             return name, title, conf, email, phone
         except (json.JSONDecodeError, AttributeError):
             continue
 
+    logger.warning(
+        "parse_found_name: no valid JSON block in response (response_len=%d)",
+        len(research_text),
+    )
     return "", "", "not_found", "", ""
 
 
@@ -310,59 +465,64 @@ def lookup_hubspot_contact_enhanced(
         except Exception as e:
             print(f"    ⚠ HubSpot phone lookup failed: {e}")
 
-    # ── Strategy 3-5: Name lookup with company association priority ─────────────
+    # ── Strategy 3-5: Name lookup with association priority ranked in SQL ───────
     if first_name and last_name:
-        # Build base name query
+        # CASE expression ranks rows so that matches at the specific facility come
+        # first (1), then parent company (2), then any other company (3).
+        # A single query replaces three sequential Python filter passes.
+        facility_case = (
+            f"WHEN CAST(properties_associatedcompanyid AS STRING) = '{facility_hubspot_id}' THEN 1"
+            if facility_hubspot_id else ""
+        )
+        parent_case = (
+            f"WHEN CAST(properties_associatedcompanyid AS STRING) = '{parent_hubspot_id}' THEN 2"
+            if parent_hubspot_id else ""
+        )
         name_query = f"""
         SELECT
-            CAST(properties_hs_object_id AS STRING)      AS contact_id,
-            properties_firstname                          AS first_name,
-            properties_lastname                           AS last_name,
-            properties_email                              AS email,
-            properties_phone                              AS phone,
-            properties_mobilephone                        AS mobile_phone,
-            properties_jobtitle                           AS job_title,
-            CAST(properties_associatedcompanyid AS STRING) AS associated_company_id
+            CAST(properties_hs_object_id AS STRING)       AS contact_id,
+            properties_firstname                           AS first_name,
+            properties_lastname                            AS last_name,
+            properties_email                               AS email,
+            properties_phone                               AS phone,
+            properties_mobilephone                         AS mobile_phone,
+            properties_jobtitle                            AS job_title,
+            CAST(properties_associatedcompanyid AS STRING) AS associated_company_id,
+            CASE
+                {facility_case}
+                {parent_case}
+                ELSE 3
+            END AS _priority
         FROM `{HUBSPOT_CONTACTS_TABLE}`
         WHERE (archived IS NOT TRUE OR archived IS NULL)
           AND LOWER(TRIM(properties_firstname)) = LOWER('{first_name}')
           AND LOWER(TRIM(properties_lastname))  = LOWER('{last_name}')
+        ORDER BY _priority, contact_id
+        LIMIT 20
         """
 
         try:
             rows = client.query(name_query).to_dataframe()
             rows = rows.replace(["nan", "None", "<NA>"], "")
-            name_matches = rows.to_dict("records")
 
-            if not name_matches:
+            if rows.empty:
                 return [], "name_not_found"
 
-            # Priority 3: Match at the specific facility
-            if facility_hubspot_id:
-                facility_matches = [
-                    m for m in name_matches
-                    if m.get("associated_company_id") == facility_hubspot_id
-                ]
-                if facility_matches:
-                    for m in facility_matches:
-                        m["match_type"] = "name_facility_match"
-                    return facility_matches, "name_facility"
+            # All rows at the highest priority (lowest _priority value)
+            best = int(rows["_priority"].min())
+            top_rows = rows[rows["_priority"] == best].drop(columns=["_priority"])
+            matches = top_rows.to_dict("records")
 
-            # Priority 4: Match at the parent company
-            if parent_hubspot_id:
-                parent_matches = [
-                    m for m in name_matches
-                    if m.get("associated_company_id") == parent_hubspot_id
-                ]
-                if parent_matches:
-                    for m in parent_matches:
-                        m["match_type"] = "name_parent_match"
-                    return parent_matches, "name_parent"
+            strategy_map = {1: "name_facility", 2: "name_parent", 3: "name_any"}
+            match_type_map = {
+                1: "name_facility_match",
+                2: "name_parent_match",
+                3: "name_any_match",
+            }
+            for m in matches:
+                m["match_type"] = match_type_map[best]
 
-            # Priority 5: Any name match (may be at other companies)
-            for m in name_matches:
-                m["match_type"] = "name_any_match"
-            return name_matches, "name_any"
+            return matches, strategy_map[best]
 
         except Exception as e:
             print(f"    ⚠ HubSpot name lookup failed for '{full_name}': {e}")
@@ -728,29 +888,41 @@ def _build_contact_research_prompt(
             f"- {state_label} assisted living or senior living association directory"
         )
 
-    return f"""You are a healthcare market research assistant. I need you to search publicly
-available state association websites and directories to find information about the following
-person:
+    return f"""I need you to search publicly available state association websites and
+directories to find information about the following person:
 
 Contact Name: {contact_name}
 Known Title:  {title}
 Corporation:  {corporation_name}
 Location:     {state_context}
 
-Please search the following types of sources:
+Search these sources in order, stopping when you find a verified match:
 {assoc_block}
 - CMS Care Compare / Nursing Home Compare listings for {corporation_name} facilities
   (https://www.medicare.gov/care-compare/)
 - LinkedIn or professional directories for "{contact_name}" + "{title}"
 
+For each source you check, briefly note: source name → result (found / not found / inaccessible).
+
 Report back:
 1. Whether you found this person listed on any state association or regulatory website
 2. The specific facility or facilities they are listed at (name, address, city, state)
 3. Their contact information if publicly listed (phone, email)
-4. The source URL where you found this information
+4. The exact URL where you found this information
 5. Any notes about their current role or facility affiliation
 
-If you cannot find this person, say so explicitly and note which sources you checked."""
+If you cannot find this person, say so explicitly and note which sources you checked
+and why each was inconclusive.
+
+At the very end of your response, include this JSON block (fill in what you found):
+```json
+{{"found_name": "First Last", "found_title": "Administrator", "found_email": "email@example.com", "found_phone": "555-123-4567", "confidence": "high"}}
+```
+Valid confidence values: "high", "medium", "low", "not_found".
+If no person was found, use:
+```json
+{{"found_name": "", "found_title": "", "found_email": "", "found_phone": "", "confidence": "not_found"}}
+```"""
 
 
 def _build_facility_research_prompt(
@@ -783,25 +955,28 @@ def _build_facility_research_prompt(
         state=state, facility_name=facility_name, city=city,
     )
 
-    prompt = f"""You are a healthcare market research assistant. I need you to find the current
-administrator or executive director for the following healthcare facility:
+    prompt = f"""I need you to find the current administrator or executive director
+for the following healthcare facility:
 
 Facility Name:   {facility_name}
 Location:        {location}
 Facility Type:   {type_desc}
 Parent Company:  {corporation_name}
 
-Please search the following sources:
+Search these sources in order, stopping when you find a verified name:
 {source_text}
+
+For each source you check, briefly note: source name → result (found / not found / inaccessible).
 
 Report back:
 1. The name of the current administrator or executive director (if found)
-2. Their job title exactly as listed
+2. Their job title exactly as listed at the source
 3. Their contact information if publicly available (phone, email)
-4. The source URL where you found this information
-5. Any notes (e.g., recently changed leadership, facility under new management)
+4. The exact URL where you found this information
+5. Any notes (e.g., recently changed leadership, listing may be outdated)
 
-If you cannot find leadership information, say so explicitly and list which sources you checked.
+If you cannot find leadership information after checking all sources, say so explicitly
+and list which sources you checked and why each was inconclusive.
 
 At the very end of your response, include this JSON block (fill in what you found):
 ```json
@@ -1087,6 +1262,167 @@ def find_facilities_missing_leadership(
     return missing.reset_index(drop=True)
 
 
+# ─── Concurrent worker functions ─────────────────────────────────────────────
+
+def _research_one_contact(
+    row: dict,
+    corporation_name: str,
+    network_id: int,
+    facility_type: str,
+) -> dict:
+    """
+    Worker for workflow_2.  Runs in a thread pool — one unassociated contact per call.
+
+    Acquires _OPENROUTER_SEMAPHORE before calling the API to cap concurrency at
+    _MAX_WORKERS, then sleeps RATE_LIMIT_SECONDS inside the semaphore so each slot
+    turns over at a controlled rate before being released.
+    """
+    contact_name = (
+        f"{row.get('FIRST_NAME', '')} {row.get('LAST_NAME', '')}".strip()
+        or str(row.get("EXECUTIVE_NAME", "Unknown"))
+    )
+    title    = str(row.get("title", "")).title()
+    state    = str(row.get("state", ""))
+    email    = str(row.get("EMAIL", ""))
+    phone    = str(row.get("DIRECT_PHONE") or row.get("LOCATION_PHONE") or "")
+    linkedin = str(row.get("LINKEDIN_PROFILE", ""))
+    source   = str(row.get("source_table", ""))
+
+    result: dict = {
+        "workflow":           "2 - Unassociated Contact",
+        "executive_id":       row.get("EXECUTIVE_ID", ""),
+        "contact_name":       contact_name,
+        "title":              title,
+        "email":              email,
+        "phone":              phone,
+        "linkedin":           linkedin,
+        "definitive_source":  source,
+        "corporation_name":   corporation_name,
+        "network_id":         network_id,
+        "research_findings":  "",
+        "research_error":     "",
+        "researched_at":      datetime.now().isoformat(),
+    }
+
+    try:
+        prompt = _build_contact_research_prompt(
+            contact_name=contact_name,
+            title=title,
+            corporation_name=corporation_name,
+            state=state,
+            facility_type=facility_type,
+        )
+        print(f"    → {contact_name}: querying Sonar Pro...")
+        with _OPENROUTER_SEMAPHORE:
+            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+            time.sleep(RATE_LIMIT_SECONDS)
+        print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
+        result["research_findings"] = research_result
+    except RuntimeError as e:
+        result["research_error"] = str(e)
+        print(f"    ✗ {contact_name}: failed — {e}")
+
+    return result
+
+
+def _research_one_facility(
+    row: dict,
+    hubspot_corp_id: str,
+    corporation_name: str,
+    client,  # bigquery.Client — thread-safe
+) -> dict:
+    """
+    Worker for workflow_1.  Runs in a thread pool — one facility per call.
+
+    Same rate-limiting pattern as _research_one_contact.
+    """
+    facility_name = str(row.get("facility_name", "Unknown Facility"))
+    city          = str(row.get("city", ""))
+    state         = str(row.get("state", ""))
+    facility_type = str(row.get("facility_type", ""))
+    hubspot_id    = str(row.get("hubspot_id", ""))
+    definitive_id = str(row.get("definitive_id", ""))
+
+    result: dict = {
+        "workflow":              "1 - Facility Missing Contact",
+        "hubspot_facility_id":   hubspot_id,
+        "facility_name":         facility_name,
+        "city":                  city,
+        "state":                 state,
+        "facility_type":         facility_type,
+        "definitive_id":         definitive_id,
+        "corporation_name":      corporation_name,
+        "hubspot_corp_id":       hubspot_corp_id,
+        "found_name":            "",
+        "found_title":           "",
+        "found_email":           "",
+        "found_phone":           "",
+        "research_confidence":   "not_found",
+        "source_tier":           "3",
+        "hubspot_contact_ids":   "",
+        "hubspot_match_detail":  "",
+        "hubspot_match_summary": "",
+        "research_findings":     "",
+        "research_error":        "",
+        "researched_at":         datetime.now().isoformat(),
+    }
+
+    try:
+        prompt, source_tier = _build_facility_research_prompt(
+            facility_name=facility_name,
+            city=city,
+            state=state,
+            facility_type=facility_type,
+            corporation_name=corporation_name,
+        )
+        result["source_tier"] = source_tier
+
+        print(f"    → {facility_name}: querying Sonar Pro...")
+        with _OPENROUTER_SEMAPHORE:
+            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+            time.sleep(RATE_LIMIT_SECONDS)
+        print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
+        result["research_findings"] = research_result[:2000]
+
+        found_name, found_title, confidence, found_email, found_phone = parse_found_name(
+            research_result
+        )
+        result.update({
+            "found_name":          found_name,
+            "found_title":         found_title,
+            "research_confidence": confidence,
+            "found_email":         found_email,
+            "found_phone":         found_phone,
+        })
+
+        if found_name and confidence != "not_found":
+            print(f"    🔎 {facility_name}: found {found_name} ({found_title}, {confidence})")
+            matches, match_strategy = lookup_hubspot_contact_enhanced(
+                client=client,
+                full_name=found_name,
+                email=found_email,
+                phone=found_phone,
+                facility_hubspot_id=hubspot_id,
+                parent_hubspot_id=hubspot_corp_id,
+            )
+            ids, detail, summary = _format_hubspot_matches_enhanced(
+                matches, match_strategy=match_strategy, facility_name=facility_name
+            )
+            result.update({
+                "hubspot_contact_ids":   ids,
+                "hubspot_match_detail":  detail,
+                "hubspot_match_summary": summary,
+            })
+        else:
+            print(f"    ℹ {facility_name}: no contact found (confidence={confidence})")
+
+    except RuntimeError as e:
+        result["research_error"] = str(e)
+        print(f"    ✗ {facility_name}: failed — {e}")
+
+    return result
+
+
 # ─── Workflow runners ─────────────────────────────────────────────────────────
 
 def workflow_2_research_contacts(
@@ -1111,61 +1447,25 @@ def workflow_2_research_contacts(
         print("  ℹ No contacts to research for Workflow 2.")
         return []
 
-    results: list[dict] = []
-    total = len(contacts_df)
+    rows  = contacts_df.to_dict("records")
+    total = len(rows)
+    print(f"\n  🔍 Researching {total} contact(s) ({_MAX_WORKERS} concurrent)...")
 
-    print(f"\n  🔍 Researching {total} contact(s) on the web...")
+    ordered: list[dict] = [{}] * total
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _research_one_contact, row, corporation_name, network_id, facility_type
+            ): i
+            for i, row in enumerate(rows)
+        }
+        done = 0
+        for future in as_completed(futures):
+            ordered[futures[future]] = future.result()
+            done += 1
+            print(f"  [{done}/{total}] contacts researched")
 
-    for idx, row in contacts_df.iterrows():
-        contact_name = (
-            f"{row.get('FIRST_NAME', '')} {row.get('LAST_NAME', '')}".strip()
-            or str(row.get("EXECUTIVE_NAME", "Unknown"))
-        )
-        title = str(row.get("title", "")).title()
-        state = str(row.get("state", ""))
-        email = str(row.get("EMAIL", ""))
-        phone = str(row.get("DIRECT_PHONE") or row.get("LOCATION_PHONE") or "")
-        linkedin = str(row.get("LINKEDIN_PROFILE", ""))
-        source = str(row.get("source_table", ""))
-
-        print(f"\n  [{idx + 1}/{total}] Researching: {contact_name} ({title})")
-
-        research_result = ""
-        error_msg = ""
-        try:
-            prompt = _build_contact_research_prompt(
-                contact_name=contact_name,
-                title=title,
-                corporation_name=corporation_name,
-                state=state,
-                facility_type=facility_type,
-            )
-            research_result = call_openrouter(prompt)
-            print(f"    ✓ Research complete ({len(research_result)} chars)")
-        except RuntimeError as e:
-            error_msg = str(e)
-            print(f"    ✗ Research failed: {error_msg}")
-
-        results.append({
-            "workflow":           "2 - Unassociated Contact",
-            "executive_id":       row.get("EXECUTIVE_ID", ""),
-            "contact_name":       contact_name,
-            "title":              title,
-            "email":              email,
-            "phone":              phone,
-            "linkedin":           linkedin,
-            "definitive_source":  source,
-            "corporation_name":   corporation_name,
-            "network_id":         network_id,
-            "research_findings":  research_result,
-            "research_error":     error_msg,
-            "researched_at":      datetime.now().isoformat(),
-        })
-
-        if idx < total - 1:
-            time.sleep(RATE_LIMIT_SECONDS)
-
-    return results
+    return ordered
 
 
 def workflow_1_research_facilities(
@@ -1192,108 +1492,25 @@ def workflow_1_research_facilities(
         print("  ✅ All child facilities already have an ED/Administrator contact in HubSpot!")
         return []
 
-    total = len(missing)
-    results: list[dict] = []
+    rows  = missing.to_dict("records")
+    total = len(rows)
+    print(f"\n  🔍 Researching {total} facilit(y/ies) ({_MAX_WORKERS} concurrent)...")
 
-    print(f"\n  🔍 Researching {total} facilit(y/ies) on state association sites...")
+    ordered: list[dict] = [{}] * total
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _research_one_facility, row, hubspot_corp_id, corporation_name, client
+            ): i
+            for i, row in enumerate(rows)
+        }
+        done = 0
+        for future in as_completed(futures):
+            ordered[futures[future]] = future.result()
+            done += 1
+            print(f"  [{done}/{total}] facilities researched")
 
-    for idx, row in missing.iterrows():
-        facility_name = str(row.get("facility_name", "Unknown Facility"))
-        city          = str(row.get("city", ""))
-        state         = str(row.get("state", ""))
-        facility_type = str(row.get("facility_type", ""))
-        hubspot_id    = str(row.get("hubspot_id", ""))
-        definitive_id = str(row.get("definitive_id", ""))
-
-        print(f"\n  [{idx + 1}/{total}] Researching: {facility_name} ({city}, {state})")
-
-        research_result = ""
-        error_msg = ""
-        found_name = ""
-        found_title = ""
-        found_email = ""
-        found_phone = ""
-        confidence = "not_found"
-        source_tier = "3"
-        hubspot_contact_ids = ""
-        hubspot_match_detail = ""
-        hubspot_match_summary = ""
-
-        try:
-            prompt, source_tier = _build_facility_research_prompt(
-                facility_name=facility_name,
-                city=city,
-                state=state,
-                facility_type=facility_type,
-                corporation_name=corporation_name,
-            )
-            research_result = call_openrouter(prompt)
-            print(f"    ✓ Research complete ({len(research_result)} chars)")
-
-            # Extract the structured name from the JSON block in the response
-            found_name, found_title, confidence, found_email, found_phone = parse_found_name(research_result)
-
-            if found_name and confidence != "not_found":
-                print(f"    🔎 Found: {found_name} ({found_title}, confidence={confidence})")
-                if found_email:
-                    print(f"    🔎 Email: {found_email}")
-                if found_phone:
-                    print(f"    🔎 Phone: {found_phone}")
-                print(f"    🔎 Checking HubSpot for existing contact...")
-                
-                # Use enhanced lookup with email, phone, facility ID, and parent ID
-                matches, match_strategy = lookup_hubspot_contact_enhanced(
-                    client=client,
-                    full_name=found_name,
-                    email=found_email,
-                    phone=found_phone,
-                    facility_hubspot_id=hubspot_id,
-                    parent_hubspot_id=hubspot_corp_id,
-                )
-                hubspot_contact_ids, hubspot_match_detail, hubspot_match_summary = _format_hubspot_matches_enhanced(
-                    matches, match_strategy=match_strategy, facility_name=facility_name
-                )
-                
-                if matches:
-                    print(f"    ✓ HubSpot match: {hubspot_match_summary}")
-                    print(f"       {hubspot_match_detail}")
-                else:
-                    print(f"    ℹ Not found in HubSpot contacts")
-            else:
-                print(f"    ℹ No administrator/ED identified (confidence={confidence})")
-
-        except RuntimeError as e:
-            error_msg = str(e)
-            print(f"    ✗ Research failed: {error_msg}")
-
-        results.append({
-            "workflow":              "1 - Facility Missing Contact",
-            "hubspot_facility_id":   hubspot_id,
-            "facility_name":         facility_name,
-            "city":                  city,
-            "state":                 state,
-            "facility_type":         facility_type,
-            "definitive_id":         definitive_id,
-            "corporation_name":      corporation_name,
-            "hubspot_corp_id":       hubspot_corp_id,
-            "found_name":            found_name,
-            "found_title":           found_title,
-            "found_email":           found_email,
-            "found_phone":           found_phone,
-            "research_confidence":   confidence,
-            "source_tier":           source_tier,
-            "hubspot_contact_ids":   hubspot_contact_ids,
-            "hubspot_match_detail":  hubspot_match_detail,
-            "hubspot_match_summary": hubspot_match_summary,
-            "research_findings":     research_result[:2000] if research_result else "",
-            "research_error":        error_msg,
-            "researched_at":         datetime.now().isoformat(),
-        })
-
-        if idx < total - 1:
-            time.sleep(RATE_LIMIT_SECONDS)
-
-    return results
+    return ordered
 
 
 def save_csv(rows: list[dict], filename: str) -> None:
