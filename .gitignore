@@ -92,3 +92,9 @@ out/
 # Temporary files
 tmp/
 temp/
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.csv

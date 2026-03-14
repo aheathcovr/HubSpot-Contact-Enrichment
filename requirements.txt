@@ -1,0 +1,19 @@
+# Web server
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# HTTP (used by state_association_matcher + hubspot_client)
+requests==2.32.3
+
+# Google Cloud
+google-cloud-bigquery==3.27.0
+google-auth==2.37.0
+pandas==2.2.3
+pyarrow==18.1.0
+db-dtypes==1.4.1
+
+# YAML parsing (state_association_agent_guide.md)
+pyyaml==6.0.2
+
+# Local dev: load .env files
+python-dotenv==1.0.1
