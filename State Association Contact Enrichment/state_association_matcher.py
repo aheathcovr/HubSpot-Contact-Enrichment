@@ -734,6 +734,7 @@ def _format_sources_for_prompt(
     state: str,
     facility_name: str = "",
     city: str = "",
+    website: str = "",
 ) -> str:
     """
     Build the 'Please search the following sources:' bullet text for a research prompt.
@@ -741,6 +742,10 @@ def _format_sources_for_prompt(
     Tier 1: lead with specific verified association URLs + access notes.
     Tier 2: note login barrier, fall through to CMS + state DOH fallbacks.
     Tier 3: skip association search, lead directly with CMS + state DOH fallbacks.
+
+    The state association site is always the primary source when available.
+    The facility's own website is included as a location-verification step only —
+    staff names are rarely listed publicly.
     """
     lines: list[str] = []
     state_label = state or "the relevant state"
@@ -783,15 +788,25 @@ def _format_sources_for_prompt(
             f"- {state_label} Department of Health licensing database"
             f" — search \"{state_label} licensed nursing facilities list\""
         )
-        if facility_name:
+        # Facility website: use for location verification only, not staff discovery
+        if website:
             lines.append(
-                f"- The facility's own website"
-                f" — search \"{facility_name} {city} {state_label} administrator\""
+                f"- Facility website ({website})"
+                " — check for a 'Leadership', 'Staff', 'About Us', or 'Contact' page;"
+                " staff names are sometimes listed but this is lower priority than the sources above"
+            )
+        elif facility_name:
+            lines.append(
+                f"- Facility's own website"
+                f" — search \"{facility_name} {city} {state_label}\" to find the site, then check"
+                " for a 'Leadership', 'Staff', or 'About Us' page;"
+                " lower priority than the sources above"
             )
         lines.append(
-            f"- LinkedIn — search \"{facility_name} administrator\" or \"{facility_name} executive director\""
+            f"- LinkedIn — last resort only; search \"{facility_name} administrator\""
+            f" or \"{facility_name} executive director\" if all above sources fail"
             if facility_name else
-            "- LinkedIn — search facility name + administrator"
+            "- LinkedIn — last resort; search facility name + administrator"
         )
 
     elif tier == "2":
@@ -810,15 +825,24 @@ def _format_sources_for_prompt(
             f"- {state_label} Department of Health licensing database"
             f" — search \"{state_label} licensed nursing facilities list\""
         )
-        if facility_name:
+        if website:
             lines.append(
-                f"- The facility's own website"
-                f" — search \"{facility_name} {city} {state_label} administrator\""
+                f"- Facility website ({website})"
+                " — check for a 'Leadership', 'Staff', 'About Us', or 'Contact' page;"
+                " staff names are sometimes listed but this is lower priority than the sources above"
+            )
+        elif facility_name:
+            lines.append(
+                f"- Facility's own website"
+                f" — search \"{facility_name} {city} {state_label}\" to find the site, then check"
+                " for a 'Leadership', 'Staff', or 'About Us' page;"
+                " lower priority than the sources above"
             )
         lines.append(
-            f"- LinkedIn — search \"{facility_name} administrator\" or \"{facility_name} executive director\""
+            f"- LinkedIn — last resort only; search \"{facility_name} administrator\""
+            f" or \"{facility_name} executive director\" if all above sources fail"
             if facility_name else
-            "- LinkedIn — search facility name + administrator"
+            "- LinkedIn — last resort; search facility name + administrator"
         )
 
     else:  # Tier 3
@@ -832,15 +856,24 @@ def _format_sources_for_prompt(
             f" — search \"{state_label} licensed nursing facilities list\" for a downloadable"
             " Excel or CSV with administrator names"
         )
-        if facility_name:
+        if website:
             lines.append(
-                f"- The facility's own website"
-                f" — search \"{facility_name} {city} {state_label} administrator\""
+                f"- Facility website ({website})"
+                " — check for a 'Leadership', 'Staff', 'About Us', or 'Contact' page;"
+                " staff names are sometimes listed but this is lower priority than the sources above"
+            )
+        elif facility_name:
+            lines.append(
+                f"- Facility's own website"
+                f" — search \"{facility_name} {city} {state_label}\" to find the site, then check"
+                " for a 'Leadership', 'Staff', or 'About Us' page;"
+                " lower priority than the sources above"
             )
         lines.append(
-            f"- LinkedIn — search \"{facility_name} administrator\" or \"{facility_name} executive director\""
+            f"- LinkedIn — last resort only; search \"{facility_name} administrator\""
+            f" or \"{facility_name} executive director\" if all above sources fail"
             if facility_name else
-            "- LinkedIn — search facility name + administrator"
+            "- LinkedIn — last resort; search facility name + administrator"
         )
         if facility_name:
             lines.append(
@@ -931,6 +964,8 @@ def _build_facility_research_prompt(
     state: str,
     facility_type: str,
     corporation_name: str,
+    address: str = "",
+    website: str = "",
 ) -> tuple[str, str]:
     """
     Build the OpenRouter prompt for researching a facility missing leadership.
@@ -952,16 +987,25 @@ def _build_facility_research_prompt(
     tier, matching_sources, fallback_sources = _lookup_guide_sources(state, facility_type)
     source_text = _format_sources_for_prompt(
         tier, matching_sources, fallback_sources,
-        state=state, facility_name=facility_name, city=city,
+        state=state, facility_name=facility_name, city=city, website=website,
     )
+
+    # Build facility identifier block — more fields = less chance of matching a
+    # same-named facility in a different city or state.
+    facility_lines = [f"Facility Name:   {facility_name}"]
+    if address:
+        facility_lines.append(f"Street Address:  {address}")
+    facility_lines.append(f"Location:        {location}")
+    facility_lines.append(f"Facility Type:   {type_desc}")
+    facility_lines.append(f"Parent Company:  {corporation_name}")
+    if website:
+        facility_lines.append(f"Website:         {website}")
+    facility_block = "\n".join(facility_lines)
 
     prompt = f"""I need you to find the current administrator or executive director
 for the following healthcare facility:
 
-Facility Name:   {facility_name}
-Location:        {location}
-Facility Type:   {type_desc}
-Parent Company:  {corporation_name}
+{facility_block}
 
 Search these sources in order, stopping when you find a verified name:
 {source_text}
@@ -1243,6 +1287,9 @@ def find_facilities_missing_leadership(
       AND (
           LOWER(properties_jobtitle) LIKE '%executive director%'
           OR LOWER(properties_jobtitle) LIKE '%administrator%'
+          OR REGEXP_CONTAINS(LOWER(TRIM(properties_jobtitle)), '^admin$|^admin[/,]|\\\\sadmin$|\\\\sadmin[/,]')
+          OR LOWER(properties_jobtitle) LIKE '%director of nursing%'
+          OR REGEXP_CONTAINS(LOWER(TRIM(properties_jobtitle)), '^don$|^don[/,]|\\\\sdon$|\\\\sdon[/,]')
       )
     """
 

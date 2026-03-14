@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from email_verifier import verify_email_millionverifier
+from fullenrich_client import enrich_contact_info, search_facility_contacts
 from hubspot_client import HubSpotClient, HubSpotError
 from state_association_matcher import (
     _build_facility_research_prompt,
@@ -68,6 +69,9 @@ CORPORATE_TITLE_KEYWORDS = {
 CHILD_HIERARCHY_TYPE = "Individual Facility / Child"
 CORP_HIERARCHY_TYPE = "Corporation / Operator"
 
+# Titles searched by FullEnrich when Sonar Pro + DH both find nothing
+LEADERSHIP_TITLES = ["Administrator", "Executive Director", "Director of Nursing"]
+
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -89,6 +93,7 @@ class ContactAction:
     source_tier: str = ""       # "1" | "2" | "3" — state association tier
     found_email: str = ""
     found_phone: str = ""
+    found_linkedin: str = ""
     email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
     email_validation_quality: str = ""  # good | ok | bad | ""
 
@@ -155,6 +160,128 @@ def _names_match(found_name: str, hs_firstname: str, hs_lastname: str) -> bool:
     )
 
 
+# ── Note helpers — all output HTML (HubSpot renders note body as HTML) ────────
+
+
+def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_email_status: str = "") -> str:
+    """HTML block for an email verification result."""
+    mv_status = ev.get("status", "")
+    mv_text = {
+        "VERIFIED":   "✓ Verified — inbox confirmed deliverable",
+        "INVALID":    "✗ Invalid — address does not exist or will bounce",
+        "RISKY":      "~ Risky — catch-all domain; deliverability uncertain",
+        "UNKNOWN":    "? Unknown — mail server blocked SMTP probe",
+        "UNVERIFIED": "Not checked (API key not configured)",
+        "ERROR":      "Error — validation attempt failed",
+    }.get(mv_status, mv_status)
+
+    src = "Existing HubSpot record" if source == "existing" else "Research finding"
+    h = (
+        f"<b>Email:</b> {email}<br>"
+        f"<b>Source:</b> {src}<br>"
+        f"<b>MillionVerifier:</b> {mv_text}<br>"
+    )
+    if mv_status == "UNKNOWN":
+        h += "<em>Microsoft 365 / Exchange Online blocks SMTP verification probes as anti-spam protection — Unknown does not mean the email is invalid.</em><br>"
+    if fe_email_status:
+        fe_text = {"DELIVERABLE": "✓ Deliverable", "NOT_DELIVERABLE": "✗ Not deliverable"}.get(fe_email_status, fe_email_status)
+        h += f"<b>FullEnrich:</b> {fe_text}<br>"
+    if ev.get("role"):
+        h += "<em>⚠ Role-based address (e.g. admin@, info@) — lower deliverability confidence</em><br>"
+    if ev.get("free"):
+        h += "<em>⚠ Free/disposable email provider</em><br>"
+    if ev.get("didyoumean"):
+        h += f"<em>⚠ Possible typo — did you mean: {ev['didyoumean']}?</em><br>"
+    return h
+
+
+def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
+    """HTML block for an email discovered by FullEnrich and added to HubSpot."""
+    fe_status = fe_info.get("email_status", "")
+    fe_text = {"DELIVERABLE": "✓ Deliverable", "NOT_DELIVERABLE": "✗ Not deliverable"}.get(fe_status, fe_status)
+    mv_status = ev.get("status", "")
+    mv_text = {
+        "VERIFIED": "✓ Verified", "INVALID": "✗ Invalid", "RISKY": "~ Risky",
+        "UNKNOWN": "? Unknown (M365 blocks SMTP probe — likely valid)",
+        "UNVERIFIED": "Not checked", "ERROR": "Error",
+    }.get(mv_status, mv_status)
+    return (
+        f"<b>✚ Email added:</b> {email}<br>"
+        f"<b>Source:</b> FullEnrich waterfall email enrichment<br>"
+        f"<b>FullEnrich:</b> {fe_text}<br>"
+        f"<b>MillionVerifier:</b> {mv_text}<br>"
+    )
+
+
+def _phone_added_line(fe_info: dict) -> str:
+    """HTML block for a phone number discovered by FullEnrich and added to HubSpot."""
+    phone = fe_info.get("phone", "")
+    region = fe_info.get("phone_region", "")
+    display = f"{phone} ({region})" if region else phone
+    h = (
+        f"<b>✚ Phone added:</b> {display}<br>"
+        f"<b>Source:</b> FullEnrich professional phone data<br>"
+    )
+    others = [p for p in (fe_info.get("all_phones") or []) if p.get("number") and p["number"] != phone]
+    if others:
+        alt_list = ", ".join(
+            f"{p['number']} ({p['region']})" if p.get("region") else p["number"]
+            for p in others[:4]
+        )
+        h += f"<b>Additional numbers found:</b> {alt_list}<br>"
+    return h
+
+
+def _build_contact_enrichment_note(
+    contact_name: str,
+    contact_title: str,
+    facility_name: str,
+    note_lines: list[str],
+    fe_info: dict,
+) -> str:
+    """HTML enrichment note written directly on a contact record."""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    has_changes = any("✚" in line or "✗" in line for line in note_lines)
+    section = "Email Check &amp; Changes Made" if has_changes else "Email Deliverability Check"
+
+    h = (
+        f"<b>RevOps Enrichment &middot; {contact_name}</b><br>"
+        f"<b>Run date:</b> {now_str} &nbsp;&middot;&nbsp; "
+        f"<b>Title:</b> {contact_title} &nbsp;&middot;&nbsp; "
+        f"<b>Facility:</b> {facility_name}<br><br>"
+        f"<b>{section}</b><br>"
+    )
+    for entry in note_lines:
+        h += entry  # each helper already returns HTML
+
+    h += (
+        "<br><b>About These Results</b><br>"
+        "MillionVerifier verifies email by connecting to the mail server via SMTP. "
+        "<b>Microsoft 365 and Exchange Online</b> block this probe as anti-spam protection, "
+        "returning an Unknown result. This is normal for corporate email — it does <b>not</b> "
+        "mean the address is bad.<br>"
+    )
+    if fe_info.get("email"):
+        h += (
+            "FullEnrich uses a multi-provider waterfall (LinkedIn data, partner databases, warm SMTP pools) "
+            "to independently verify deliverability. <b>Deliverable from FullEnrich is a strong positive "
+            "signal</b> even when MillionVerifier returns Unknown.<br>"
+        )
+
+    extras = [
+        p for p in (fe_info.get("all_phones") or [])
+        if p.get("number") and p["number"] != fe_info.get("phone", "")
+    ]
+    if extras:
+        h += "<br><b>Additional Phone Numbers (FullEnrich)</b><br>Use as fallback if the primary doesn't connect:<ul>"
+        for p in extras[:5]:
+            region = f" ({p['region']})" if p.get("region") else ""
+            h += f"<li>{p['number']}{region}</li>"
+        h += "</ul>"
+
+    return h
+
+
 # ── Contact processing ────────────────────────────────────────────────────────
 
 
@@ -170,6 +297,8 @@ def _process_found_contact(
     facility_name: str,
     research_findings: str,
     source_tier: str = "",
+    found_linkedin: str = "",
+    facility_domain: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
@@ -197,6 +326,7 @@ def _process_found_contact(
         source_tier=source_tier,
         found_email=found_email,
         found_phone=found_phone,
+        found_linkedin=found_linkedin,
         source_urls=source_urls,
         facility_name=facility_name,
         target_company_id=target_company_id,
@@ -216,39 +346,174 @@ def _process_found_contact(
         )
 
     # ── Pre-populated IDs from BigQuery HubSpot lookup (W1) ──────────────────
+    matched_contact_id: str = ""
+    matched_detail: str = ""
+
     existing_ids = [x for x in (pre_populated_contact_ids or "").split("|") if x]
-    if existing_ids:
-        for contact_id in existing_ids:
-            try:
-                hs.associate_contact_to_company(contact_id, target_company_id)
-                return ContactAction(
-                    action="associated_existing",
-                    contact_id=contact_id,
-                    contact_name=found_name,
-                    contact_title=found_title,
-                    detail=f"Added association to existing contact #{contact_id}",
-                    **_base,
-                )
-            except HubSpotError as exc:
-                logger.warning(f"Association failed for contact {contact_id}: {exc}")
+    for cid in existing_ids:
+        try:
+            hs.associate_contact_to_company(cid, target_company_id)
+            matched_contact_id = cid
+            matched_detail = f"Added association to existing contact #{cid}"
+            break
+        except HubSpotError as exc:
+            logger.warning(f"Association failed for contact {cid}: {exc}")
 
     # ── Live email search (W2 and fallback for W1) ────────────────────────────
-    if email_to_use:
+    if not matched_contact_id and email_to_use:
         existing = hs.search_contacts_by_email(email_to_use)
         for contact in existing:
             if _names_match(found_name, contact["firstname"], contact["lastname"]):
                 try:
                     hs.associate_contact_to_company(contact["id"], target_company_id)
-                    return ContactAction(
-                        action="associated_existing",
-                        contact_id=contact["id"],
-                        contact_name=found_name,
-                        contact_title=found_title,
-                        detail=f"Email match → added association to existing #{contact['id']}",
-                        **_base,
-                    )
+                    matched_contact_id = contact["id"]
+                    matched_detail = f"Email match → added association to existing #{contact['id']}"
+                    break
                 except HubSpotError as exc:
                     logger.warning(f"Email-match association failed: {exc}")
+
+    # ── Post-association: verify/enrich email + phone on existing contact ─────
+    if matched_contact_id:
+        enriched_email = found_email
+        enriched_email_status = email_validation.get("status", "")
+        enriched_email_quality = email_validation.get("quality", "")
+        enriched_phone = found_phone
+
+        # Track what actually changed so we can write a meaningful note
+        note_lines: list[str] = []
+        fe_info: dict = {}   # FullEnrich result (populated if called)
+
+        try:
+            existing_props = hs.get_contact_properties(matched_contact_id)
+            existing_email = existing_props.get("email", "")
+            existing_phone = existing_props.get("phone", "")
+
+            # ── Always document email verification status ─────────────────────
+            # MV ran at the top of this function when found_email was supplied
+            # (e.g. from _enrich_existing_leadership). Surface that result in
+            # the contact note regardless of whether anything else changes.
+            if enriched_email and email_validation:
+                note_lines.append(
+                    _email_verification_line(enriched_email, email_validation, source="existing")
+                )
+                if email_validation.get("status") == "INVALID":
+                    logger.info(
+                        "Existing contact %s email %r failed MillionVerifier — keeping but flagging",
+                        matched_contact_id, enriched_email,
+                    )
+
+            # ── Verify email that exists only on the HubSpot record ───────────
+            # (found_email was empty, so MV wasn't run at the top of the function)
+            elif not enriched_email and existing_email:
+                ev = verify_email_millionverifier(existing_email)
+                enriched_email = existing_email
+                enriched_email_status = ev.get("status", "")
+                enriched_email_quality = ev.get("quality", "")
+                note_lines.append(_email_verification_line(existing_email, ev, source="existing"))
+                if ev.get("status") == "INVALID":
+                    logger.info(
+                        "Existing contact %s email %r failed MillionVerifier — keeping but flagging",
+                        matched_contact_id, existing_email,
+                    )
+
+            if not enriched_phone and existing_phone:
+                enriched_phone = existing_phone
+
+            existing_linkedin = existing_props.get("hs_linkedin_url", "")
+
+            # ── FullEnrich: find missing email and/or phone ───────────────────
+            if not existing_email or not existing_phone:
+                fe_first, fe_last = _split_name(found_name)
+                fe_info = enrich_contact_info(
+                    firstname=fe_first,
+                    lastname=fe_last,
+                    company_name=facility_name,
+                    domain=facility_domain,
+                    linkedin_url=found_linkedin,
+                )
+                hs_updates: dict = {}
+
+                if not existing_email and fe_info.get("email"):
+                    new_email = fe_info["email"]
+                    ev = verify_email_millionverifier(new_email)
+                    enriched_email_status = ev.get("status", "")
+                    enriched_email_quality = ev.get("quality", "")
+                    if ev.get("status") != "INVALID":
+                        hs_updates["email"] = new_email
+                        enriched_email = new_email
+                        note_lines.append(
+                            _email_added_line(new_email, fe_info, ev)
+                        )
+                    else:
+                        logger.info(
+                            "FullEnrich email %r for contact %s failed MillionVerifier — suppressed",
+                            new_email, matched_contact_id,
+                        )
+                        note_lines.append(
+                            f"<b>✗ Email suppressed:</b> {new_email}<br>"
+                            f"<b>Reason:</b> FullEnrich found this address but MillionVerifier flagged it as INVALID<br>"
+                        )
+
+                if not existing_phone and fe_info.get("phone"):
+                    hs_updates["phone"] = fe_info["phone"]
+                    enriched_phone = fe_info["phone"]
+                    note_lines.append(_phone_added_line(fe_info))
+
+                if hs_updates:
+                    hs.update_contact(matched_contact_id, hs_updates)
+
+            # ── Write LinkedIn URL if we have it and the contact doesn't ──────
+            if found_linkedin and not existing_linkedin:
+                try:
+                    hs.update_contact(matched_contact_id, {"hs_linkedin_url": found_linkedin})
+                    note_lines.append(
+                        f"<b>✚ LinkedIn added:</b> <a href=\"{found_linkedin}\">{found_linkedin}</a><br>"
+                        f"<b>Source:</b> FullEnrich People Search<br>"
+                    )
+                except HubSpotError as exc:
+                    logger.warning(
+                        "Could not write hs_linkedin_url for contact %s: %s",
+                        matched_contact_id, exc,
+                    )
+
+            # ── Write enrichment note on the contact record ───────────────────
+            # Always write when we have anything to report (MV check alone counts)
+            if note_lines or enriched_email:
+                try:
+                    contact_note = _build_contact_enrichment_note(
+                        contact_name=found_name,
+                        contact_title=found_title,
+                        facility_name=facility_name,
+                        note_lines=note_lines,
+                        fe_info=fe_info,
+                    )
+                    hs.create_note_on_contact(matched_contact_id, contact_note)
+                except HubSpotError as exc:
+                    logger.warning(
+                        "Could not write enrichment note on contact %s: %s",
+                        matched_contact_id, exc,
+                    )
+
+        except HubSpotError as exc:
+            logger.warning(
+                "Post-association enrichment failed for contact %s: %s",
+                matched_contact_id, exc,
+            )
+
+        _base.update(
+            found_email=enriched_email,
+            found_phone=enriched_phone,
+            email_validation_status=enriched_email_status,
+            email_validation_quality=enriched_email_quality,
+        )
+        return ContactAction(
+            action="associated_existing",
+            contact_id=matched_contact_id,
+            contact_name=found_name,
+            contact_title=found_title,
+            detail=matched_detail,
+            **_base,
+        )
 
     # ── Create new contact ────────────────────────────────────────────────────
     contact_props: dict = {"firstname": first, "lastname": last, "jobtitle": found_title or ""}
@@ -256,18 +521,12 @@ def _process_found_contact(
         contact_props["email"] = email_to_use.strip()
     if found_phone:
         contact_props["phone"] = found_phone.strip()
+    if found_linkedin:
+        contact_props["hs_linkedin_url"] = found_linkedin.strip()
 
     try:
         new_id = hs.create_contact(contact_props)
         hs.associate_contact_to_company(new_id, target_company_id)
-        return ContactAction(
-            action="created_new",
-            contact_id=new_id,
-            contact_name=found_name,
-            contact_title=found_title,
-            detail=f"Created new contact #{new_id} and associated with company {target_company_id}",
-            **_base,
-        )
     except HubSpotError as exc:
         logger.error(f"Failed to create contact for '{found_name}': {exc}")
         return ContactAction(
@@ -277,6 +536,156 @@ def _process_found_contact(
             detail=f"HubSpot API error: {exc}",
             **_base,
         )
+
+    # ── FullEnrich bulk enrich on the new contact (fill missing email/phone) ─
+    # Runs whenever the contact was created without a complete email + phone.
+    new_note_lines: list[str] = []
+    new_fe_info: dict = {}
+    if not email_to_use or not found_phone:
+        new_fe_info = enrich_contact_info(
+            firstname=first,
+            lastname=last,
+            company_name=facility_name,
+            domain=facility_domain,
+            linkedin_url=found_linkedin,
+        )
+        new_updates: dict = {}
+
+        if not email_to_use and new_fe_info.get("email"):
+            new_email = new_fe_info["email"]
+            ev = verify_email_millionverifier(new_email)
+            if ev.get("status") != "INVALID":
+                new_updates["email"] = new_email
+                _base["found_email"] = new_email
+                _base["email_validation_status"] = ev.get("status", "")
+                _base["email_validation_quality"] = ev.get("quality", "")
+                new_note_lines.append(_email_added_line(new_email, new_fe_info, ev))
+            else:
+                new_note_lines.append(
+                    f"<b>✗ Email suppressed:</b> {new_email}<br>"
+                    f"<b>Reason:</b> FullEnrich found this address but MillionVerifier flagged it as INVALID<br>"
+                )
+
+        if not found_phone and new_fe_info.get("phone"):
+            new_updates["phone"] = new_fe_info["phone"]
+            _base["found_phone"] = new_fe_info["phone"]
+            new_note_lines.append(_phone_added_line(new_fe_info))
+
+        if new_updates:
+            try:
+                hs.update_contact(new_id, new_updates)
+            except HubSpotError as exc:
+                logger.warning(f"Post-creation FullEnrich update failed for {new_id}: {exc}")
+
+    if new_note_lines:
+        try:
+            contact_note = _build_contact_enrichment_note(
+                contact_name=found_name,
+                contact_title=found_title,
+                facility_name=facility_name,
+                note_lines=new_note_lines,
+                fe_info=new_fe_info,
+            )
+            hs.create_note_on_contact(new_id, contact_note)
+        except HubSpotError as exc:
+            logger.warning(f"Could not write enrichment note on new contact {new_id}: {exc}")
+
+    return ContactAction(
+        action="created_new",
+        contact_id=new_id,
+        contact_name=found_name,
+        contact_title=found_title,
+        detail=f"Created new contact #{new_id} and associated with company {target_company_id}",
+        **_base,
+    )
+
+
+# ── Leadership title matching ──────────────────────────────────────────────────
+
+# Regex patterns that identify admin/ED/DON titles (mirrors the BigQuery filter)
+_LEADERSHIP_TITLE_RE = re.compile(
+    r"executive director"
+    r"|administrator"
+    r"|director of nursing"
+    r"|^admin$|^admin[/,]|\sadmin$|\sadmin[/,]"
+    r"|^don$|^don[/,]|\sdon$|\sdon[/,]",
+    re.IGNORECASE,
+)
+
+
+def _is_leadership_title(title: str) -> bool:
+    """Return True if *title* matches admin / Executive Director / DON patterns."""
+    return bool(_LEADERSHIP_TITLE_RE.search((title or "").strip()))
+
+
+# ── Existing leadership enrichment ────────────────────────────────────────────
+
+
+def _enrich_existing_leadership(
+    hs: HubSpotClient,
+    company_id: str,
+    props: dict,
+    parent_corp_name: str,
+) -> list[dict]:
+    """
+    Called when the facility already has an Admin/ED in HubSpot.
+
+    Fetches associated contacts, filters for leadership titles, and returns
+    result dicts for each one so they flow through _process_found_contact →
+    associated_existing → email/phone enrichment.
+
+    Returns [] if no leadership contacts can be fetched from HubSpot.
+    """
+    facility_name = props.get("name", "")
+    city          = props.get("city", "") or ""
+    state         = props.get("state", "") or ""
+    facility_type = props.get("facility_type", "") or ""
+    definitive_id = props.get("definitive_healthcare_id", "") or ""
+    parent_id     = props.get("hs_parent_company_id", "") or ""
+
+    try:
+        all_contacts = hs.get_associated_contacts(company_id)
+    except Exception as exc:
+        logger.warning(f"Could not fetch contacts for {facility_name}: {exc}")
+        return []
+
+    leadership = [c for c in all_contacts if _is_leadership_title(c["jobtitle"])]
+    if not leadership:
+        logger.info(f"  No leadership contacts returned by HubSpot for {facility_name}")
+        return []
+
+    logger.info(
+        f"  Fetched {len(leadership)} existing leadership contact(s) for {facility_name} — "
+        "will check/enrich email and phone"
+    )
+
+    results: list[dict] = []
+    for c in leadership:
+        full_name = f"{c['firstname']} {c['lastname']}".strip()
+        results.append({
+            "workflow":              "1 - Facility Missing Contact",
+            "hubspot_facility_id":   company_id,
+            "facility_name":         facility_name,
+            "city":                  city,
+            "state":                 state,
+            "facility_type":         facility_type,
+            "definitive_id":         definitive_id,
+            "corporation_name":      parent_corp_name,
+            "hubspot_corp_id":       parent_id,
+            "found_name":            full_name,
+            "found_title":           c["jobtitle"],
+            "found_email":           c["email"],
+            "found_phone":           c["phone"],
+            "research_confidence":   "high",
+            "source_tier":           "",
+            "hubspot_contact_ids":   c["id"],   # flows to associated_existing path
+            "hubspot_match_detail":  "already associated",
+            "hubspot_match_summary": "existing",
+            "research_findings":     "",
+            "research_error":        "",
+            "researched_at":         datetime.now().isoformat(),
+        })
+    return results
 
 
 # ── Workflow 1 — single facility ──────────────────────────────────────────────
@@ -303,8 +712,10 @@ def _run_workflow1_single_facility(
     facility_name = props.get("name", "Unknown Facility")
     city = props.get("city", "") or ""
     state = props.get("state", "") or ""
+    address = props.get("address", "") or ""
     facility_type = props.get("facility_type", "") or ""
     definitive_id = props.get("definitive_healthcare_id", "") or ""
+    website = props.get("website", "") or ""
 
     logger.info(f"W1 single-facility: {facility_name} ({city}, {state})")
 
@@ -327,8 +738,8 @@ def _run_workflow1_single_facility(
     if missing is None:
         missing = find_facilities_missing_leadership(bq_client, facility_df)
     if missing.empty:
-        logger.info(f"  ✅ {facility_name} already has an Admin/ED in HubSpot — skipping")
-        return []
+        logger.info(f"  ✅ {facility_name} already has an Admin/ED — checking email/phone")
+        return _enrich_existing_leadership(hs, company_id, props, parent_corp_name)
 
     # Research the facility
     result: dict = {
@@ -362,6 +773,8 @@ def _run_workflow1_single_facility(
             state=state,
             facility_type=facility_type,
             corporation_name=parent_corp_name,
+            address=address,
+            website=website,
         )
         result["source_tier"] = source_tier
 
@@ -407,6 +820,39 @@ def _run_workflow1_single_facility(
         result["research_error"] = str(exc)
         logger.error(f"  Research failed: {exc}")
 
+    # ── FullEnrich fallback ────────────────────────────────────────────────────
+    # If Sonar Pro + DH found nothing, try FullEnrich People Search as a last resort.
+    if not result.get("found_name"):
+        logger.info(f"  W1 found nothing — trying FullEnrich for {facility_name}")
+        fe_contacts = search_facility_contacts(
+            company_name=facility_name,
+            city=city,
+            state=state,
+            titles=LEADERSHIP_TITLES,
+            domain=website,
+        )
+        if fe_contacts:
+            logger.info(f"  FullEnrich returned {len(fe_contacts)} contact(s) for {facility_name}")
+            fe_results = []
+            for fe in fe_contacts:
+                r = dict(result)
+                r.update({
+                    "found_name":          fe["full_name"],
+                    "found_title":         fe["title"],
+                    "research_confidence": "low",
+                    "found_email":         "",
+                    "found_phone":         "",
+                    "found_linkedin":      fe.get("linkedin_url", ""),
+                    # linkedin_url in research_findings so _extract_urls picks it up for the note
+                    "research_findings":   fe.get("linkedin_url", ""),
+                    "research_error":      "",
+                    "hubspot_contact_ids": "",
+                })
+                fe_results.append(r)
+            return fe_results
+        else:
+            logger.info(f"  FullEnrich: no contacts found for {facility_name}")
+
     return [result]
 
 
@@ -442,38 +888,17 @@ def _build_note(
     errors: list[str],
 ) -> str:
     """
-    Build the salesperson-readable summary note for the company record.
+    Build the salesperson-readable HTML summary note for the company record.
 
-    Designed to answer three questions at a glance:
-      1. What did the automation look for and where?
-      2. Who did it find (and how reliable is that information)?
-      3. How can I quickly verify or disprove the finding?
+    HubSpot renders the note body as HTML, so we use semantic tags for clean
+    display in both the collapsed activity-feed preview and the expanded view.
     """
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    divider = "─" * 66
 
     n_found = sum(1 for a in actions if a.action not in ("no_contact_found", "error"))
     n_created = sum(1 for a in actions if a.action == "created_new")
     n_associated = sum(1 for a in actions if a.action == "associated_existing")
     n_missed = sum(1 for a in actions if a.action == "no_contact_found")
-
-    lines: list[str] = [
-        f"RevOps Contact Enrichment  ·  {company_name}",
-        f"Run date:  {now_str}",
-        f"Workflow:  {workflow_label}",
-        "",
-        f"Summary:  {len(results)} researched  ·  {n_found} found  ·  "
-        f"{n_created} created  ·  {n_associated} linked  ·  {n_missed} not found",
-        "",
-        divider,
-        "WHAT WAS SEARCHED",
-        divider,
-    ]
-
-    # Describe data sources consulted
-    lines.append("  Data sources (checked in this order):")
-    lines.append("    1. Definitive Healthcare Executives table (BigQuery)")
-    lines.append("    2. Definitive Healthcare Contact Full Feed (BigQuery)")
 
     # Pull tier info from first result that has it
     tier_str = ""
@@ -482,69 +907,92 @@ def _build_note(
         if t:
             tier_str = t
             break
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    h = (
+        f"<b>RevOps Contact Enrichment &middot; {company_name}</b><br>"
+        f"<b>Run date:</b> {now_str} &nbsp;&middot;&nbsp; "
+        f"<b>Workflow:</b> {workflow_label}<br><br>"
+        f"<b>Summary:</b> {len(results)} researched &nbsp;&middot;&nbsp; "
+        f"{n_found} found &nbsp;&middot;&nbsp; "
+        f"{n_created} created &nbsp;&middot;&nbsp; "
+        f"{n_associated} linked &nbsp;&middot;&nbsp; "
+        f"{n_missed} not found<br><br>"
+    )
+
+    # ── What Was Searched ─────────────────────────────────────────────────────
+    h += "<b>What Was Searched</b><br>Data sources (checked in this order):<ol>"
+    h += "<li>Definitive Healthcare Executives table (BigQuery)</li>"
+    h += "<li>Definitive Healthcare Contact Full Feed (BigQuery)</li>"
     if tier_str:
         tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
-        lines.append(f"    3. State association directory — {tier_label}")
+        h += f"<li>State association directory &mdash; {tier_label}</li>"
     else:
-        lines.append("    3. State association directory")
-    lines.append("    4. Web search via Perplexity Sonar Pro (live internet search)")
+        h += "<li>State association directory</li>"
+    h += "<li>Web search via Perplexity Sonar Pro (live internet search)</li>"
 
-    # Show MillionVerifier as source #5 when at least one email was found
     if any(a.found_email for a in actions):
         mv_active = bool(os.getenv("MILLIONVERIFIER_API_KEY", "").strip())
         if mv_active:
-            lines.append("    5. MillionVerifier API — email deliverability validation")
+            h += "<li>MillionVerifier API &mdash; email deliverability validation</li>"
         else:
-            lines.append("    5. MillionVerifier API — skipped (MILLIONVERIFIER_API_KEY not configured)")
-    lines.append("")
+            h += "<li>MillionVerifier API &mdash; <em>skipped (MILLIONVERIFIER_API_KEY not configured)</em></li>"
 
-    # ── Per-contact results ─────────────────────────────────────────────────
-    lines += [divider, "RESULTS", divider]
+    if any(a.found_linkedin for a in actions):
+        fe_active = bool(os.getenv("FULLENRICH_API_KEY", "").strip())
+        if fe_active:
+            h += "<li>FullEnrich People Search &mdash; contact discovery fallback (Sonar Pro returned nothing)</li>"
+        else:
+            h += "<li>FullEnrich People Search &mdash; <em>skipped (FULLENRICH_API_KEY not configured)</em></li>"
+    h += "</ol><br>"
 
+    # ── Per-contact results ───────────────────────────────────────────────────
+    h += "<b>Results</b><br>"
     for action in actions:
         label = action.facility_name or action.contact_name or "Unknown"
-        lines.append(f"  ● {label}")
+        h += f"<b>&bull; {label}</b><br>"
 
         if action.action in ("created_new", "associated_existing"):
             conf_label = _CONFIDENCE_LABELS.get(action.confidence, action.confidence)
-            lines.append(f"    Contact:    {action.contact_name},  {action.contact_title}")
-            lines.append(f"    Confidence: {conf_label}")
+            h += f"<b>Contact:</b> {action.contact_name}, {action.contact_title}<br>"
+            h += f"<b>Confidence:</b> {conf_label}<br>"
             if action.found_email:
                 vstatus  = action.email_validation_status
                 vquality = action.email_validation_quality
                 if vstatus == "VERIFIED":
-                    v_suffix = " ✓ verified"
+                    v_suffix = " <em>&#10003; verified</em>"
                 elif vstatus == "INVALID":
-                    v_suffix = " ✗ INVALID — not written to HubSpot"
+                    v_suffix = " <em>&#10007; INVALID &mdash; not written to HubSpot</em>"
                 elif vstatus == "RISKY":
-                    v_suffix = " ~ risky/catchall" + (f" — quality: {vquality}" if vquality else "")
+                    v_suffix = " <em>~ risky/catchall" + (f" &mdash; quality: {vquality}" if vquality else "") + "</em>"
                 elif vstatus == "UNKNOWN":
-                    v_suffix = " ? unverifiable"
+                    v_suffix = " <em>? unverifiable (M365 blocks SMTP probe &mdash; likely valid)</em>"
                 elif vstatus == "UNVERIFIED":
-                    v_suffix = " (not validated — API key not configured)"
+                    v_suffix = " <em>(not validated &mdash; API key not configured)</em>"
                 elif vstatus == "ERROR":
-                    v_suffix = " (validation error — treat as unconfirmed)"
+                    v_suffix = " <em>(validation error &mdash; treat as unconfirmed)</em>"
                 else:
                     v_suffix = ""
-                lines.append(f"    Email:      {action.found_email}{v_suffix}")
+                h += f"<b>Email:</b> {action.found_email}{v_suffix}<br>"
             if action.found_phone:
-                lines.append(f"    Phone:      {action.found_phone}")
+                h += f"<b>Phone:</b> {action.found_phone}<br>"
+            if action.found_linkedin:
+                h += f"<b>LinkedIn:</b> <a href=\"{action.found_linkedin}\">{action.found_linkedin}</a><br>"
             act_label = _ACTION_LABELS.get(action.action, action.action)
             contact_ref = f" #{action.contact_id}" if action.contact_id else ""
-            lines.append(f"    HubSpot:    {act_label}{contact_ref}")
+            h += f"<b>HubSpot:</b> {act_label}{contact_ref}<br>"
 
         elif action.action == "no_contact_found":
-            lines.append(f"    Result:     No administrator or Executive Director identified")
+            h += "<b>Result:</b> No administrator or Executive Director identified<br>"
             if action.detail and action.detail != "No contact identified by research":
-                lines.append(f"    Detail:     {action.detail}")
+                h += f"<b>Detail:</b> {action.detail}<br>"
 
         else:  # error
-            lines.append(f"    Result:     Error — {action.detail}")
+            h += f"<b>Result:</b> Error &mdash; {action.detail}<br>"
 
-        lines.append("")
+        h += "<br>"
 
-    # ── How to verify ────────────────────────────────────────────────────────
-    # Collect all source URLs across all actions
+    # ── How to Verify ─────────────────────────────────────────────────────────
     all_urls: list[str] = []
     seen_urls: set[str] = set()
     for action in actions:
@@ -553,33 +1001,33 @@ def _build_note(
                 seen_urls.add(url)
                 all_urls.append(url)
 
-    lines += [divider, "HOW TO VERIFY", divider]
-    lines.append("  Quick checks to confirm or disprove these findings:")
-    lines.append("")
-    lines.append("  • CMS Care Compare (search by facility name for current leadership):")
-    lines.append("    https://www.medicare.gov/care-compare/")
-    lines.append("")
-
+    h += "<b>How to Verify</b><br>Quick checks to confirm or disprove these findings:<ul>"
+    h += (
+        "<li>CMS Care Compare (search by facility name for current leadership): "
+        "<a href=\"https://www.medicare.gov/care-compare/\">medicare.gov/care-compare</a></li>"
+    )
     if all_urls:
-        lines.append("  • Sources cited by the web search agent:")
-        for url in all_urls[:15]:
-            lines.append(f"    {url}")
-        lines.append("")
-
+        sources_html = " &nbsp; ".join(
+            f"<a href=\"{u}\">{u[:80]}{'...' if len(u) > 80 else ''}</a>"
+            for u in all_urls[:15]
+        )
+        h += f"<li>Sources cited by the web search agent:<br>{sources_html}</li>"
     if tier_str == "1":
-        lines.append("  • State association directory was public — check the URL in sources above")
+        h += "<li>State association directory was public &mdash; check the URL in sources above</li>"
     elif tier_str == "2":
-        lines.append("  • State association directory requires login — verify through direct outreach")
+        h += "<li>State association directory requires login &mdash; verify through direct outreach</li>"
     else:
-        lines.append("  • No state directory available for this state — web search was primary source")
+        h += "<li>No state directory available for this state &mdash; web search was primary source</li>"
+    h += "</ul>"
 
-    # ── Errors ───────────────────────────────────────────────────────────────
+    # ── Errors ────────────────────────────────────────────────────────────────
     if errors:
-        lines += ["", divider, "ERRORS / WARNINGS", divider]
+        h += "<br><b>Errors / Warnings</b><ul>"
         for err in errors:
-            lines.append(f"  {err}")
+            h += f"<li>{err}</li>"
+        h += "</ul>"
 
-    return "\n".join(lines)
+    return h
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -614,10 +1062,16 @@ def run_enrichment(company_id: str) -> None:
     )
 
     # ── Step 2: 30-day guard ──────────────────────────────────────────────────
-    last_enriched_ms = props.get("revops_enrichment_date")
-    if last_enriched_ms:
+    # HubSpot date-picker properties are stored/returned as "YYYY-MM-DD" strings
+    # even though they are submitted as epoch-ms integers.  Handle both formats.
+    last_enriched_raw = props.get("revops_enrichment_date")
+    if last_enriched_raw:
         try:
-            last_dt = datetime.utcfromtimestamp(int(last_enriched_ms) / 1000)
+            raw = str(last_enriched_raw).strip()
+            if raw.isdigit():
+                last_dt = datetime.utcfromtimestamp(int(raw) / 1000)
+            else:
+                last_dt = datetime.strptime(raw[:10], "%Y-%m-%d")
             days_since = (datetime.utcnow() - last_dt).days
             if days_since < 30:
                 logger.info(
@@ -758,6 +1212,8 @@ def run_enrichment(company_id: str) -> None:
             facility_name=result.get("facility_name", "") or result.get("contact_name", ""),
             research_findings=result.get("research_findings", ""),
             source_tier=str(result.get("source_tier", "")),
+            found_linkedin=result.get("found_linkedin", ""),
+            facility_domain=props.get("website", "") or "",
         )
         actions.append(action)
         if action.action == "error":

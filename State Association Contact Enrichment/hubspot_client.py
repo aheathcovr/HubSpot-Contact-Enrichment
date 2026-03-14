@@ -130,7 +130,10 @@ class HubSpotClient:
             "definitive_healthcare_id",
             "city",
             "state",
+            "address",
+            "zip",
             "hs_parent_company_id",
+            "website",
         ])
         data = self._get(
             f"/crm/v3/objects/companies/{company_id}",
@@ -227,6 +230,76 @@ class HubSpotClient:
             logger.warning(f"Contact search by email failed: {exc}")
             return []
 
+    def get_contact_properties(self, contact_id: str) -> dict:
+        """
+        Fetch email, phone, and name for an existing contact.
+
+        Returns a dict with keys: email, phone, firstname, lastname.
+        """
+        data = self._get(
+            f"/crm/v3/objects/contacts/{contact_id}",
+            params={"properties": "email,phone,firstname,lastname,hs_linkedin_url"},
+        )
+        p = data.get("properties", {})
+        return {
+            "email":          p.get("email") or "",
+            "phone":          p.get("phone") or "",
+            "firstname":      p.get("firstname") or "",
+            "lastname":       p.get("lastname") or "",
+            "hs_linkedin_url": p.get("hs_linkedin_url") or "",
+        }
+
+    def get_associated_contacts(self, company_id: str, limit: int = 20) -> list[dict]:
+        """
+        Return contacts whose primary associated company is *company_id*.
+
+        Uses the CRM search endpoint filtered by associatedcompanyid.
+        Callers are responsible for any further title or role filtering.
+
+        Returns a list of dicts: {id, firstname, lastname, email, phone, jobtitle}.
+        """
+        body = {
+            "filterGroups": [
+                {
+                    "filters": [
+                        {
+                            "propertyName": "associatedcompanyid",
+                            "operator": "EQ",
+                            "value": str(company_id),
+                        }
+                    ]
+                }
+            ],
+            "properties": ["firstname", "lastname", "email", "phone", "jobtitle"],
+            "limit": limit,
+        }
+        try:
+            data = self._post("/crm/v3/objects/contacts/search", body)
+        except HubSpotError as exc:
+            logger.warning(f"Associated contacts search failed for company {company_id}: {exc}")
+            return []
+
+        contacts: list[dict] = []
+        for r in data.get("results", []):
+            p = r.get("properties", {})
+            contacts.append({
+                "id":        r["id"],
+                "firstname": p.get("firstname") or "",
+                "lastname":  p.get("lastname") or "",
+                "email":     p.get("email") or "",
+                "phone":     p.get("phone") or "",
+                "jobtitle":  p.get("jobtitle") or "",
+            })
+        return contacts
+
+    def update_contact(self, contact_id: str, properties: dict) -> None:
+        """Update one or more properties on an existing contact record."""
+        self._patch(
+            f"/crm/v3/objects/contacts/{contact_id}",
+            body={"properties": properties},
+        )
+        logger.info(f"Updated contact {contact_id}: {list(properties.keys())}")
+
     # ── Associations ──────────────────────────────────────────────────────────
 
     def associate_contact_to_company(self, contact_id: str, company_id: str) -> None:
@@ -268,6 +341,32 @@ class HubSpotClient:
         data = self._post("/engagements/v1/engagements", payload)
         engagement_id = str(data["engagement"]["id"])
         logger.info(f"Created note (engagement {engagement_id}) on company {company_id}")
+        return engagement_id
+
+    def create_note_on_contact(self, contact_id: str, note_body: str) -> str:
+        """
+        Create a note (engagement) associated with a contact record.
+
+        Uses the same Engagements v1 API as create_note_on_company.
+        Returns the new engagement ID.
+        """
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        payload = {
+            "engagement": {
+                "active": True,
+                "type": "NOTE",
+                "timestamp": now_ms,
+            },
+            "associations": {
+                "contactIds": [int(contact_id)],
+            },
+            "metadata": {
+                "body": note_body,
+            },
+        }
+        data = self._post("/engagements/v1/engagements", payload)
+        engagement_id = str(data["engagement"]["id"])
+        logger.info(f"Created note (engagement {engagement_id}) on contact {contact_id}")
         return engagement_id
 
     # ── Date helpers ──────────────────────────────────────────────────────────
