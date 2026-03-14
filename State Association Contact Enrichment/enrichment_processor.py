@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from email_verifier import verify_email_millionverifier
 from hubspot_client import HubSpotClient, HubSpotError
 from state_association_matcher import (
     _build_facility_research_prompt,
@@ -88,6 +89,8 @@ class ContactAction:
     source_tier: str = ""       # "1" | "2" | "3" — state association tier
     found_email: str = ""
     found_phone: str = ""
+    email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
+    email_validation_quality: str = ""  # good | ok | bad | ""
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -173,6 +176,22 @@ def _process_found_contact(
     """
     source_urls = _extract_urls(research_findings)[:20]
 
+    # ── Email validation (MillionVerifier) ────────────────────────────────────
+    # email_to_use is cleared when the email is definitively INVALID so it is
+    # never written to HubSpot.  found_email is preserved in _base for the note.
+    email_validation: dict = {}
+    email_to_use = found_email
+
+    if found_email:
+        email_validation = verify_email_millionverifier(found_email)
+        if email_validation.get("status") == "INVALID":
+            logger.info(
+                "Email %r failed MillionVerifier (quality=%r) — suppressing from HubSpot",
+                found_email,
+                email_validation.get("quality"),
+            )
+            email_to_use = ""
+
     _base = dict(
         confidence=confidence,
         source_tier=source_tier,
@@ -181,6 +200,8 @@ def _process_found_contact(
         source_urls=source_urls,
         facility_name=facility_name,
         target_company_id=target_company_id,
+        email_validation_status=email_validation.get("status", ""),
+        email_validation_quality=email_validation.get("quality", ""),
     )
 
     if not found_name or confidence == "not_found":
@@ -212,8 +233,8 @@ def _process_found_contact(
                 logger.warning(f"Association failed for contact {contact_id}: {exc}")
 
     # ── Live email search (W2 and fallback for W1) ────────────────────────────
-    if found_email:
-        existing = hs.search_contacts_by_email(found_email)
+    if email_to_use:
+        existing = hs.search_contacts_by_email(email_to_use)
         for contact in existing:
             if _names_match(found_name, contact["firstname"], contact["lastname"]):
                 try:
@@ -231,8 +252,8 @@ def _process_found_contact(
 
     # ── Create new contact ────────────────────────────────────────────────────
     contact_props: dict = {"firstname": first, "lastname": last, "jobtitle": found_title or ""}
-    if found_email:
-        contact_props["email"] = found_email.strip()
+    if email_to_use:
+        contact_props["email"] = email_to_use.strip()
     if found_phone:
         contact_props["phone"] = found_phone.strip()
 
@@ -467,6 +488,14 @@ def _build_note(
     else:
         lines.append("    3. State association directory")
     lines.append("    4. Web search via Perplexity Sonar Pro (live internet search)")
+
+    # Show MillionVerifier as source #5 when at least one email was found
+    if any(a.found_email for a in actions):
+        mv_active = bool(os.getenv("MILLIONVERIFIER_API_KEY", "").strip())
+        if mv_active:
+            lines.append("    5. MillionVerifier API — email deliverability validation")
+        else:
+            lines.append("    5. MillionVerifier API — skipped (MILLIONVERIFIER_API_KEY not configured)")
     lines.append("")
 
     # ── Per-contact results ─────────────────────────────────────────────────
@@ -481,7 +510,23 @@ def _build_note(
             lines.append(f"    Contact:    {action.contact_name},  {action.contact_title}")
             lines.append(f"    Confidence: {conf_label}")
             if action.found_email:
-                lines.append(f"    Email:      {action.found_email}")
+                vstatus  = action.email_validation_status
+                vquality = action.email_validation_quality
+                if vstatus == "VERIFIED":
+                    v_suffix = " ✓ verified"
+                elif vstatus == "INVALID":
+                    v_suffix = " ✗ INVALID — not written to HubSpot"
+                elif vstatus == "RISKY":
+                    v_suffix = " ~ risky/catchall" + (f" — quality: {vquality}" if vquality else "")
+                elif vstatus == "UNKNOWN":
+                    v_suffix = " ? unverifiable"
+                elif vstatus == "UNVERIFIED":
+                    v_suffix = " (not validated — API key not configured)"
+                elif vstatus == "ERROR":
+                    v_suffix = " (validation error — treat as unconfirmed)"
+                else:
+                    v_suffix = ""
+                lines.append(f"    Email:      {action.found_email}{v_suffix}")
             if action.found_phone:
                 lines.append(f"    Phone:      {action.found_phone}")
             act_label = _ACTION_LABELS.get(action.action, action.action)
