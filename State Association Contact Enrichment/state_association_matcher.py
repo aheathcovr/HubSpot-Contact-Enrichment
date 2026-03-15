@@ -104,7 +104,33 @@ DH_TABLES = {
 
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "perplexity/sonar-pro")
+OPENROUTER_MODEL         = os.getenv("OPENROUTER_MODEL",          "perplexity/sonar-pro")
+OPENROUTER_MODEL_TIER23  = os.getenv("OPENROUTER_MODEL_TIER23",   "perplexity/sonar-reasoning-pro")
+
+# Structured JSON schema enforced on every OpenRouter response.
+# Using response_format eliminates the need for regex-based JSON extraction
+# and guarantees a parseable result on every call.
+_CONTACT_JSON_SCHEMA = {
+    "name": "contact_result",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "found_name":  {"type": "string"},
+            "found_title": {"type": "string"},
+            "found_email": {"type": "string"},
+            "found_phone": {"type": "string"},
+            "confidence":  {
+                "type": "string",
+                "enum": ["high", "medium", "low", "not_found"]
+            },
+            "source_url":  {"type": "string"},
+        },
+        "required": ["found_name", "found_title", "found_email",
+                     "found_phone", "confidence", "source_url"],
+        "additionalProperties": False,
+     },
+}
 GCS_CACHE_BUCKET    = os.getenv("GCS_CACHE_BUCKET", "")
 
 # Titles that identify facility-level leadership we care about
@@ -138,7 +164,7 @@ Accuracy rules (strictly enforced):
 - confidence="not_found" → no verified name located; never guess or hallucinate a name
 
 Always cite the exact URL where you found the name.
-Always end your response with the JSON block specified in the user message.\
+Your response MUST be a single valid JSON object matching the required schema — no extra text.\
 """
 
 # Disk cache for LLM responses — used as fallback when GCS_CACHE_BUCKET is not set.
@@ -252,6 +278,8 @@ def call_openrouter(
     system_prompt: str,
     user_prompt: str,
     model: str = OPENROUTER_MODEL,
+    response_format: Optional[dict] = None,
+    extra_params: Optional[dict] = None,
 ) -> str:
     """
     Call the OpenRouter chat-completions endpoint and return the response text.
@@ -260,6 +288,16 @@ def call_openrouter(
     HTTP session (TCP connection reuse).  Responses are cached:
       - In GCS (cross-instance, persistent) when GCS_CACHE_BUCKET env var is set.
       - On disk (.llm_cache/) as a fallback for local development.
+
+    Args:
+        system_prompt:   The system-role message.
+        user_prompt:     The user-role message.
+        model:           OpenRouter model slug.
+        response_format: Optional dict passed as ``response_format`` in the payload.
+                         Pass ``{"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}``
+                         to enforce structured JSON output and skip regex parsing.
+        extra_params:    Optional dict of additional top-level payload keys, e.g.
+                         ``{"reasoning_effort": "high"}`` for sonar-reasoning-pro.
 
     Raises:
         RuntimeError: if OPENROUTER_API_KEY is not set or the request fails.
@@ -271,24 +309,29 @@ def call_openrouter(
         )
 
     # ── Cache key (shared between GCS and disk backends) ─────────────────────
-    cache_key = hashlib.sha256(
-        (system_prompt + user_prompt + model).encode()
-    ).hexdigest()[:20]
+    # Include model + extra_params in the key so different parameter sets
+    # never collide in the cache.
+    cache_seed = system_prompt + user_prompt + model
+    if response_format:
+        cache_seed += json.dumps(response_format, sort_keys=True)
+    if extra_params:
+        cache_seed += json.dumps(extra_params, sort_keys=True)
+    cache_key = hashlib.sha256(cache_seed.encode()).hexdigest()[:20]
 
-    # ── GCS cache lookup (production) ────────────────────────────────────────
+    # ── GCS cache lookup (production) ───────────────────────────────────────
     if GCS_CACHE_BUCKET:
         cached = _gcs_cache_get(cache_key)
         if cached is not None:
             return cached
     else:
-        # ── Disk cache fallback (local dev) ───────────────────────────────────
+        # ── Disk cache fallback (local dev) ─────────────────────────────────
         cache_file = _LLM_CACHE_DIR / f"{cache_key}.json"
         if cache_file.exists():
             logger.info("Disk LLM cache hit (key=%s)", cache_key)
             return json.loads(cache_file.read_text())["response"]
 
-    # ── Call OpenRouter via shared session ───────────────────────────────────
-    payload = {
+    # ── Build payload ─────────────────────────────────────────────────────────────────
+    payload: dict = {
         "model":       model,
         "temperature": 0,
         "messages": [
@@ -296,12 +339,17 @@ def call_openrouter(
             {"role": "user",   "content": user_prompt},
         ],
     }
+    if response_format:
+        payload["response_format"] = response_format
+    if extra_params:
+        payload.update(extra_params)
 
+    # ── Call OpenRouter via shared session ────────────────────────────────────
     try:
         response = _OPENROUTER_SESSION.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
             json=payload,
-            timeout=90,
+            timeout=120,  # increased for reasoning-pro which can take longer
         )
         response.raise_for_status()
         data = response.json()
@@ -311,7 +359,7 @@ def call_openrouter(
     except Exception as e:
         raise RuntimeError(f"OpenRouter call failed: {e}") from e
 
-    # ── Cache write ───────────────────────────────────────────────────────────
+    # ── Cache write ──────────────────────────────────────────────────────────────────
     if GCS_CACHE_BUCKET:
         _gcs_cache_set(cache_key, result)
     else:
@@ -323,15 +371,44 @@ def call_openrouter(
 
 def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
     """
-    Extract the structured JSON block from an OpenRouter facility research response.
+    Extract structured contact fields from an OpenRouter research response.
+
+    Handles two response formats:
+      1. Structured output (response_format=json_schema): the entire response IS
+         a valid JSON object — parsed directly with no regex.
+      2. Legacy free-text output: the JSON block is embedded inside a ```json
+         fenced code block or as a bare object at the end of the response.
 
     Returns (found_name, found_title, confidence, found_email, found_phone).
-    Returns ("", "", "not_found", "", "") if no JSON block is present or parsing fails.
+    Returns ("", "", "not_found", "", "") if parsing fails entirely.
     """
     import re
     import json
 
-    # Look for the last ```json ... ``` block in the response
+    def _extract_fields(data: dict) -> tuple[str, str, str, str, str]:
+        name  = str(data.get("found_name",  "") or "").strip()
+        title = str(data.get("found_title", "") or "").strip()
+        conf  = str(data.get("confidence",  "not_found") or "not_found").strip().lower()
+        email = str(data.get("found_email", "") or "").strip()
+        phone = str(data.get("found_phone", "") or "").strip()
+        if conf not in ("high", "medium", "low", "not_found"):
+            logger.warning(
+                "parse_found_name: unexpected confidence value %r — treating as not_found", conf
+            )
+            conf = "not_found"
+        return name, title, conf, email, phone
+
+    # ── Path 1: structured output — the whole response is a JSON object ──────────
+    stripped = research_text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+            if "found_name" in data or "confidence" in data:
+                return _extract_fields(data)
+        except (json.JSONDecodeError, AttributeError):
+            pass  # fall through to legacy path
+
+    # ── Path 2: legacy free-text — JSON embedded in a fenced code block ────────
     matches = re.findall(r"```json\s*(\{.*?\})\s*```", research_text, re.DOTALL)
     if not matches:
         # Try bare JSON object as fallback
@@ -340,15 +417,7 @@ def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
     for raw in reversed(matches):  # use last match (most likely the structured block)
         try:
             data = json.loads(raw)
-            name  = str(data.get("found_name",  "") or "").strip()
-            title = str(data.get("found_title", "") or "").strip()
-            conf  = str(data.get("confidence",  "not_found") or "not_found").strip().lower()
-            email = str(data.get("found_email", "") or "").strip()
-            phone = str(data.get("found_phone", "") or "").strip()
-            if conf not in ("high", "medium", "low", "not_found"):
-                logger.warning("parse_found_name: unexpected confidence value %r — treating as not_found", conf)
-                conf = "not_found"
-            return name, title, conf, email, phone
+            return _extract_fields(data)
         except (json.JSONDecodeError, AttributeError):
             continue
 
@@ -937,25 +1006,14 @@ Search these sources in order, stopping when you find a verified match:
 
 For each source you check, briefly note: source name → result (found / not found / inaccessible).
 
-Report back:
-1. Whether you found this person listed on any state association or regulatory website
-2. The specific facility or facilities they are listed at (name, address, city, state)
-3. Their contact information if publicly listed (phone, email)
-4. The exact URL where you found this information
-5. Any notes about their current role or facility affiliation
-
-If you cannot find this person, say so explicitly and note which sources you checked
-and why each was inconclusive.
-
-At the very end of your response, include this JSON block (fill in what you found):
-```json
-{{"found_name": "First Last", "found_title": "Administrator", "found_email": "email@example.com", "found_phone": "555-123-4567", "confidence": "high"}}
-```
-Valid confidence values: "high", "medium", "low", "not_found".
-If no person was found, use:
-```json
-{{"found_name": "", "found_title": "", "found_email": "", "found_phone": "", "confidence": "not_found"}}
-```"""
+Return a JSON object with these fields:
+- found_name:  full name as listed at the source, or empty string if not found
+- found_title: exact job title as listed at the source, or empty string
+- found_email: publicly listed email address, or empty string
+- found_phone: publicly listed phone number, or empty string
+- confidence:  "high" (official association/CMS listing), "medium" (facility/operator site),
+               "low" (LinkedIn/news/possibly outdated), or "not_found" (no verified name)
+- source_url:  exact URL where the name was found, or empty string"""
 
 
 def _build_facility_research_prompt(
@@ -1012,25 +1070,14 @@ Search these sources in order, stopping when you find a verified name:
 
 For each source you check, briefly note: source name → result (found / not found / inaccessible).
 
-Report back:
-1. The name of the current administrator or executive director (if found)
-2. Their job title exactly as listed at the source
-3. Their contact information if publicly available (phone, email)
-4. The exact URL where you found this information
-5. Any notes (e.g., recently changed leadership, listing may be outdated)
-
-If you cannot find leadership information after checking all sources, say so explicitly
-and list which sources you checked and why each was inconclusive.
-
-At the very end of your response, include this JSON block (fill in what you found):
-```json
-{{"found_name": "First Last", "found_title": "Administrator", "found_email": "email@example.com", "found_phone": "555-123-4567", "confidence": "high"}}
-```
-Valid confidence values: "high", "medium", "low", "not_found".
-If no person was found, use:
-```json
-{{"found_name": "", "found_title": "", "found_email": "", "found_phone": "", "confidence": "not_found"}}
-```"""
+Return a JSON object with these fields:
+- found_name:  full name of the administrator/executive director, or empty string if not found
+- found_title: exact job title as listed at the source, or empty string
+- found_email: publicly listed email address, or empty string
+- found_phone: publicly listed phone number, or empty string
+- confidence:  "high" (official association/CMS listing), "medium" (facility/operator site),
+               "low" (LinkedIn/news/possibly outdated), or "not_found" (no verified name)
+- source_url:  exact URL where the name was found, or empty string"""
 
     return prompt, tier
 
@@ -1359,9 +1406,20 @@ def _research_one_contact(
             state=state,
             facility_type=facility_type,
         )
-        print(f"    → {contact_name}: querying Sonar Pro...")
+
+        # Workflow 2 contacts are unassociated (no direct facility URL), so they
+        # always benefit from the deeper reasoning model.
+        structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
+
+        print(f"    → {contact_name}: querying Sonar Reasoning Pro (high effort)...")
         with _OPENROUTER_SEMAPHORE:
-            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+            research_result = call_openrouter(
+                RESEARCH_SYSTEM_PROMPT,
+                prompt,
+                model=OPENROUTER_MODEL_TIER23,
+                response_format=structured_format,
+                extra_params={"reasoning_effort": "high"},
+            )
             time.sleep(RATE_LIMIT_SECONDS)
         print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result
@@ -1424,9 +1482,31 @@ def _research_one_facility(
         )
         result["source_tier"] = source_tier
 
-        print(f"    → {facility_name}: querying Sonar Pro...")
+        # ── Tiered model selection (Rec #2) ────────────────────────────────────────────
+        # Tier 1 → sonar-pro (direct association URL, cheaper, fast)
+        # Tier 2/3 → sonar-reasoning-pro + reasoning_effort=high (no direct URL;
+        #             deeper multi-step reasoning needed to locate the contact)
+        if source_tier == "1":
+            model       = OPENROUTER_MODEL
+            extra       = None
+            model_label = "Sonar Pro"
+        else:
+            model       = OPENROUTER_MODEL_TIER23
+            extra       = {"reasoning_effort": "high"}
+            model_label = "Sonar Reasoning Pro (high effort)"
+
+        # ── Structured JSON output (Rec #1) ──────────────────────────────────────────
+        structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
+
+        print(f"    → {facility_name}: querying {model_label} (tier {source_tier})...")
         with _OPENROUTER_SEMAPHORE:
-            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+            research_result = call_openrouter(
+                RESEARCH_SYSTEM_PROMPT,
+                prompt,
+                model=model,
+                response_format=structured_format,
+                extra_params=extra,
+            )
             time.sleep(RATE_LIMIT_SECONDS)
         print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result[:2000]
