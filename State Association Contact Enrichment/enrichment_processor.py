@@ -69,8 +69,18 @@ CORPORATE_TITLE_KEYWORDS = {
 CHILD_HIERARCHY_TYPE = "Individual Facility / Child"
 CORP_HIERARCHY_TYPE = "Corporation / Operator"
 
-# Titles searched by FullEnrich when Sonar Pro + DH both find nothing
+# Titles searched by FullEnrich when Sonar Pro + DH both find nothing (Workflow 1)
 LEADERSHIP_TITLES = ["Administrator", "Executive Director", "Director of Nursing"]
+
+# Corporate titles searched by FullEnrich as a supplement in Workflow 2
+W2_CORPORATE_TITLES = [
+    "Chief Executive Officer",
+    "Chief Operating Officer",
+    "Chief Financial Officer",
+    "Vice President of Operations",
+    "Regional Vice President of Operations",
+    "Regional Director of Operations",
+]
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -211,6 +221,26 @@ def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
         f"<b>FullEnrich:</b> {fe_text}<br>"
         f"<b>MillionVerifier:</b> {mv_text}<br>"
     )
+
+
+def _collect_additional_emails(fe_info: dict, primary_email: str) -> str:
+    """
+    Return a semicolon-delimited string of DELIVERABLE alternate emails from
+    FullEnrich's all_emails list, excluding the primary email already written
+    to the contact's email property.
+
+    HubSpot stores these in the hs_additional_emails property and uses them
+    for deduplication and display alongside the primary address.
+    """
+    primary = (primary_email or "").strip().lower()
+    extras = [
+        e["email"]
+        for e in (fe_info.get("all_emails") or [])
+        if e.get("email")
+        and e.get("status") == "DELIVERABLE"
+        and e["email"].strip().lower() != primary
+    ]
+    return ";".join(extras)
 
 
 def _phone_added_line(fe_info: dict) -> str:
@@ -388,6 +418,35 @@ def _process_found_contact(
             existing_email = existing_props.get("email", "")
             existing_phone = existing_props.get("phone", "")
 
+            # ── 30-day guard: skip MV + FullEnrich if enriched recently ───────
+            last_enriched_raw = existing_props.get("most_recent_enrichment_date", "")
+            if last_enriched_raw:
+                try:
+                    raw = str(last_enriched_raw).strip()
+                    if raw.isdigit():
+                        last_dt = datetime.utcfromtimestamp(int(raw) / 1000)
+                    else:
+                        last_dt = datetime.strptime(raw[:10], "%Y-%m-%d")
+                    days_since = (datetime.utcnow() - last_dt).days
+                    if days_since < 30:
+                        logger.info(
+                            f"Skipping MV/FullEnrich for contact {matched_contact_id}: "
+                            f"enriched {days_since} day(s) ago (< 30 day threshold)"
+                        )
+                        return ContactAction(
+                            action="associated_existing",
+                            contact_id=matched_contact_id,
+                            contact_name=found_name,
+                            contact_title=found_title,
+                            detail=matched_detail + " (skipped re-enrichment — within 30-day window)",
+                            **_base,
+                        )
+                except (ValueError, TypeError) as exc:
+                    logger.warning(
+                        f"Could not parse most_recent_enrichment_date={last_enriched_raw!r} "
+                        f"for contact {matched_contact_id}: {exc}"
+                    )
+
             # ── Always document email verification status ─────────────────────
             # MV ran at the top of this function when found_email was supplied
             # (e.g. from _enrich_existing_leadership). Surface that result in
@@ -459,22 +518,42 @@ def _process_found_contact(
                     enriched_phone = fe_info["phone"]
                     note_lines.append(_phone_added_line(fe_info))
 
+                # Additional DELIVERABLE emails → hs_additional_emails
+                primary_for_extras = hs_updates.get("email") or existing_email
+                alt_emails = _collect_additional_emails(fe_info, primary_for_extras)
+                if alt_emails:
+                    hs_updates["hs_additional_emails"] = alt_emails
+
                 if hs_updates:
                     hs.update_contact(matched_contact_id, hs_updates)
 
             # ── Write LinkedIn URL if we have it and the contact doesn't ──────
-            if found_linkedin and not existing_linkedin:
+            linkedin_to_write = found_linkedin or fe_info.get("linkedin_url", "")
+            if linkedin_to_write and not existing_linkedin:
                 try:
-                    hs.update_contact(matched_contact_id, {"hs_linkedin_url": found_linkedin})
+                    hs.update_contact(matched_contact_id, {"hs_linkedin_url": linkedin_to_write})
+                    source = "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
                     note_lines.append(
-                        f"<b>✚ LinkedIn added:</b> <a href=\"{found_linkedin}\">{found_linkedin}</a><br>"
-                        f"<b>Source:</b> FullEnrich People Search<br>"
+                        f"<b>✚ LinkedIn added:</b> <a href=\"{linkedin_to_write}\">{linkedin_to_write}</a><br>"
+                        f"<b>Source:</b> {source}<br>"
                     )
                 except HubSpotError as exc:
                     logger.warning(
                         "Could not write hs_linkedin_url for contact %s: %s",
                         matched_contact_id, exc,
                     )
+
+            # ── Stamp most_recent_enrichment_date ────────────────────────────
+            try:
+                hs.update_contact(
+                    matched_contact_id,
+                    {"most_recent_enrichment_date": str(HubSpotClient.epoch_ms_today_utc())},
+                )
+            except HubSpotError as exc:
+                logger.warning(
+                    "Could not set most_recent_enrichment_date on contact %s: %s",
+                    matched_contact_id, exc,
+                )
 
             # ── Write enrichment note on the contact record ───────────────────
             # Always write when we have anything to report (MV check alone counts)
@@ -571,11 +650,34 @@ def _process_found_contact(
             _base["found_phone"] = new_fe_info["phone"]
             new_note_lines.append(_phone_added_line(new_fe_info))
 
+        # Additional DELIVERABLE emails → hs_additional_emails
+        primary_for_extras = new_updates.get("email") or email_to_use
+        alt_emails = _collect_additional_emails(new_fe_info, primary_for_extras)
+        if alt_emails:
+            new_updates["hs_additional_emails"] = alt_emails
+
+        # LinkedIn from bulk enrich — only needed when People Search didn't supply one
+        if not found_linkedin and new_fe_info.get("linkedin_url"):
+            new_updates["hs_linkedin_url"] = new_fe_info["linkedin_url"]
+            new_note_lines.append(
+                f"<b>✚ LinkedIn added:</b> <a href=\"{new_fe_info['linkedin_url']}\">{new_fe_info['linkedin_url']}</a><br>"
+                f"<b>Source:</b> FullEnrich Bulk Enrich<br>"
+            )
+
         if new_updates:
             try:
                 hs.update_contact(new_id, new_updates)
             except HubSpotError as exc:
                 logger.warning(f"Post-creation FullEnrich update failed for {new_id}: {exc}")
+
+    # ── Stamp most_recent_enrichment_date on the new contact ─────────────────
+    try:
+        hs.update_contact(
+            new_id,
+            {"most_recent_enrichment_date": str(HubSpotClient.epoch_ms_today_utc())},
+        )
+    except HubSpotError as exc:
+        logger.warning(f"Could not set most_recent_enrichment_date on new contact {new_id}: {exc}")
 
     if new_note_lines:
         try:
@@ -1176,6 +1278,53 @@ def run_enrichment(company_id: str) -> None:
             logger.info(msg)
             errors.append(msg)
 
+        # ── FullEnrich supplement: find corporate executives not in DH ────────
+        # Runs regardless of whether DH returned results, so FullEnrich fills
+        # gaps when DH has no record or definitive_id is missing.
+        dh_names = {
+            (r.get("contact_name") or "").lower().strip()
+            for r in results
+            if r.get("contact_name")
+        }
+        logger.info(
+            f"W2 FullEnrich supplement: searching for corporate executives at '{company_name}'"
+        )
+        fe_corp_contacts = search_facility_contacts(
+            company_name=company_name,
+            city="",
+            state=props.get("state", "") or "",
+            titles=W2_CORPORATE_TITLES,
+            domain=props.get("website", "") or "",
+        )
+        fe_added = 0
+        for fe in fe_corp_contacts:
+            if (fe["full_name"] or "").lower().strip() not in dh_names:
+                results.append({
+                    "workflow":            "2 - Unassociated Contact",
+                    "contact_name":        fe["full_name"],
+                    "title":               fe["title"],
+                    "email":               "",
+                    "phone":               "",
+                    "linkedin":            fe.get("linkedin_url", ""),
+                    "found_name":          fe["full_name"],
+                    "found_title":         fe["title"],
+                    "found_email":         "",
+                    "found_phone":         "",
+                    "found_linkedin":      fe.get("linkedin_url", ""),
+                    # linkedin_url in research_findings so _extract_urls picks it up for the note
+                    "research_findings":   fe.get("linkedin_url", ""),
+                    "research_confidence": "low",
+                    "source_tier":         "",
+                    "hubspot_contact_ids": "",
+                    "research_error":      "",
+                })
+                dh_names.add((fe["full_name"] or "").lower().strip())
+                fe_added += 1
+        if fe_added:
+            logger.info(f"W2 FullEnrich supplement added {fe_added} new contact(s)")
+        else:
+            logger.info("W2 FullEnrich supplement: no additional contacts found")
+
     else:
         msg = (
             f"Unknown hierarchy_type='{hierarchy_type}'. "
@@ -1212,7 +1361,7 @@ def run_enrichment(company_id: str) -> None:
             facility_name=result.get("facility_name", "") or result.get("contact_name", ""),
             research_findings=result.get("research_findings", ""),
             source_tier=str(result.get("source_tier", "")),
-            found_linkedin=result.get("found_linkedin", ""),
+            found_linkedin=result.get("found_linkedin", "") or result.get("linkedin", ""),
             facility_domain=props.get("website", "") or "",
         )
         actions.append(action)

@@ -360,13 +360,14 @@ def search_facility_contacts(
 
 def _parse_enrich_response(data: dict) -> dict:
     """
-    Extract email, phone, and supporting metadata from a completed FullEnrich v2 response.
+    Extract email, phone, LinkedIn, and supporting metadata from a completed FullEnrich v2 response.
 
     v2 response shape:
         data[0].contact_info.most_probable_work_email.{email, status}
         data[0].contact_info.most_probable_phone.{number, region}
         data[0].contact_info.work_emails[].{email, status}
         data[0].contact_info.phones[].{number, region}
+        data[0].social_profiles.linkedin.url
 
     Returned dict keys:
         email           str   — most probable work email (or "")
@@ -375,15 +376,18 @@ def _parse_enrich_response(data: dict) -> dict:
         phone_region    str   — ISO country code of most probable phone, e.g. "US"
         all_emails      list  — [{"email": str, "status": str}, ...]
         all_phones      list  — [{"number": str, "region": str}, ...]
+        linkedin_url    str   — LinkedIn profile URL (or "")
     """
     _empty: dict = {
         "email": "", "email_status": "", "phone": "",
         "phone_region": "", "all_emails": [], "all_phones": [],
+        "linkedin_url": "",
     }
     records = data.get("data") or []
     if not records or not isinstance(records, list):
         return _empty
-    contact_info = (records[0] or {}).get("contact_info") or {}
+    record = records[0] or {}
+    contact_info = record.get("contact_info") or {}
 
     email_obj = contact_info.get("most_probable_work_email") or {}
     email = str(email_obj.get("email") or "").strip()
@@ -404,6 +408,9 @@ def _parse_enrich_response(data: dict) -> dict:
         if p.get("number")
     ]
 
+    social = record.get("social_profiles") or {}
+    linkedin_url = str((social.get("linkedin") or {}).get("url") or "").strip()
+
     return {
         "email":        email,
         "email_status": email_status,
@@ -411,6 +418,7 @@ def _parse_enrich_response(data: dict) -> dict:
         "phone_region": phone_region,
         "all_emails":   all_emails,
         "all_phones":   all_phones,
+        "linkedin_url": linkedin_url,
     }
 
 

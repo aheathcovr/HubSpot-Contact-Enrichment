@@ -28,7 +28,11 @@ steps:
       - '--max-instances=5'
       - '--timeout=60s'
       - '--no-cpu-throttling'
+      - '--set-secrets=HUBSPOT_API_KEY=HUBSPOT_API_KEY:latest'
+      - '--set-secrets=OPENROUTER_API_KEY=OPENROUTER_API_KEY:latest'
       - '--set-secrets=MILLIONVERIFIER_API_KEY=MILLIONVERIFIER_API_KEY:latest'
+      - '--set-secrets=FULLENRICH_API_KEY=FULLENRICH_API_KEY:latest'
+      - '--set-secrets=HUBSPOT_WEBHOOK_SECRET=HUBSPOT_WEBHOOK_SECRET:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/hubspot-enrichment:$COMMIT_SHA'

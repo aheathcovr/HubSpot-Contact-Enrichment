@@ -232,21 +232,23 @@ class HubSpotClient:
 
     def get_contact_properties(self, contact_id: str) -> dict:
         """
-        Fetch email, phone, and name for an existing contact.
+        Fetch email, phone, name, and enrichment date for an existing contact.
 
-        Returns a dict with keys: email, phone, firstname, lastname.
+        Returns a dict with keys: email, phone, firstname, lastname,
+        hs_linkedin_url, most_recent_enrichment_date.
         """
         data = self._get(
             f"/crm/v3/objects/contacts/{contact_id}",
-            params={"properties": "email,phone,firstname,lastname,hs_linkedin_url"},
+            params={"properties": "email,phone,firstname,lastname,hs_linkedin_url,most_recent_enrichment_date"},
         )
         p = data.get("properties", {})
         return {
-            "email":          p.get("email") or "",
-            "phone":          p.get("phone") or "",
-            "firstname":      p.get("firstname") or "",
-            "lastname":       p.get("lastname") or "",
-            "hs_linkedin_url": p.get("hs_linkedin_url") or "",
+            "email":                       p.get("email") or "",
+            "phone":                       p.get("phone") or "",
+            "firstname":                   p.get("firstname") or "",
+            "lastname":                    p.get("lastname") or "",
+            "hs_linkedin_url":             p.get("hs_linkedin_url") or "",
+            "most_recent_enrichment_date": p.get("most_recent_enrichment_date") or "",
         }
 
     def get_associated_contacts(self, company_id: str, limit: int = 20) -> list[dict]:

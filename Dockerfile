@@ -3,7 +3,8 @@ FROM python:3.11-slim
 # gcc is needed to compile some google-cloud packages
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 appuser
 
 WORKDIR /app
 
@@ -20,11 +21,17 @@ COPY ["State Association Contact Enrichment/", "./"]
 # So the guide must live at /state_association_agent_guide.md inside the container.
 COPY state_association_agent_guide.md /state_association_agent_guide.md
 
+# Drop root privileges before starting the server
+USER appuser
+
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
 
 # Single worker required — FastAPI BackgroundTasks are per-process
 CMD ["uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

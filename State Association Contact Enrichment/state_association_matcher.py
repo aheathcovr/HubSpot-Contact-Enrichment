@@ -102,6 +102,17 @@ DH_TABLES = {
     "full_feed":    f"{BQ_PROJECT_ID}.definitive_healthcare.December SNF AND ALF Contact Full Feed",
 }
 
+# BigQuery RE2 pattern used to filter corporate executive titles in Workflow 2.
+# Matches: CEO/Chief Executive, COO/Chief Operating, CFO/Chief Financial,
+# Vice President (any), Regional Director (any), standalone President.
+DH_W2_TITLE_PATTERN = (
+    r"chief executive|chief operating|chief financial"
+    r"|\bceo\b|\bcoo\b|\bcfo\b"
+    r"|vice president"
+    r"|regional director"
+    r"|\bpresident\b"
+)
+
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL         = os.getenv("OPENROUTER_MODEL",          "perplexity/sonar-pro")
@@ -465,8 +476,8 @@ def lookup_hubspot_contact_enhanced(
     if len(parts) < 2 and not email and not phone:
         return [], "no_search_criteria"
 
-    first_name = parts[0].replace("'", "\\'") if parts else ""
-    last_name = " ".join(parts[1:]).replace("'", "\\'") if len(parts) > 1 else ""
+    first_name = parts[0] if parts else ""
+    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
     normalized_phone = normalize_phone(phone)
 
     all_matches: list[dict] = []
@@ -474,7 +485,7 @@ def lookup_hubspot_contact_enhanced(
 
     # ── Strategy 1: Email lookup (highest confidence) ───────────────────────────
     if email and "@" in email:
-        email_clean = email.strip().lower().replace("'", "\\'")
+        email_clean = email.strip().lower()
         query = f"""
         SELECT
             CAST(properties_hs_object_id AS STRING)      AS contact_id,
@@ -487,11 +498,14 @@ def lookup_hubspot_contact_enhanced(
             CAST(properties_associatedcompanyid AS STRING) AS associated_company_id
         FROM `{HUBSPOT_CONTACTS_TABLE}`
         WHERE (archived IS NOT TRUE OR archived IS NULL)
-          AND LOWER(TRIM(properties_email)) = LOWER('{email_clean}')
+          AND LOWER(TRIM(properties_email)) = LOWER(@email_clean)
         LIMIT 5
         """
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("email_clean", "STRING", email_clean),
+        ])
         try:
-            rows = client.query(query).to_dataframe()
+            rows = client.query(query, job_config=job_config).to_dataframe()
             rows = rows.replace(["nan", "None", "<NA>"], "")
             for row in rows.to_dict("records"):
                 row["match_type"] = "email_match"
@@ -504,6 +518,7 @@ def lookup_hubspot_contact_enhanced(
     # ── Strategy 2: Phone lookup ────────────────────────────────────────────────
     if normalized_phone and len(normalized_phone) >= 10:
         # Search both phone and mobile_phone fields
+        phone_suffix = normalized_phone[-10:]
         query = f"""
         SELECT
             CAST(properties_hs_object_id AS STRING)      AS contact_id,
@@ -517,13 +532,16 @@ def lookup_hubspot_contact_enhanced(
         FROM `{HUBSPOT_CONTACTS_TABLE}`
         WHERE (archived IS NOT TRUE OR archived IS NULL)
           AND (
-              REGEXP_REPLACE(properties_phone, r'[^0-9]', '') LIKE '%{normalized_phone[-10:]}%'
-              OR REGEXP_REPLACE(properties_mobilephone, r'[^0-9]', '') LIKE '%{normalized_phone[-10:]}%'
+              REGEXP_REPLACE(properties_phone, r'[^0-9]', '') LIKE CONCAT('%', @phone_suffix, '%')
+              OR REGEXP_REPLACE(properties_mobilephone, r'[^0-9]', '') LIKE CONCAT('%', @phone_suffix, '%')
           )
         LIMIT 10
         """
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("phone_suffix", "STRING", phone_suffix),
+        ])
         try:
-            rows = client.query(query).to_dataframe()
+            rows = client.query(query, job_config=job_config).to_dataframe()
             rows = rows.replace(["nan", "None", "<NA>"], "")
             phone_matches = []
             for row in rows.to_dict("records"):
@@ -539,14 +557,7 @@ def lookup_hubspot_contact_enhanced(
         # CASE expression ranks rows so that matches at the specific facility come
         # first (1), then parent company (2), then any other company (3).
         # A single query replaces three sequential Python filter passes.
-        facility_case = (
-            f"WHEN CAST(properties_associatedcompanyid AS STRING) = '{facility_hubspot_id}' THEN 1"
-            if facility_hubspot_id else ""
-        )
-        parent_case = (
-            f"WHEN CAST(properties_associatedcompanyid AS STRING) = '{parent_hubspot_id}' THEN 2"
-            if parent_hubspot_id else ""
-        )
+        # Both WHEN clauses are always emitted; empty-string params never match real IDs.
         name_query = f"""
         SELECT
             CAST(properties_hs_object_id AS STRING)       AS contact_id,
@@ -558,20 +569,26 @@ def lookup_hubspot_contact_enhanced(
             properties_jobtitle                            AS job_title,
             CAST(properties_associatedcompanyid AS STRING) AS associated_company_id,
             CASE
-                {facility_case}
-                {parent_case}
+                WHEN @facility_id != '' AND CAST(properties_associatedcompanyid AS STRING) = @facility_id THEN 1
+                WHEN @parent_id != '' AND CAST(properties_associatedcompanyid AS STRING) = @parent_id THEN 2
                 ELSE 3
             END AS _priority
         FROM `{HUBSPOT_CONTACTS_TABLE}`
         WHERE (archived IS NOT TRUE OR archived IS NULL)
-          AND LOWER(TRIM(properties_firstname)) = LOWER('{first_name}')
-          AND LOWER(TRIM(properties_lastname))  = LOWER('{last_name}')
+          AND LOWER(TRIM(properties_firstname)) = LOWER(@first_name)
+          AND LOWER(TRIM(properties_lastname))  = LOWER(@last_name)
         ORDER BY _priority, contact_id
         LIMIT 20
         """
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("first_name",  "STRING", first_name),
+            bigquery.ScalarQueryParameter("last_name",   "STRING", last_name),
+            bigquery.ScalarQueryParameter("facility_id", "STRING", facility_hubspot_id or ""),
+            bigquery.ScalarQueryParameter("parent_id",   "STRING", parent_hubspot_id or ""),
+        ])
 
         try:
-            rows = client.query(name_query).to_dataframe()
+            rows = client.query(name_query, job_config=job_config).to_dataframe()
             rows = rows.replace(["nan", "None", "<NA>"], "")
 
             if rows.empty:
@@ -1091,15 +1108,18 @@ def get_facility_ids_for_network(client: bigquery.Client, network_id: int) -> li
     """
     facility_ids: set[int] = set()
 
+    _network_cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("network_id", "INT64", network_id),
+    ])
     for key, table in [("SNF", DH_TABLES["snf_overview"]), ("ALF", DH_TABLES["alf_overview"])]:
         query = f"""
         SELECT DISTINCT CAST(HOSPITAL_ID AS INT64) AS hospital_id
         FROM `{table}`
-        WHERE NETWORK_ID = {network_id}
+        WHERE NETWORK_ID = @network_id
           AND HOSPITAL_ID IS NOT NULL
         """
         try:
-            rows = client.query(query).result()
+            rows = client.query(query, job_config=_network_cfg).result()
             ids = {row.hospital_id for row in rows}
             facility_ids.update(ids)
             print(f"  ✓ {key} Overview: {len(ids)} child facilities")
@@ -1129,6 +1149,10 @@ def load_corporate_level_contacts(
 
     all_rows: list[dict] = []
 
+    _net_cfg = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("network_id", "INT64", network_id),
+    ])
+
     # ── Source 1: Executives table (contacts listed directly under the network ID) ──
     exec_query = f"""
     SELECT
@@ -1146,11 +1170,11 @@ def load_corporate_level_contacts(
         LAST_UPDATE,
         'executives' AS source_table
     FROM `{DH_TABLES['executives']}`
-    WHERE HOSPITAL_ID = {network_id}
-      AND LOWER(TRIM(TITLE)) IN ('executive director', 'administrator')
+    WHERE HOSPITAL_ID = @network_id
+      AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
     """
     try:
-        rows = [dict(r) for r in client.query(exec_query).result()]
+        rows = [dict(r) for r in client.query(exec_query, job_config=_net_cfg).result()]
         all_rows.extend(rows)
         print(f"    Executives table (network level): {len(rows)} rows")
     except Exception as e:
@@ -1173,11 +1197,11 @@ def load_corporate_level_contacts(
         LAST_UPDATE,
         'corporate_executives' AS source_table
     FROM `{DH_TABLES['corporation']}`
-    WHERE HOSPITAL_ID = {network_id}
-      AND LOWER(TRIM(TITLE)) IN ('executive director', 'administrator')
+    WHERE HOSPITAL_ID = @network_id
+      AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
     """
     try:
-        rows = [dict(r) for r in client.query(corp_query).result()]
+        rows = [dict(r) for r in client.query(corp_query, job_config=_net_cfg).result()]
         all_rows.extend(rows)
         print(f"    Corporate Executives table (network level): {len(rows)} rows")
     except Exception as e:
@@ -1200,18 +1224,18 @@ def load_corporate_level_contacts(
         LAST_UPDATE,
         'december_full_feed' AS source_table
     FROM `{DH_TABLES['full_feed']}`
-    WHERE HOSPITAL_ID = {network_id}
-      AND LOWER(TRIM(TITLE)) IN ('executive director', 'administrator')
+    WHERE HOSPITAL_ID = @network_id
+      AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
     """
     try:
-        rows = [dict(r) for r in client.query(feed_query).result()]
+        rows = [dict(r) for r in client.query(feed_query, job_config=_net_cfg).result()]
         all_rows.extend(rows)
         print(f"    December Full Feed (network level): {len(rows)} rows")
     except Exception as e:
         print(f"    ⚠ December Full Feed query failed: {e}")
 
     if not all_rows:
-        print("  ℹ No corporate-level ED/Administrator contacts found.")
+        print("  ℹ No corporate-level executive contacts found in Definitive Healthcare.")
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
@@ -1222,18 +1246,22 @@ def load_corporate_level_contacts(
     # Build set of exec_ids that have a facility-level row in ANY Definitive source
     facility_exec_ids: set = set()
     if exec_ids and facility_ids:
-        exec_ids_str = ",".join(str(int(e)) for e in exec_ids)
-        fac_ids_str  = ",".join(str(f) for f in facility_ids)
+        exec_ids_list = [int(e) for e in exec_ids]
+        fac_ids_list  = [int(f) for f in facility_ids]
 
         for table_key in ("executives", "full_feed"):
             fac_check_query = f"""
             SELECT DISTINCT EXECUTIVE_ID
             FROM `{DH_TABLES[table_key]}`
-            WHERE EXECUTIVE_ID IN ({exec_ids_str})
-              AND CAST(HOSPITAL_ID AS INT64) IN ({fac_ids_str})
+            WHERE EXECUTIVE_ID IN UNNEST(@exec_ids)
+              AND CAST(HOSPITAL_ID AS INT64) IN UNNEST(@fac_ids)
             """
+            fac_check_cfg = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("exec_ids", "INT64", exec_ids_list),
+                bigquery.ArrayQueryParameter("fac_ids",  "INT64", fac_ids_list),
+            ])
             try:
-                rows = client.query(fac_check_query).result()
+                rows = client.query(fac_check_query, job_config=fac_check_cfg).result()
                 ids  = {row.EXECUTIVE_ID for row in rows}
                 facility_exec_ids.update(ids)
             except Exception as e:
@@ -1280,14 +1308,17 @@ def load_hubspot_child_facilities(
         CAST(properties_definitive_healthcare_id AS STRING) AS definitive_id
     FROM `{HUBSPOT_COMPANIES_TABLE}`
     WHERE (archived IS NOT TRUE OR archived IS NULL)
-      AND CAST(properties_hs_parent_company_id AS STRING) = '{hubspot_corp_id}'
+      AND CAST(properties_hs_parent_company_id AS STRING) = @corp_id
       AND properties_name IS NOT NULL
       AND TRIM(properties_name) != ''
     ORDER BY properties_name
     """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("corp_id", "STRING", hubspot_corp_id),
+    ])
 
     try:
-        df = client.query(query).to_dataframe()
+        df = client.query(query, job_config=job_config).to_dataframe()
         df = df.replace(["nan", "None", "<NA>"], "")
         print(f"  ✓ Found {len(df)} child facilities in HubSpot")
         return df
@@ -1317,9 +1348,6 @@ def find_facilities_missing_leadership(
 
     print(f"\n  Checking {len(facility_ids)} facilities for existing ED/Administrator contacts...")
 
-    # Build a SQL list of facility IDs
-    ids_sql = ",".join(f"'{fid}'" for fid in facility_ids)
-
     # Query HubSpot contacts associated with these facilities that hold target titles
     contact_query = f"""
     SELECT DISTINCT
@@ -1330,7 +1358,7 @@ def find_facilities_missing_leadership(
         LOWER(TRIM(properties_jobtitle)) AS job_title
     FROM `{HUBSPOT_CONTACTS_TABLE}`
     WHERE (archived IS NOT TRUE OR archived IS NULL)
-      AND CAST(properties_associatedcompanyid AS STRING) IN ({ids_sql})
+      AND CAST(properties_associatedcompanyid AS STRING) IN UNNEST(@facility_ids)
       AND (
           LOWER(properties_jobtitle) LIKE '%executive director%'
           OR LOWER(properties_jobtitle) LIKE '%administrator%'
@@ -1340,8 +1368,11 @@ def find_facilities_missing_leadership(
       )
     """
 
+    contact_job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("facility_ids", "STRING", facility_ids),
+    ])
     try:
-        contacts_df = client.query(contact_query).to_dataframe()
+        contacts_df = client.query(contact_query, job_config=contact_job_config).to_dataframe()
         contacts_df = contacts_df.replace(["nan", "None", "<NA>"], "")
         print(f"  ✓ Found {len(contacts_df)} existing ED/Administrator contacts across facilities")
     except Exception as e:
@@ -1383,19 +1414,20 @@ def _research_one_contact(
     source   = str(row.get("source_table", ""))
 
     result: dict = {
-        "workflow":           "2 - Unassociated Contact",
-        "executive_id":       row.get("EXECUTIVE_ID", ""),
-        "contact_name":       contact_name,
-        "title":              title,
-        "email":              email,
-        "phone":              phone,
-        "linkedin":           linkedin,
-        "definitive_source":  source,
-        "corporation_name":   corporation_name,
-        "network_id":         network_id,
-        "research_findings":  "",
-        "research_error":     "",
-        "researched_at":      datetime.now().isoformat(),
+        "workflow":            "2 - Unassociated Contact",
+        "executive_id":        row.get("EXECUTIVE_ID", ""),
+        "contact_name":        contact_name,
+        "title":               title,
+        "email":               email,
+        "phone":               phone,
+        "linkedin":            linkedin,
+        "definitive_source":   source,
+        "corporation_name":    corporation_name,
+        "network_id":          network_id,
+        "research_confidence": "high",   # sourced directly from Definitive Healthcare
+        "research_findings":   "",
+        "research_error":      "",
+        "researched_at":       datetime.now().isoformat(),
     }
 
     try:
@@ -1689,11 +1721,14 @@ def _lookup_corporation_name(client: bigquery.Client, hubspot_corp_id: str) -> t
         properties_name         AS company_name,
         properties_facility_type AS facility_type
     FROM `{HUBSPOT_COMPANIES_TABLE}`
-    WHERE CAST(properties_hs_object_id AS STRING) = '{hubspot_corp_id}'
+    WHERE CAST(properties_hs_object_id AS STRING) = @corp_id
     LIMIT 1
     """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("corp_id", "STRING", hubspot_corp_id),
+    ])
     try:
-        rows = list(client.query(query).result())
+        rows = list(client.query(query, job_config=job_config).result())
         if rows:
             return str(rows[0].company_name or "Unknown Corporation"), str(rows[0].facility_type or "")
     except Exception as e:

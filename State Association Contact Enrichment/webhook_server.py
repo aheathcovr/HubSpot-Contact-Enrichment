@@ -11,7 +11,7 @@ Endpoints:
 
 Environment variables:
   HUBSPOT_API_KEY           HubSpot Private App token (required)
-  HUBSPOT_WEBHOOK_SECRET    HMAC secret for signature validation (optional)
+  HUBSPOT_WEBHOOK_SECRET    HMAC secret for signature validation (required)
   OPENROUTER_API_KEY        OpenRouter / Perplexity key (required for research)
   BQ_PROJECT_ID             GCP project (default: gen-lang-client-0844868008)
   BQ_LOCATION               BigQuery location (default: US)
@@ -22,7 +22,9 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Request, Response
@@ -35,12 +37,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger("webhook_server")
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="HubSpot Contact Enrichment", docs_url=None, redoc_url=None)
-
-HUBSPOT_WEBHOOK_SECRET = os.getenv("HUBSPOT_WEBHOOK_SECRET", "")
+# ── Startup validation ────────────────────────────────────────────────────────
+HUBSPOT_WEBHOOK_SECRET: str = ""
 TRIGGER_PROPERTY = "request_to_enrich"
 TRIGGER_VALUES = {"true", "1", "yes"}
+
+_COMPANY_ID_RE = re.compile(r'^\d{1,20}$')
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global HUBSPOT_WEBHOOK_SECRET
+    secret = os.getenv("HUBSPOT_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise RuntimeError(
+            "HUBSPOT_WEBHOOK_SECRET is required. "
+            "Set it to the HubSpot Private App webhook signing secret."
+        )
+    HUBSPOT_WEBHOOK_SECRET = secret
+    logger.info("Webhook signature validation enabled")
+    yield
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="HubSpot Contact Enrichment",
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
 
 
 # ── Signature validation ──────────────────────────────────────────────────────
@@ -132,29 +157,29 @@ async def handle_webhook(
     enqueue an enrichment background task for each unique company ID.
 
     Returns 200 immediately — enrichment runs asynchronously.
+    Requests without a valid HubSpot HMAC-SHA256 signature are rejected with 401.
     """
     body = await request.body()
 
-    # ── Optional signature validation ─────────────────────────────────────────
-    if HUBSPOT_WEBHOOK_SECRET:
-        sig_v3 = request.headers.get("X-HubSpot-Signature-V3", "")
-        timestamp = request.headers.get("X-HubSpot-Request-Timestamp", "")
-        if not sig_v3:
-            logger.warning("Webhook received without X-HubSpot-Signature-V3 header")
-            return JSONResponse({"error": "Missing signature"}, status_code=401)
+    # ── Signature validation (always enforced) ────────────────────────────────
+    sig_v3 = request.headers.get("X-HubSpot-Signature-V3", "")
+    timestamp = request.headers.get("X-HubSpot-Request-Timestamp", "")
+    if not sig_v3:
+        logger.warning("Webhook received without X-HubSpot-Signature-V3 header")
+        return JSONResponse({"error": "Missing signature"}, status_code=401)
 
-        url = str(request.url)
-        valid = _validate_hubspot_signature(
-            secret=HUBSPOT_WEBHOOK_SECRET,
-            method="POST",
-            url=url,
-            body=body,
-            timestamp=timestamp,
-            signature_v3=sig_v3,
-        )
-        if not valid:
-            logger.warning("Invalid HubSpot webhook signature — request rejected")
-            return JSONResponse({"error": "Invalid signature"}, status_code=401)
+    url = str(request.url)
+    valid = _validate_hubspot_signature(
+        secret=HUBSPOT_WEBHOOK_SECRET,
+        method="POST",
+        url=url,
+        body=body,
+        timestamp=timestamp,
+        signature_v3=sig_v3,
+    )
+    if not valid:
+        logger.warning("Invalid HubSpot webhook signature — request rejected")
+        return JSONResponse({"error": "Invalid signature"}, status_code=401)
 
     # ── Parse payload ─────────────────────────────────────────────────────────
     try:
@@ -172,7 +197,12 @@ async def handle_webhook(
         prop_value = str(event.get("propertyValue", "")).strip().lower()
         obj_id = str(event.get("objectId", "") or event.get("companyId", "")).strip()
 
-        if prop_name == TRIGGER_PROPERTY and prop_value in TRIGGER_VALUES and obj_id:
+        if not _COMPANY_ID_RE.match(obj_id):
+            if obj_id:
+                logger.warning(f"Ignoring event with invalid company_id format: {obj_id!r}")
+            continue
+
+        if prop_name == TRIGGER_PROPERTY and prop_value in TRIGGER_VALUES:
             queued_ids.add(obj_id)
 
     for company_id in queued_ids:
