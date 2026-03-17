@@ -38,3 +38,6 @@ steps:
 images:
   - 'gcr.io/$PROJECT_ID/hubspot-enrichment:$COMMIT_SHA'
   - 'gcr.io/$PROJECT_ID/hubspot-enrichment:latest'
+
+options:
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
