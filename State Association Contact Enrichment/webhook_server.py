@@ -1,19 +1,24 @@
 """
 FastAPI webhook server for HubSpot contact enrichment.
 
-Receives HubSpot company property-change webhooks and fires the enrichment
-workflow as a background task, returning 200 immediately so HubSpot doesn't
-retry.
+Receives HubSpot company property-change webhooks, enqueues a Cloud Tasks job,
+and returns 200 immediately so HubSpot doesn't retry. Cloud Tasks then delivers
+a POST /enrich request to this service, which runs the enrichment synchronously.
 
 Endpoints:
   GET  /health   — health check (used by Cloud Run)
-  POST /webhook  — HubSpot company webhook receiver
+  POST /webhook  — HubSpot company webhook receiver (enqueues Cloud Task)
+  POST /enrich   — Cloud Tasks delivery endpoint (runs enrichment synchronously)
 
 Environment variables:
   HUBSPOT_API_KEY           HubSpot Private App token (required)
   HUBSPOT_WEBHOOK_SECRET    HMAC secret for signature validation (required)
   OPENROUTER_API_KEY        OpenRouter / Perplexity key (required for research)
-  BQ_PROJECT_ID             GCP project (default: gen-lang-client-0844868008)
+  GCP_PROJECT_ID            GCP project (default: gen-lang-client-0844868008)
+  GCP_LOCATION              GCP region (default: us-central1)
+  CLOUD_TASKS_QUEUE         Cloud Tasks queue name (default: hubspot-enrichment)
+  CLOUD_RUN_SERVICE_URL     Base URL of this Cloud Run service (required for Cloud Tasks)
+  CLOUD_TASKS_SA_EMAIL      Service account email for OIDC auth on /enrich (required)
   BQ_LOCATION               BigQuery location (default: US)
 """
 
@@ -27,7 +32,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -135,6 +140,53 @@ def _run_enrichment_safe(company_id: str) -> None:
             )
 
 
+# ── Cloud Tasks enqueue ───────────────────────────────────────────────────────
+
+
+def _enqueue_enrichment(company_id: str) -> None:
+    """
+    Create a Cloud Tasks HTTP task that delivers POST /enrich to this service.
+
+    Cloud Tasks owns the job lifecycle: it retries on non-2xx responses and
+    guarantees at-least-once delivery, so enrichment jobs survive instance
+    shutdowns.
+
+    Required env vars: CLOUD_RUN_SERVICE_URL, CLOUD_TASKS_SA_EMAIL
+    Optional env vars: GCP_PROJECT_ID, GCP_LOCATION, CLOUD_TASKS_QUEUE
+    """
+    from google.cloud import tasks_v2
+
+    project  = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0844868008")
+    location = os.getenv("GCP_LOCATION", "us-central1")
+    queue    = os.getenv("CLOUD_TASKS_QUEUE", "hubspot-enrichment")
+    base_url = os.getenv("CLOUD_RUN_SERVICE_URL", "").rstrip("/")
+    sa_email = os.getenv("CLOUD_TASKS_SA_EMAIL", "")
+
+    if not base_url:
+        raise RuntimeError("CLOUD_RUN_SERVICE_URL is required for Cloud Tasks enqueue")
+    if not sa_email:
+        raise RuntimeError("CLOUD_TASKS_SA_EMAIL is required for Cloud Tasks enqueue")
+
+    client = tasks_v2.CloudTasksClient()
+    parent = client.queue_path(project, location, queue)
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": f"{base_url}/enrich",
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"company_id": company_id}).encode(),
+            "oidc_token": {
+                "service_account_email": sa_email,
+                "audience": base_url,
+            },
+        }
+    }
+
+    response = client.create_task(request={"parent": parent, "task": task})
+    logger.info(f"Enqueued Cloud Task {response.name} for company_id={company_id}")
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
@@ -145,18 +197,15 @@ async def health() -> dict:
 
 
 @app.post("/webhook")
-async def handle_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-) -> JSONResponse:
+async def handle_webhook(request: Request) -> JSONResponse:
     """
     Receive a HubSpot company property-change webhook.
 
     HubSpot sends a JSON array of event objects. We filter for events where
     propertyName == "request_to_enrich" and propertyValue is truthy, then
-    enqueue an enrichment background task for each unique company ID.
+    enqueue a Cloud Task for each unique company ID.
 
-    Returns 200 immediately — enrichment runs asynchronously.
+    Returns 200 immediately — enrichment runs via Cloud Tasks delivery to /enrich.
     Requests without a valid HubSpot HMAC-SHA256 signature are rejected with 401.
     """
     body = await request.body()
@@ -206,10 +255,41 @@ async def handle_webhook(
             queued_ids.add(obj_id)
 
     for company_id in queued_ids:
-        logger.info(f"Queuing enrichment for company_id={company_id}")
-        background_tasks.add_task(_run_enrichment_safe, company_id)
+        logger.info(f"Enqueuing Cloud Task for company_id={company_id}")
+        try:
+            _enqueue_enrichment(company_id)
+        except Exception as exc:
+            logger.exception(f"Failed to enqueue Cloud Task for company {company_id}: {exc}")
 
     logger.info(
-        f"Webhook processed: {len(events)} event(s), {len(queued_ids)} enrichment(s) queued"
+        f"Webhook processed: {len(events)} event(s), {len(queued_ids)} enrichment(s) enqueued"
     )
     return JSONResponse({"status": "accepted", "queued": len(queued_ids)})
+
+
+@app.post("/enrich")
+async def handle_enrich(request: Request) -> JSONResponse:
+    """
+    Cloud Tasks delivery endpoint — runs enrichment synchronously.
+
+    Cloud Tasks delivers POST /enrich with {"company_id": "<id>"} in the body.
+    This endpoint runs enrichment to completion before returning 200, so Cloud
+    Tasks knows the job succeeded. On failure, _run_enrichment_safe handles
+    cleanup (resetting request_to_enrich) and logs the error.
+
+    Cloud Run's --no-allow-unauthenticated + OIDC token on the task ensures
+    only Cloud Tasks (via the configured service account) can call this endpoint.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    company_id = str(body.get("company_id", "")).strip()
+    if not _COMPANY_ID_RE.match(company_id):
+        logger.warning(f"/enrich received invalid company_id: {company_id!r}")
+        return JSONResponse({"error": "Invalid company_id"}, status_code=400)
+
+    logger.info(f"Running enrichment for company_id={company_id}")
+    _run_enrichment_safe(company_id)
+    return JSONResponse({"status": "done", "company_id": company_id})
