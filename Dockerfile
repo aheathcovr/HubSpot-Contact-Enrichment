@@ -21,6 +21,9 @@ COPY ["State Association Contact Enrichment/", "./"]
 # So the guide must live at /state_association_agent_guide.md inside the container.
 COPY state_association_agent_guide.md /state_association_agent_guide.md
 
+# Create cache directory and set ownership before dropping privileges
+RUN mkdir -p /app/.llm_cache && chown appuser /app/.llm_cache
+
 # Drop root privileges before starting the server
 USER appuser
 
