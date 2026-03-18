@@ -136,9 +136,10 @@ _CONTACT_JSON_SCHEMA = {
                 "enum": ["high", "medium", "low", "not_found"]
             },
             "source_url":  {"type": "string"},
+            "reasoning":   {"type": "string"},
         },
         "required": ["found_name", "found_title", "found_email",
-                     "found_phone", "confidence", "source_url"],
+                     "found_phone", "confidence", "source_url", "reasoning"],
         "additionalProperties": False,
      },
 }
@@ -175,6 +176,7 @@ Accuracy rules (strictly enforced):
 - confidence="not_found" → no verified name located; never guess or hallucinate a name
 
 Always cite the exact URL where you found the name.
+In the "reasoning" field, write 2–5 sentences explaining: which specific source confirmed this person's name and title, any date visible on that source (event date, publication date, page last-updated), why you are confident this is the current person and not a former employee, and any corroborating sources. If multiple sources agree, name them. If the source is recent (within 12 months), say so explicitly.
 Your response MUST be a single valid JSON object matching the required schema — no extra text.\
 """
 
@@ -380,7 +382,7 @@ def call_openrouter(
     return result
 
 
-def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
+def parse_found_name(research_text: str) -> tuple[str, str, str, str, str, str]:
     """
     Extract structured contact fields from an OpenRouter research response.
 
@@ -390,24 +392,25 @@ def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
       2. Legacy free-text output: the JSON block is embedded inside a ```json
          fenced code block or as a bare object at the end of the response.
 
-    Returns (found_name, found_title, confidence, found_email, found_phone).
-    Returns ("", "", "not_found", "", "") if parsing fails entirely.
+    Returns (found_name, found_title, confidence, found_email, found_phone, reasoning).
+    Returns ("", "", "not_found", "", "", "") if parsing fails entirely.
     """
     import re
     import json
 
-    def _extract_fields(data: dict) -> tuple[str, str, str, str, str]:
-        name  = str(data.get("found_name",  "") or "").strip()
-        title = str(data.get("found_title", "") or "").strip()
-        conf  = str(data.get("confidence",  "not_found") or "not_found").strip().lower()
-        email = str(data.get("found_email", "") or "").strip()
-        phone = str(data.get("found_phone", "") or "").strip()
+    def _extract_fields(data: dict) -> tuple[str, str, str, str, str, str]:
+        name      = str(data.get("found_name",  "") or "").strip()
+        title     = str(data.get("found_title", "") or "").strip()
+        conf      = str(data.get("confidence",  "not_found") or "not_found").strip().lower()
+        email     = str(data.get("found_email", "") or "").strip()
+        phone     = str(data.get("found_phone", "") or "").strip()
+        reasoning = str(data.get("reasoning",   "") or "").strip()
         if conf not in ("high", "medium", "low", "not_found"):
             logger.warning(
                 "parse_found_name: unexpected confidence value %r — treating as not_found", conf
             )
             conf = "not_found"
-        return name, title, conf, email, phone
+        return name, title, conf, email, phone, reasoning
 
     # ── Path 1: structured output — the whole response is a JSON object ──────────
     stripped = research_text.strip()
@@ -436,7 +439,7 @@ def parse_found_name(research_text: str) -> tuple[str, str, str, str, str]:
         "parse_found_name: no valid JSON block in response (response_len=%d)",
         len(research_text),
     )
-    return "", "", "not_found", "", ""
+    return "", "", "not_found", "", "", ""
 
 
 def normalize_phone(phone: str) -> str:
@@ -1543,7 +1546,7 @@ def _research_one_facility(
         print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result[:2000]
 
-        found_name, found_title, confidence, found_email, found_phone = parse_found_name(
+        found_name, found_title, confidence, found_email, found_phone, reasoning = parse_found_name(
             research_result
         )
         result.update({
@@ -1552,6 +1555,7 @@ def _research_one_facility(
             "research_confidence": confidence,
             "found_email":         found_email,
             "found_phone":         found_phone,
+            "research_reasoning":  reasoning,
         })
 
         if found_name and confidence != "not_found":

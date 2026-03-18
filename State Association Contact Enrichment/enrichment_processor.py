@@ -107,6 +107,7 @@ class ContactAction:
     email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
     email_validation_quality: str = ""  # good | ok | bad | ""
     fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
+    research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -269,6 +270,7 @@ def _build_contact_enrichment_note(
     facility_name: str,
     note_lines: list[str],
     fe_info: dict,
+    research_reasoning: str = "",
 ) -> str:
     """HTML enrichment note written directly on a contact record."""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -280,8 +282,10 @@ def _build_contact_enrichment_note(
         f"<b>Run date:</b> {now_str} &nbsp;&middot;&nbsp; "
         f"<b>Title:</b> {contact_title} &nbsp;&middot;&nbsp; "
         f"<b>Facility:</b> {facility_name}<br><br>"
-        f"<b>{section}</b><br>"
     )
+    if research_reasoning:
+        h += f"<b>Why This Contact</b><br>{research_reasoning}<br><br>"
+    h += f"<b>{section}</b><br>"
     for entry in note_lines:
         h += entry  # each helper already returns HTML
 
@@ -330,6 +334,7 @@ def _process_found_contact(
     source_tier: str = "",
     found_linkedin: str = "",
     facility_domain: str = "",
+    research_reasoning: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
@@ -363,6 +368,7 @@ def _process_found_contact(
         target_company_id=target_company_id,
         email_validation_status=email_validation.get("status", ""),
         email_validation_quality=email_validation.get("quality", ""),
+        research_reasoning=research_reasoning,
     )
 
     if not found_name or confidence == "not_found":
@@ -566,6 +572,7 @@ def _process_found_contact(
                         facility_name=facility_name,
                         note_lines=note_lines,
                         fe_info=fe_info,
+                        research_reasoning=research_reasoning,
                     )
                     hs.create_note_on_contact(matched_contact_id, contact_note)
                 except HubSpotError as exc:
@@ -689,6 +696,7 @@ def _process_found_contact(
                 facility_name=facility_name,
                 note_lines=new_note_lines,
                 fe_info=new_fe_info,
+                research_reasoning=research_reasoning,
             )
             hs.create_note_on_contact(new_id, contact_note)
         except HubSpotError as exc:
@@ -887,15 +895,16 @@ def _run_workflow1_single_facility(
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 
-        found_name, found_title, confidence, found_email, found_phone = parse_found_name(
+        found_name, found_title, confidence, found_email, found_phone, reasoning = parse_found_name(
             research_result
         )
         result.update({
-            "found_name": found_name,
-            "found_title": found_title,
+            "found_name":         found_name,
+            "found_title":        found_title,
             "research_confidence": confidence,
-            "found_email": found_email,
-            "found_phone": found_phone,
+            "found_email":        found_email,
+            "found_phone":        found_phone,
+            "research_reasoning": reasoning,
         })
 
         if found_name and confidence != "not_found":
@@ -1068,6 +1077,8 @@ def _build_note(
             conf_label = _CONFIDENCE_LABELS.get(action.confidence, action.confidence)
             h += f"<b>Contact:</b> {action.contact_name}, {action.contact_title}<br>"
             h += f"<b>Confidence:</b> {conf_label}<br>"
+            if action.research_reasoning:
+                h += f"<b>Why:</b> {action.research_reasoning}<br>"
             if action.found_email:
                 vstatus  = action.email_validation_status
                 vquality = action.email_validation_quality
@@ -1375,6 +1386,7 @@ def run_enrichment(company_id: str) -> None:
             source_tier=str(result.get("source_tier", "")),
             found_linkedin=result.get("found_linkedin", "") or result.get("linkedin", ""),
             facility_domain=props.get("website", "") or "",
+            research_reasoning=result.get("research_reasoning", ""),
         )
         actions.append(action)
         if action.action == "error":
