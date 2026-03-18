@@ -109,6 +109,7 @@ class ContactAction:
     email_validation_quality: str = ""  # good | ok | bad | ""
     fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
     research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
+    research_source_name: str = ""      # Human-readable name of the source (e.g. "WA HCAP directory")
     source_path: str = ""               # "existing_contact" | "sonar_pro" | "fullenrich_people_search"
     fe_people_search_ran: bool = False  # True when FE People Search ran but found nothing
     dh_verified: bool = False           # True when DH confirms this person at this facility
@@ -233,6 +234,7 @@ def _is_source_stale(reasoning: str) -> tuple[bool, str]:
 
 def _compute_data_freshness(
     source_path: str,
+    research_source_name: str,
     research_reasoning: str,
     dh_verified: bool,
     dh_last_update: str,
@@ -247,9 +249,10 @@ def _compute_data_freshness(
     """
     if source_path == "sonar_pro":
         d = _extract_most_recent_date(research_reasoning)
+        source_label = research_source_name if research_source_name else "web search"
         if d:
-            return f"Sonar Pro web search ({d.strftime('%B %Y')})"
-        return "Sonar Pro web search — source date not available"
+            return f"{source_label} ({d.strftime('%B %Y')})"
+        return f"{source_label} — source date not available"
 
     if source_path == "fullenrich_people_search":
         if fe_updated_at:
@@ -448,6 +451,7 @@ def _process_found_contact(
     dh_verification_detail: str = "",
     dh_last_update: str = "",
     fe_updated_at: str = "",
+    research_source_name: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
@@ -488,11 +492,13 @@ def _process_found_contact(
         dh_verification_detail=dh_verification_detail,
         dh_last_update=dh_last_update,
         fe_updated_at=fe_updated_at,
+        research_source_name=research_source_name,
     )
 
     # Compute data freshness value once — written to HubSpot on both create + update paths
     data_freshness_value = _compute_data_freshness(
         source_path=source_path,
+        research_source_name=research_source_name,
         research_reasoning=research_reasoning,
         dh_verified=dh_verified,
         dh_last_update=dh_last_update,
@@ -1090,16 +1096,17 @@ def _run_workflow1_single_facility(
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 
-        found_name, found_title, confidence, found_email, found_phone, reasoning = parse_found_name(
+        found_name, found_title, confidence, found_email, found_phone, reasoning, source_name = parse_found_name(
             research_result
         )
         result.update({
-            "found_name":         found_name,
-            "found_title":        found_title,
-            "research_confidence": confidence,
-            "found_email":        found_email,
-            "found_phone":        found_phone,
-            "research_reasoning": reasoning,
+            "found_name":             found_name,
+            "found_title":            found_title,
+            "research_confidence":    confidence,
+            "found_email":            found_email,
+            "found_phone":            found_phone,
+            "research_reasoning":     reasoning,
+            "research_source_name":   source_name,
         })
 
         if found_name and confidence != "not_found":
@@ -1673,6 +1680,7 @@ def run_enrichment(company_id: str) -> None:
             dh_verification_detail=result.get("dh_verification_detail", ""),
             dh_last_update=result.get("dh_last_update", ""),
             fe_updated_at=result.get("fe_updated_at", ""),
+            research_source_name=result.get("research_source_name", ""),
         )
         actions.append(action)
         if action.action == "error":
