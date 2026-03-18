@@ -108,6 +108,8 @@ class ContactAction:
     email_validation_quality: str = ""  # good | ok | bad | ""
     fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
     research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
+    source_path: str = ""               # "existing_contact" | "sonar_pro" | "fullenrich_people_search"
+    fe_people_search_ran: bool = False  # True when FE People Search ran but found nothing
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -335,6 +337,8 @@ def _process_found_contact(
     found_linkedin: str = "",
     facility_domain: str = "",
     research_reasoning: str = "",
+    source_path: str = "",
+    fe_people_search_ran: bool = False,
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
@@ -369,6 +373,8 @@ def _process_found_contact(
         email_validation_status=email_validation.get("status", ""),
         email_validation_quality=email_validation.get("quality", ""),
         research_reasoning=research_reasoning,
+        source_path=source_path,
+        fe_people_search_ran=fe_people_search_ran,
     )
 
     if not found_name or confidence == "not_found":
@@ -790,6 +796,7 @@ def _enrich_existing_leadership(
             "found_phone":           c["phone"],
             "research_confidence":   "high",
             "source_tier":           "",
+            "source_path":           "existing_contact",
             "hubspot_contact_ids":   c["id"],   # flows to associated_existing path
             "hubspot_match_detail":  "already associated",
             "hubspot_match_summary": "existing",
@@ -870,6 +877,7 @@ def _run_workflow1_single_facility(
         "found_phone": "",
         "research_confidence": "not_found",
         "source_tier": "3",
+        "source_path": "sonar_pro",   # Sonar Pro always runs on this path
         "hubspot_contact_ids": "",
         "hubspot_match_detail": "",
         "hubspot_match_summary": "",
@@ -954,6 +962,7 @@ def _run_workflow1_single_facility(
                     "found_title":         fe["title"],
                     "research_confidence": "low_fullenrich",
                     "source_tier":         "",   # not found via state directory
+                    "source_path":         "fullenrich_people_search",
                     "found_email":         "",
                     "found_phone":         "",
                     "found_linkedin":      fe.get("linkedin_url", ""),
@@ -965,6 +974,7 @@ def _run_workflow1_single_facility(
             return fe_results
         else:
             logger.info(f"  FullEnrich: no contacts found for {facility_name}")
+            result["fe_people_search_ran"] = True
 
     return [result]
 
@@ -1034,37 +1044,84 @@ def _build_note(
         f"{n_missed} not found<br><br>"
     )
 
-    # ── What Was Searched ─────────────────────────────────────────────────────
-    h += "<b>What Was Searched</b><br>Data sources (checked in this order):<ol>"
-    h += "<li>Definitive Healthcare Executives table (BigQuery)</li>"
-    h += "<li>Definitive Healthcare Contact Full Feed (BigQuery)</li>"
-    if tier_str:
-        tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
-        h += f"<li>State association directory &mdash; {tier_label}</li>"
+    # ── Research Process (dynamic step outcomes) ──────────────────────────────
+    existing_contact_actions = [a for a in actions if a.source_path == "existing_contact"]
+    sonar_pro_actions        = [a for a in actions if a.source_path == "sonar_pro"]
+    fe_ps_actions            = [a for a in actions if a.source_path == "fullenrich_people_search"]
+    fe_ps_ran_not_found      = any(a.fe_people_search_ran for a in actions)
+    fe_people_search         = bool(fe_ps_actions)   # used later for How to Verify
+    fe_bulk_enrich_actions   = [a for a in actions if a.fe_email_found]
+
+    h += "<b>Research Process</b><br><ol>"
+
+    if existing_contact_actions:
+        # Fast path: facility already had an Admin/ED in HubSpot
+        names = ", ".join(
+            f"{a.contact_name} ({a.contact_title})"
+            for a in existing_contact_actions if a.contact_name
+        )
+        h += f"<li><b>HubSpot existing contact check</b> &mdash; ✓ Found on file: {names}</li>"
     else:
-        h += "<li>State association directory</li>"
-    h += "<li>Web search via Perplexity Sonar Pro (live internet search)</li>"
-
-    if any(a.found_email for a in actions):
-        mv_active = bool(os.getenv("MILLIONVERIFIER_API_KEY", "").strip())
-        if mv_active:
-            h += "<li>MillionVerifier API &mdash; email deliverability validation</li>"
+        # Full research path
+        h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
+        if tier_str:
+            tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
+            h += f"<li><b>State association directory</b> &mdash; {tier_label}</li>"
         else:
-            h += "<li>MillionVerifier API &mdash; <em>skipped (MILLIONVERIFIER_API_KEY not configured)</em></li>"
+            h += "<li><b>State association directory</b> &mdash; no state directory available; web search used</li>"
 
-    fe_people_search = any(a.found_linkedin for a in actions)
-    fe_bulk_enrich = any(a.fe_email_found for a in actions)
-    if fe_people_search or fe_bulk_enrich:
-        fe_active = bool(os.getenv("FULLENRICH_API_KEY", "").strip())
-        if fe_active:
-            if fe_people_search and not fe_bulk_enrich:
-                h += "<li>FullEnrich People Search &mdash; contact discovery fallback (Sonar Pro returned nothing)</li>"
-            elif fe_bulk_enrich and not fe_people_search:
-                h += "<li>FullEnrich Bulk Enrich &mdash; email enrichment for found contact</li>"
-            else:
-                h += "<li>FullEnrich &mdash; contact discovery + email enrichment</li>"
+        # Sonar Pro outcome
+        sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
+        sonar_missed = (
+            any(a.source_path == "sonar_pro" and a.action == "no_contact_found" for a in actions)
+            or fe_ps_actions          # FE PS only runs after Sonar Pro finds nothing
+            or fe_ps_ran_not_found
+        )
+        if sonar_found:
+            a = sonar_found[0]
+            conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
+            h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+        elif sonar_missed:
+            h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No contact identified</li>"
         else:
-            h += "<li>FullEnrich &mdash; <em>skipped (FULLENRICH_API_KEY not configured)</em></li>"
+            h += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
+
+        # FullEnrich People Search outcome
+        if fe_ps_actions:
+            fe_names = ", ".join(
+                f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
+            )
+            h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
+        elif fe_ps_ran_not_found:
+            h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
+
+    # MillionVerifier outcome (runs when any email is present)
+    emails_checked = [a for a in actions if a.email_validation_status and a.action != "error"]
+    if emails_checked:
+        mv_labels = {
+            "VERIFIED":   "✓ Verified — inbox confirmed deliverable",
+            "INVALID":    "✗ Invalid — address does not exist",
+            "RISKY":      "~ Risky — catch-all domain; deliverability uncertain",
+            "UNKNOWN":    "? Unverifiable (M365 blocks SMTP probe — likely valid)",
+            "UNVERIFIED": "not checked (API key not configured)",
+            "ERROR":      "validation error",
+        }
+        if len(emails_checked) == 1:
+            a = emails_checked[0]
+            mv_text = mv_labels.get(a.email_validation_status, a.email_validation_status)
+            h += f"<li><b>MillionVerifier</b> &mdash; {mv_text}</li>"
+        else:
+            parts = "; ".join(
+                f"{a.contact_name}: {mv_labels.get(a.email_validation_status, a.email_validation_status)}"
+                for a in emails_checked
+            )
+            h += f"<li><b>MillionVerifier</b> &mdash; {parts}</li>"
+
+    # FullEnrich Bulk Enrich outcome (email enrichment for a found contact)
+    if fe_bulk_enrich_actions:
+        fe_emails = ", ".join(a.found_email for a in fe_bulk_enrich_actions if a.found_email)
+        h += f"<li><b>FullEnrich Bulk Enrich</b> &mdash; ✓ Email found: {fe_emails}</li>"
+
     h += "</ol><br>"
 
     # ── Per-contact results ───────────────────────────────────────────────────
@@ -1378,6 +1435,8 @@ def run_enrichment(company_id: str) -> None:
             found_linkedin=result.get("found_linkedin", "") or result.get("linkedin", ""),
             facility_domain=props.get("website", "") or "",
             research_reasoning=result.get("research_reasoning", ""),
+            source_path=result.get("source_path", ""),
+            fe_people_search_ran=result.get("fe_people_search_ran", False),
         )
         actions.append(action)
         if action.action == "error":
