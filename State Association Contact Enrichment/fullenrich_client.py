@@ -233,16 +233,22 @@ def _best_candidate(
     state: str,
     identifier: str,
     title_filter: str,
+    min_score: int = 0,
 ) -> dict | None:
     """
     From a list of FullEnrich person dicts, return the best location-matched contact.
 
     Scoring: 2 = city+state match, 1 = state match, 0 = no data.
-    Falls back to the first result when no location data is available.
+    Falls back to the first result when no location data is available (unless
+    min_score > 0, in which case score-0 candidates are rejected entirely).
     Logs the score so operators can judge match quality.
 
     Skips candidates whose actual title is a tech/IT role (e.g. "Database Administrator")
     so that searches for healthcare "Administrator" don't return IT staff.
+
+    min_score=1 should be passed whenever city and state are known, to avoid
+    returning a contact from a different state (e.g. a shared corporate domain
+    like brookdale.com matching Brookdale employees in the wrong state).
     """
     if not people:
         return None
@@ -274,15 +280,24 @@ def _best_candidate(
         return None
 
     score_label = {2: "city+state", 1: "state-only", 0: "no-location-data"}[best_score]
+
+    if best_score < min_score:
+        logger.warning(
+            "FullEnrich: best candidate for %r/title=%r is %r (score=%s) but "
+            "facility is %r, %r — rejecting to avoid wrong-facility match",
+            identifier, title_filter, contact["full_name"], score_label, city, state,
+        )
+        return None
+
     logger.info(
         "FullEnrich found: %r (%r) at %r via title=%r [location match: %s]",
         contact["full_name"], contact["title"], identifier, title_filter, score_label,
     )
-    if best_score == 0 and len(people) > 1:
+    if best_score == 0 and len(eligible) > 1:
         logger.warning(
             "FullEnrich name search for %r matched %d candidate(s) but none had "
             "location data — returning first result; verify this is the correct facility",
-            identifier, len(people),
+            identifier, len(eligible),
         )
 
     return contact
@@ -327,11 +342,17 @@ def search_facility_contacts(
     contacts: list[dict] = []
     seen_names: set[str] = set()
 
+    # Require at least a state match when the facility location is known.
+    # This prevents shared corporate domains (e.g. brookdale.com) from returning
+    # employees at the wrong facility in a different state.
+    min_score = 1 if (city or state) else 0
+
     for title_filter in titles:
-        # Domain search: exact match, no ambiguity → limit=1 is fine
+        # Domain search: fetch multiple candidates so location scoring can pick
+        # the right facility — a single result gives nothing to compare against.
         if bare_domain:
             raw_people = _search_one_title(
-                api_key=api_key, title=title_filter, domain=bare_domain, limit=1,
+                api_key=api_key, title=title_filter, domain=bare_domain, limit=5,
             )
             # Fall back to name search if domain not indexed in FullEnrich
             if not raw_people and company_name:
@@ -350,7 +371,9 @@ def search_facility_contacts(
                 company_name=company_name, limit=5,
             )
 
-        contact = _best_candidate(raw_people, city, state, identifier, title_filter)
+        contact = _best_candidate(
+            raw_people, city, state, identifier, title_filter, min_score=min_score,
+        )
         if contact and contact["full_name"] not in seen_names:
             seen_names.add(contact["full_name"])
             contacts.append(contact)
