@@ -40,6 +40,7 @@ from state_association_matcher import (
     find_facilities_missing_leadership,
     lookup_hubspot_contact_enhanced,
     parse_found_name,
+    verify_contact_in_definitive,
     workflow_2_research_contacts,
     RATE_LIMIT_SECONDS,
     RESEARCH_SYSTEM_PROMPT,
@@ -110,6 +111,8 @@ class ContactAction:
     research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
     source_path: str = ""               # "existing_contact" | "sonar_pro" | "fullenrich_people_search"
     fe_people_search_ran: bool = False  # True when FE People Search ran but found nothing
+    dh_verified: bool = False           # True when DH confirms this person at this facility
+    dh_verification_detail: str = ""    # Human-readable DH verification outcome
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -388,6 +391,8 @@ def _process_found_contact(
     research_reasoning: str = "",
     source_path: str = "",
     fe_people_search_ran: bool = False,
+    dh_verified: bool = False,
+    dh_verification_detail: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
@@ -424,6 +429,8 @@ def _process_found_contact(
         research_reasoning=research_reasoning,
         source_path=source_path,
         fe_people_search_ran=fe_people_search_ran,
+        dh_verified=dh_verified,
+        dh_verification_detail=dh_verification_detail,
     )
 
     if not found_name or confidence == "not_found":
@@ -793,6 +800,7 @@ def _enrich_existing_leadership(
     company_id: str,
     props: dict,
     parent_corp_name: str,
+    bq_client=None,
 ) -> list[dict]:
     """
     Called when the facility already has an Admin/ED in HubSpot.
@@ -829,29 +837,67 @@ def _enrich_existing_leadership(
     results: list[dict] = []
     for c in leadership:
         full_name = f"{c['firstname']} {c['lastname']}".strip()
+
+        # ── Definitive Healthcare verification ────────────────────────────────
+        dh_verified = False
+        dh_verification_detail = ""
+        if bq_client and definitive_id:
+            dh = verify_contact_in_definitive(
+                client=bq_client,
+                first_name=c["firstname"],
+                last_name=c["lastname"],
+                definitive_hospital_id=definitive_id,
+            )
+            if dh.get("error") == "query_failed":
+                dh_verification_detail = "DH lookup unavailable (query error)"
+            elif dh["confirmed"]:
+                dh_verified = True
+                table_label = {"executives": "Executives table", "full_feed": "Full Feed"}.get(
+                    dh["source_table"], dh["source_table"]
+                )
+                last_update = dh.get("dh_last_update", "")
+                update_str = f", updated {last_update}" if last_update else ""
+                dh_verification_detail = f"✓ Confirmed in DH {table_label}{update_str}"
+                logger.info(
+                    "DH confirmed %s at %s (%s)",
+                    full_name, facility_name, dh["source_table"],
+                )
+            else:
+                dh_verification_detail = "✗ Not found in Definitive Healthcare — verify this contact is still current"
+                logger.info(
+                    "DH: %s not found at HOSPITAL_ID=%s (%s)",
+                    full_name, definitive_id, facility_name,
+                )
+        elif not definitive_id:
+            dh_verification_detail = "Facility has no Definitive Healthcare ID — cannot verify"
+        else:
+            dh_verification_detail = "DH check skipped (BigQuery unavailable)"
+
         results.append({
-            "workflow":              "1 - Facility Missing Contact",
-            "hubspot_facility_id":   company_id,
-            "facility_name":         facility_name,
-            "city":                  city,
-            "state":                 state,
-            "facility_type":         facility_type,
-            "definitive_id":         definitive_id,
-            "corporation_name":      parent_corp_name,
-            "hubspot_corp_id":       parent_id,
-            "found_name":            full_name,
-            "found_title":           c["jobtitle"],
-            "found_email":           c["email"],
-            "found_phone":           c["phone"],
-            "research_confidence":   "high",
-            "source_tier":           "",
-            "source_path":           "existing_contact",
-            "hubspot_contact_ids":   c["id"],   # flows to associated_existing path
-            "hubspot_match_detail":  "already associated",
-            "hubspot_match_summary": "existing",
-            "research_findings":     "",
-            "research_error":        "",
-            "researched_at":         datetime.now().isoformat(),
+            "workflow":               "1 - Facility Missing Contact",
+            "hubspot_facility_id":    company_id,
+            "facility_name":          facility_name,
+            "city":                   city,
+            "state":                  state,
+            "facility_type":          facility_type,
+            "definitive_id":          definitive_id,
+            "corporation_name":       parent_corp_name,
+            "hubspot_corp_id":        parent_id,
+            "found_name":             full_name,
+            "found_title":            c["jobtitle"],
+            "found_email":            c["email"],
+            "found_phone":            c["phone"],
+            "research_confidence":    "high",
+            "source_tier":            "",
+            "source_path":            "existing_contact",
+            "dh_verified":            dh_verified,
+            "dh_verification_detail": dh_verification_detail,
+            "hubspot_contact_ids":    c["id"],
+            "hubspot_match_detail":   "already associated",
+            "hubspot_match_summary":  "existing",
+            "research_findings":      "",
+            "research_error":         "",
+            "researched_at":          datetime.now().isoformat(),
         })
     return results
 
@@ -906,8 +952,8 @@ def _run_workflow1_single_facility(
     if missing is None:
         missing = find_facilities_missing_leadership(bq_client, facility_df)
     if missing.empty:
-        logger.info(f"  ✅ {facility_name} already has an Admin/ED — checking email/phone")
-        return _enrich_existing_leadership(hs, company_id, props, parent_corp_name)
+        logger.info(f"  ✅ {facility_name} already has an Admin/ED — verifying against DH + checking email/phone")
+        return _enrich_existing_leadership(hs, company_id, props, parent_corp_name, bq_client=bq_client)
 
     # Research the facility
     result: dict = {
@@ -1111,6 +1157,23 @@ def _build_note(
             for a in existing_contact_actions if a.contact_name
         )
         h += f"<li><b>HubSpot existing contact check</b> &mdash; ✓ Found on file: {names}</li>"
+
+        # DH verification summary across all existing contacts
+        confirmed  = [a for a in existing_contact_actions if a.dh_verified]
+        unconfirmed = [a for a in existing_contact_actions if not a.dh_verified and a.dh_verification_detail]
+        if confirmed and not unconfirmed:
+            detail = confirmed[0].dh_verification_detail  # all same outcome — show once
+            h += f"<li><b>Definitive Healthcare verification</b> &mdash; {detail}</li>"
+        elif unconfirmed and not confirmed:
+            detail = unconfirmed[0].dh_verification_detail
+            h += f"<li><b>Definitive Healthcare verification</b> &mdash; {detail}</li>"
+        elif confirmed or unconfirmed:
+            # Mixed — summarise per contact
+            parts = "; ".join(
+                f"{a.contact_name}: {a.dh_verification_detail}"
+                for a in existing_contact_actions if a.dh_verification_detail
+            )
+            h += f"<li><b>Definitive Healthcare verification</b> &mdash; {parts}</li>"
     else:
         # Full research path
         h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
@@ -1191,6 +1254,8 @@ def _build_note(
             linkedin_check = "✓" if action.found_linkedin else "✗"
             h += f"<b>Data:</b> Email {email_check} &nbsp;|&nbsp; Phone {phone_check} &nbsp;|&nbsp; LinkedIn {linkedin_check}<br>"
 
+            if action.dh_verification_detail:
+                h += f"<b>DH Status:</b> {action.dh_verification_detail}<br>"
             if action.research_reasoning:
                 h += f"<b>Why:</b> {action.research_reasoning}<br>"
                 stale, stale_label = _is_source_stale(action.research_reasoning)
@@ -1511,6 +1576,8 @@ def run_enrichment(company_id: str) -> None:
             research_reasoning=result.get("research_reasoning", ""),
             source_path=result.get("source_path", ""),
             fe_people_search_ran=result.get("fe_people_search_ran", False),
+            dh_verified=result.get("dh_verified", False),
+            dh_verification_detail=result.get("dh_verification_detail", ""),
         )
         actions.append(action)
         if action.action == "error":

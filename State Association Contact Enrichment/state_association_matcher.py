@@ -1390,6 +1390,80 @@ def find_facilities_missing_leadership(
     return missing.reset_index(drop=True)
 
 
+def verify_contact_in_definitive(
+    client: bigquery.Client,
+    first_name: str,
+    last_name: str,
+    definitive_hospital_id: str,
+) -> dict:
+    """
+    Check whether a contact is still listed in Definitive Healthcare for a
+    specific facility (HOSPITAL_ID).
+
+    Queries the Executives table first, then the Full Feed as a fallback.
+
+    Returns a dict:
+      confirmed (bool)        — True if found by name at this HOSPITAL_ID
+      dh_name (str)           — Full name as stored in DH
+      dh_title (str)          — Title in DH
+      dh_email (str)          — Email in DH (may be empty)
+      dh_last_update (str)    — LAST_UPDATE as ISO date string
+      source_table (str)      — "executives" | "full_feed" | ""
+      error (str)             — non-empty string if lookup was skipped or failed
+    """
+    _empty = {"confirmed": False, "dh_name": "", "dh_title": "", "dh_email": "",
+              "dh_last_update": "", "source_table": ""}
+
+    if not first_name or not last_name:
+        return {**_empty, "error": "missing_name"}
+    if not definitive_hospital_id or not str(definitive_hospital_id).strip().isdigit():
+        return {**_empty, "error": "no_dh_id"}
+
+    hospital_id_int = int(str(definitive_hospital_id).strip())
+
+    for table_key in ("executives", "full_feed"):
+        table = DH_TABLES[table_key]
+        query = f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(EXECUTIVE_NAME), ''),
+                     CONCAT(TRIM(FIRST_NAME), ' ', TRIM(LAST_NAME))) AS dh_name,
+            LOWER(TRIM(TITLE))              AS dh_title,
+            TRIM(EMAIL)                     AS dh_email,
+            CAST(LAST_UPDATE AS STRING)     AS dh_last_update
+        FROM `{table}`
+        WHERE CAST(HOSPITAL_ID AS INT64) = @hospital_id
+          AND LOWER(TRIM(FIRST_NAME)) = LOWER(@first_name)
+          AND LOWER(TRIM(LAST_NAME))  = LOWER(@last_name)
+        LIMIT 1
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("hospital_id", "INT64", hospital_id_int),
+            bigquery.ScalarQueryParameter("first_name",  "STRING", first_name.strip()),
+            bigquery.ScalarQueryParameter("last_name",   "STRING", last_name.strip()),
+        ])
+        try:
+            rows = list(client.query(query, job_config=job_config).result())
+            if rows:
+                r = dict(rows[0])
+                return {
+                    "confirmed":      True,
+                    "dh_name":        str(r.get("dh_name") or ""),
+                    "dh_title":       str(r.get("dh_title") or ""),
+                    "dh_email":       str(r.get("dh_email") or ""),
+                    "dh_last_update": str(r.get("dh_last_update") or "")[:10],
+                    "source_table":   table_key,
+                    "error":          "",
+                }
+        except Exception as exc:
+            logger.warning(
+                "DH verification query (%s) failed for %s %s at HOSPITAL_ID=%s: %s",
+                table_key, first_name, last_name, hospital_id_int, exc,
+            )
+            return {**_empty, "error": f"query_failed: {exc}"}
+
+    return {**_empty, "error": ""}   # queried successfully, not found
+
+
 # ─── Concurrent worker functions ─────────────────────────────────────────────
 
 def _research_one_contact(
