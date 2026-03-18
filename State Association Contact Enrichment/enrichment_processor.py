@@ -1124,26 +1124,17 @@ def _build_note(
                 seen_urls.add(url)
                 all_urls.append(url)
 
-    h += "<b>How to Verify</b><br>Quick checks to confirm or disprove these findings:<ul>"
-    h += (
-        "<li>CMS Care Compare (search by facility name for current leadership): "
-        "<a href=\"https://www.medicare.gov/care-compare/\">medicare.gov/care-compare</a></li>"
-    )
+    h += "<b>How to Verify</b><br>"
     if all_urls:
-        sources_html = " &nbsp; ".join(
-            f"<a href=\"{u}\">{u[:80]}{'...' if len(u) > 80 else ''}</a>"
-            for u in all_urls[:15]
-        )
-        h += f"<li>Sources cited by the web search agent:<br>{sources_html}</li>"
-    if fe_people_search:
-        h += "<li>FullEnrich People Search returned these contacts from LinkedIn profile data &mdash; verify via the LinkedIn links in Results above</li>"
-    elif tier_str == "1":
-        h += "<li>State association directory was public &mdash; check the URL in sources above</li>"
-    elif tier_str == "2":
-        h += "<li>State association directory requires login &mdash; verify through direct outreach</li>"
+        h += "Sources cited for the contacts above:<ul>"
+        for u in all_urls[:15]:
+            display = u[:80] + ("..." if len(u) > 80 else "")
+            h += f"<li><a href=\"{u}\">{display}</a></li>"
+        h += "</ul>"
+    elif fe_people_search:
+        h += "Contacts were found via FullEnrich People Search — verify using the LinkedIn profile links in Results above.<br>"
     else:
-        h += "<li>No state directory available for this state &mdash; web search was primary source</li>"
-    h += "</ul>"
+        h += "No source URLs were returned by the web search agent for this run.<br>"
 
     # ── Errors ────────────────────────────────────────────────────────────────
     if errors:
