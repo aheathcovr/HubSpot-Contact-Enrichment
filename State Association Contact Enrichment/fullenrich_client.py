@@ -28,9 +28,11 @@ Location disambiguation:
 
 Returned list of dicts (one per unique person found):
     {
-        "full_name":    str,
-        "title":        str,   # from employment.current.title
-        "linkedin_url": str,   # from social_profiles.linkedin.url, may be ""
+        "full_name":     str,
+        "title":         str,   # from employment.current.title
+        "linkedin_url":  str,   # from social_profiles.linkedin.url, may be ""
+        "updated_at":    str,   # ISO date when FullEnrich last refreshed profile, may be ""
+        "current_start": str,   # ISO date person started at current company, may be ""
     }
 
 Key behaviours:
@@ -198,10 +200,20 @@ def _extract_contact(person: dict) -> dict:
     linkedin_data = social.get("linkedin") or {}
     linkedin_url = str(linkedin_data.get("url") or "").strip()
 
+    # Profile freshness — FullEnrich may return when this record was last updated
+    # and/or when the person started at their current role.
+    updated_at = str(
+        person.get("updated_at") or person.get("last_updated") or ""
+    ).strip()
+    # employment.current may have start_date (ISO date, e.g. "2023-04-01")
+    current_start = str(current_job.get("start_date") or "").strip()
+
     return {
-        "full_name":    full_name,
-        "title":        title,
-        "linkedin_url": linkedin_url,
+        "full_name":       full_name,
+        "title":           title,
+        "linkedin_url":    linkedin_url,
+        "updated_at":      updated_at,      # when FullEnrich last updated this profile
+        "current_start":   current_start,   # when person started at current company
     }
 
 

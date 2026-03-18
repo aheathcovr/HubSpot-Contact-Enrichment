@@ -113,6 +113,8 @@ class ContactAction:
     fe_people_search_ran: bool = False  # True when FE People Search ran but found nothing
     dh_verified: bool = False           # True when DH confirms this person at this facility
     dh_verification_detail: str = ""    # Human-readable DH verification outcome
+    dh_last_update: str = ""            # Raw DH LAST_UPDATE date string (YYYY-MM-DD)
+    fe_updated_at: str = ""             # FullEnrich profile last-updated date (ISO string)
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -224,6 +226,57 @@ def _is_source_stale(reasoning: str) -> tuple[bool, str]:
         label = d.strftime("%B %Y")
         return True, label
     return False, ""
+
+
+# ── Data freshness property helper ───────────────────────────────────────────
+
+
+def _compute_data_freshness(
+    source_path: str,
+    research_reasoning: str,
+    dh_verified: bool,
+    dh_last_update: str,
+    fe_updated_at: str,
+) -> str:
+    """
+    Build the value for the HubSpot contact property
+    'data_freshness_according_to_definitive'.
+
+    Encodes which system identified the contact and how recently
+    that system verified them at this facility.
+    """
+    if source_path == "sonar_pro":
+        d = _extract_most_recent_date(research_reasoning)
+        if d:
+            return f"Sonar Pro web search ({d.strftime('%B %Y')})"
+        return "Sonar Pro web search — source date not available"
+
+    if source_path == "fullenrich_people_search":
+        if fe_updated_at:
+            # ISO date like "2024-08-15" → "August 2024"
+            try:
+                parts = fe_updated_at[:10].split("-")
+                if len(parts) == 3:
+                    d = datetime(int(parts[0]), int(parts[1]), 1)
+                    date_label = d.strftime("%B %Y")
+                else:
+                    date_label = fe_updated_at[:10]
+            except (ValueError, IndexError):
+                date_label = fe_updated_at[:10]
+            return f"FullEnrich People Search / LinkedIn (profile updated {date_label})"
+        return "FullEnrich People Search / LinkedIn — profile date not available"
+
+    if source_path == "existing_contact":
+        if dh_verified and dh_last_update:
+            return f"Definitive Healthcare — last updated {dh_last_update}"
+        if dh_verified:
+            return "Definitive Healthcare — confirmed (update date not available)"
+        if dh_last_update:
+            # In DH but update date doesn't help if not confirmed at this facility
+            return "Definitive Healthcare — not confirmed at this facility"
+        return "HubSpot existing record — not confirmed in Definitive Healthcare"
+
+    return ""
 
 
 # ── Note helpers — all output HTML (HubSpot renders note body as HTML) ────────
@@ -393,6 +446,8 @@ def _process_found_contact(
     fe_people_search_ran: bool = False,
     dh_verified: bool = False,
     dh_verification_detail: str = "",
+    dh_last_update: str = "",
+    fe_updated_at: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
@@ -431,6 +486,17 @@ def _process_found_contact(
         fe_people_search_ran=fe_people_search_ran,
         dh_verified=dh_verified,
         dh_verification_detail=dh_verification_detail,
+        dh_last_update=dh_last_update,
+        fe_updated_at=fe_updated_at,
+    )
+
+    # Compute data freshness value once — written to HubSpot on both create + update paths
+    data_freshness_value = _compute_data_freshness(
+        source_path=source_path,
+        research_reasoning=research_reasoning,
+        dh_verified=dh_verified,
+        dh_last_update=dh_last_update,
+        fe_updated_at=fe_updated_at,
     )
 
     if not found_name or confidence == "not_found":
@@ -548,6 +614,19 @@ def _process_found_contact(
                 enriched_phone = existing_phone
 
             existing_linkedin = existing_props.get("hs_linkedin_url", "")
+
+            # ── Write data freshness property ─────────────────────────────────
+            if data_freshness_value:
+                try:
+                    hs.update_contact(
+                        matched_contact_id,
+                        {"data_freshness_according_to_definitive": data_freshness_value},
+                    )
+                except HubSpotError as exc:
+                    logger.warning(
+                        "Could not write data_freshness_according_to_definitive on contact %s: %s",
+                        matched_contact_id, exc,
+                    )
 
             # ── FullEnrich: find missing email and/or phone ───────────────────
             if not existing_email or not existing_phone:
@@ -735,11 +814,22 @@ def _process_found_contact(
                 f"<b>Source:</b> FullEnrich Bulk Enrich<br>"
             )
 
+        if data_freshness_value:
+            new_updates["data_freshness_according_to_definitive"] = data_freshness_value
+
         if new_updates:
             try:
                 hs.update_contact(new_id, new_updates)
             except HubSpotError as exc:
                 logger.warning(f"Post-creation FullEnrich update failed for {new_id}: {exc}")
+
+    elif data_freshness_value:
+        # No FullEnrich run (contact was created with full email+phone already) —
+        # still write freshness on its own
+        try:
+            hs.update_contact(new_id, {"data_freshness_according_to_definitive": data_freshness_value})
+        except HubSpotError as exc:
+            logger.warning(f"Could not write data_freshness_according_to_definitive on new contact {new_id}: {exc}")
 
     # ── Stamp most_recent_enrichment_date on the new contact ─────────────────
     try:
@@ -841,6 +931,7 @@ def _enrich_existing_leadership(
         # ── Definitive Healthcare verification ────────────────────────────────
         dh_verified = False
         dh_verification_detail = ""
+        dh_last_update_val = ""
         if bq_client and definitive_id:
             dh = verify_contact_in_definitive(
                 client=bq_client,
@@ -852,11 +943,11 @@ def _enrich_existing_leadership(
                 dh_verification_detail = "DH lookup unavailable (query error)"
             elif dh["confirmed"]:
                 dh_verified = True
+                dh_last_update_val = dh.get("dh_last_update", "")
                 table_label = {"executives": "Executives table", "full_feed": "Full Feed"}.get(
                     dh["source_table"], dh["source_table"]
                 )
-                last_update = dh.get("dh_last_update", "")
-                update_str = f", updated {last_update}" if last_update else ""
+                update_str = f", updated {dh_last_update_val}" if dh_last_update_val else ""
                 dh_verification_detail = f"✓ Confirmed in DH {table_label}{update_str}"
                 logger.info(
                     "DH confirmed %s at %s (%s)",
@@ -892,6 +983,7 @@ def _enrich_existing_leadership(
             "source_path":            "existing_contact",
             "dh_verified":            dh_verified,
             "dh_verification_detail": dh_verification_detail,
+            "dh_last_update":         dh_last_update_val,
             "hubspot_contact_ids":    c["id"],
             "hubspot_match_detail":   "already associated",
             "hubspot_match_summary":  "existing",
@@ -1061,6 +1153,7 @@ def _run_workflow1_single_facility(
                     "found_email":         "",
                     "found_phone":         "",
                     "found_linkedin":      fe.get("linkedin_url", ""),
+                    "fe_updated_at":       fe.get("updated_at", "") or fe.get("current_start", ""),
                     "research_findings":   "",   # LinkedIn URL shown via found_linkedin, not as a web-search source
                     "research_error":      "",
                     "hubspot_contact_ids": "",
@@ -1578,6 +1671,8 @@ def run_enrichment(company_id: str) -> None:
             fe_people_search_ran=result.get("fe_people_search_ran", False),
             dh_verified=result.get("dh_verified", False),
             dh_verification_detail=result.get("dh_verification_detail", ""),
+            dh_last_update=result.get("dh_last_update", ""),
+            fe_updated_at=result.get("fe_updated_at", ""),
         )
         actions.append(action)
         if action.action == "error":
