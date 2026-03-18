@@ -108,9 +108,11 @@ DH_TABLES = {
 DH_W2_TITLE_PATTERN = (
     r"chief executive|chief operating|chief financial"
     r"|\bceo\b|\bcoo\b|\bcfo\b"
+    r"|senior vice president"
     r"|vice president"
     r"|regional director"
     r"|\bpresident\b"
+    r"|\bowner\b"
 )
 
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
@@ -1490,9 +1492,9 @@ def _research_one_contact(
     )
     title    = str(row.get("title", "")).title()
     state    = str(row.get("state", ""))
-    email    = str(row.get("EMAIL", ""))
+    email    = str(row.get("EMAIL") or "")
     phone    = str(row.get("DIRECT_PHONE") or row.get("LOCATION_PHONE") or "")
-    linkedin = str(row.get("LINKEDIN_PROFILE", ""))
+    linkedin = str(row.get("LINKEDIN_PROFILE") or "")
     source   = str(row.get("source_table", ""))
 
     result: dict = {

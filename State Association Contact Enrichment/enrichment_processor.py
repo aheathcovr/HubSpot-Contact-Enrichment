@@ -79,8 +79,10 @@ W2_CORPORATE_TITLES = [
     "Chief Operating Officer",
     "Chief Financial Officer",
     "Vice President of Operations",
+    "Senior Vice President of Operations",
     "Regional Vice President of Operations",
     "Regional Director of Operations",
+    "Owner",
 ]
 
 
@@ -762,7 +764,10 @@ def _process_found_contact(
         new_id = hs.create_contact(contact_props)
         hs.associate_contact_to_company(new_id, target_company_id)
     except HubSpotError as exc:
-        logger.error(f"Failed to create contact for '{found_name}': {exc}")
+        logger.error(
+            f"Failed to create contact for '{found_name}': {exc} | "
+            f"props={contact_props} | response={exc.response_text}"
+        )
         return ContactAction(
             action="error",
             contact_name=found_name,
