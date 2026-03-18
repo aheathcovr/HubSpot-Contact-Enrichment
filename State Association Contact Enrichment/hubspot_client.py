@@ -230,6 +230,45 @@ class HubSpotClient:
             logger.warning(f"Contact search by email failed: {exc}")
             return []
 
+    def search_contacts_by_name(self, firstname: str, lastname: str) -> list[dict]:
+        """
+        Search HubSpot contacts by exact first name + last name match.
+
+        Used as a fallback when no email is available, to prevent creating
+        duplicate contacts for the same person. Returns a list of contact dicts
+        with keys: id, firstname, lastname, email, associatedcompanyid.
+        """
+        if not firstname or not lastname:
+            return []
+
+        body = {
+            "filterGroups": [
+                {
+                    "filters": [
+                        {"propertyName": "firstname", "operator": "EQ", "value": firstname.strip()},
+                        {"propertyName": "lastname",  "operator": "EQ", "value": lastname.strip()},
+                    ]
+                }
+            ],
+            "properties": ["firstname", "lastname", "email", "associatedcompanyid"],
+            "limit": 10,
+        }
+        try:
+            data = self._post("/crm/v3/objects/contacts/search", body)
+            return [
+                {
+                    "id":                 r["id"],
+                    "firstname":          r.get("properties", {}).get("firstname", ""),
+                    "lastname":           r.get("properties", {}).get("lastname", ""),
+                    "email":              r.get("properties", {}).get("email", ""),
+                    "associatedcompanyid": r.get("properties", {}).get("associatedcompanyid", ""),
+                }
+                for r in data.get("results", [])
+            ]
+        except HubSpotError as exc:
+            logger.warning(f"Contact search by name failed ({firstname} {lastname}): {exc}")
+            return []
+
     def get_contact_properties(self, contact_id: str) -> dict:
         """
         Fetch email, phone, name, and enrichment date for an existing contact.
@@ -239,7 +278,7 @@ class HubSpotClient:
         """
         data = self._get(
             f"/crm/v3/objects/contacts/{contact_id}",
-            params={"properties": "email,phone,firstname,lastname,hs_linkedin_url,most_recent_enrichment_date"},
+            params={"properties": "email,phone,firstname,lastname,jobtitle,hs_linkedin_url,most_recent_enrichment_date"},
         )
         p = data.get("properties", {})
         return {
@@ -247,6 +286,7 @@ class HubSpotClient:
             "phone":                       p.get("phone") or "",
             "firstname":                   p.get("firstname") or "",
             "lastname":                    p.get("lastname") or "",
+            "jobtitle":                    p.get("jobtitle") or "",
             "hs_linkedin_url":             p.get("hs_linkedin_url") or "",
             "most_recent_enrichment_date": p.get("most_recent_enrichment_date") or "",
         }

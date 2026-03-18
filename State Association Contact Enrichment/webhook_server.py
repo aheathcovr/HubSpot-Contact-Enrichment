@@ -30,17 +30,52 @@ import logging
 import os
 import re
 import time
+import traceback
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
+
+# ── Structured JSON logging (Cloud Logging compatible) ────────────────────────
+
+class _CloudLoggingFormatter(logging.Formatter):
+    """Emit one JSON object per log line for Cloud Logging structured ingestion."""
+
+    _SEVERITY = {
+        logging.DEBUG:    "DEBUG",
+        logging.INFO:     "INFO",
+        logging.WARNING:  "WARNING",
+        logging.ERROR:    "ERROR",
+        logging.CRITICAL: "CRITICAL",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict = {
+            "severity": self._SEVERITY.get(record.levelno, "DEFAULT"),
+            "message":  record.getMessage(),
+            "logger":   record.name,
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        # Callers can attach extra structured fields via extra={"json_fields": {...}}
+        json_fields = getattr(record, "json_fields", None)
+        if json_fields and isinstance(json_fields, dict):
+            payload.update(json_fields)
+        return json.dumps(payload, default=str)
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_CloudLoggingFormatter())
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(handler)
+
+
+_setup_logging()
 logger = logging.getLogger("webhook_server")
 
 # ── Startup validation ────────────────────────────────────────────────────────
@@ -50,10 +85,13 @@ TRIGGER_VALUES = {"true", "1", "yes"}
 
 _COMPANY_ID_RE = re.compile(r'^\d{1,20}$')
 
+# Set to True once lifespan startup completes; checked by /health readiness probe.
+_ready: bool = False
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global HUBSPOT_WEBHOOK_SECRET
+    global HUBSPOT_WEBHOOK_SECRET, _ready
     secret = os.getenv("HUBSPOT_WEBHOOK_SECRET", "").strip()
     if not secret:
         raise RuntimeError(
@@ -62,7 +100,9 @@ async def lifespan(app: FastAPI):
         )
     HUBSPOT_WEBHOOK_SECRET = secret
     logger.info("Webhook signature validation enabled")
+    _ready = True
     yield
+    _ready = False
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -124,22 +164,48 @@ def _run_enrichment_safe(company_id: str) -> None:
     Catches all exceptions so the background task never dies silently.
     On any uncaught error, attempts a last-resort reset of request_to_enrich
     so the record doesn't get stuck in a permanently triggered state.
+
+    Failures are logged as structured ERROR records with alert="enrichment_failure"
+    so a Cloud Logging log-based alert can notify on-call when a company gets stuck.
+    To wire up alerting: create a log-based metric on
+      jsonPayload.alert="enrichment_failure"
+    then attach a Cloud Monitoring alerting policy to that metric.
     """
     try:
         from enrichment_processor import run_enrichment
 
         run_enrichment(company_id)
     except Exception as exc:
-        logger.exception(f"Unhandled error in enrichment for company {company_id}: {exc}")
-        # Last-resort: reset the trigger flag
+        logger.error(
+            "Enrichment failed — company stuck; manual review required",
+            extra={
+                "json_fields": {
+                    "alert":      "enrichment_failure",
+                    "company_id": company_id,
+                    "error":      str(exc),
+                    "traceback":  traceback.format_exc(),
+                }
+            },
+        )
+        # Last-resort: reset the trigger flag so the record isn't permanently stuck
         try:
             from hubspot_client import HubSpotClient
 
             HubSpotClient().update_company(company_id, {"request_to_enrich": "false"})
-            logger.info(f"Last-resort: reset request_to_enrich for company {company_id}")
+            logger.info(
+                "Last-resort: reset request_to_enrich after enrichment failure",
+                extra={"json_fields": {"company_id": company_id}},
+            )
         except Exception as reset_exc:
             logger.error(
-                f"Last-resort flag reset also failed for company {company_id}: {reset_exc}"
+                "Last-resort flag reset failed after enrichment failure",
+                extra={
+                    "json_fields": {
+                        "alert":      "enrichment_failure",
+                        "company_id": company_id,
+                        "error":      str(reset_exc),
+                    }
+                },
             )
 
 
@@ -194,9 +260,17 @@ def _enqueue_enrichment(company_id: str) -> None:
 
 
 @app.get("/health")
-async def health() -> dict:
-    """Health check endpoint — used by Cloud Run startup/liveness probes."""
-    return {"status": "ok"}
+async def health() -> JSONResponse:
+    """
+    Readiness/liveness probe for Cloud Run.
+
+    Returns 503 until the lifespan startup hook has run (env vars loaded,
+    secrets validated). Cloud Run startup probes will retry until 200 is
+    returned, so no traffic is routed to a cold instance before it is ready.
+    """
+    if not _ready:
+        return JSONResponse({"status": "starting"}, status_code=503)
+    return JSONResponse({"status": "ok"})
 
 
 @app.post("/webhook")

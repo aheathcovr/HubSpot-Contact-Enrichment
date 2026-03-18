@@ -42,24 +42,41 @@ Environment Variables
   GOOGLE_APPLICATION_CREDENTIALS  Path to GCP service account key file
 """
 
-import hashlib
+import csv
 import json
 import logging
 import os
 import re
 import sys
 import time
-import csv
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import pandas as pd
+
+from config import (
+    DH_W2_TITLE_PATTERN,
+    TARGET_TITLES,
+    DH_CSUITE_KEYWORDS as _DH_CSUITE_KEYWORDS,
+    DH_CSUITE_PATTERN as _DH_CSUITE_PATTERN,
+    DH_FRESHNESS_MONTHS as _DH_FRESHNESS_MONTHS,
+)
+from state_association.llm_client import (
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
+    OPENROUTER_MODEL_TIER23,
+    RATE_LIMIT_SECONDS,
+    RESEARCH_SYSTEM_PROMPT,
+    _CONTACT_JSON_SCHEMA,
+    _MAX_WORKERS,
+    _OPENROUTER_SEMAPHORE,
+    call_openrouter,
+    normalize_phone,
+    parse_found_name,
+)
 
 # ─── PyYAML (for state association guide parsing) ─────────────────────────────
 try:
@@ -102,98 +119,69 @@ DH_TABLES = {
     "full_feed":    f"{BQ_PROJECT_ID}.definitive_healthcare.December SNF AND ALF Contact Full Feed",
 }
 
-# BigQuery RE2 pattern used to filter corporate executive titles in Workflow 2.
-# Matches: CEO/Chief Executive, COO/Chief Operating, CFO/Chief Financial,
-# CNO/Chief Nursing, CCO/Chief Clinical, Vice President (any),
-# Regional Director (any), standalone President.
-DH_W2_TITLE_PATTERN = (
-    r"chief executive|chief operating|chief financial|chief nursing|chief clinical"
-    r"|chief administrative"
-    r"|\bceo\b|\bcoo\b|\bcfo\b|\bcno\b|\bcco\b|\bcao\b"
-    r"|senior vice president"
-    r"|vice president"
-    r"|regional director"
-    r"|\bpresident\b"
-    r"|\bowner\b"
-)
+# DH_W2_TITLE_PATTERN, TARGET_TITLES, _DH_CSUITE_KEYWORDS, _DH_FRESHNESS_MONTHS
+# imported from config.py
 
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL         = os.getenv("OPENROUTER_MODEL",          "perplexity/sonar-pro")
-OPENROUTER_MODEL_TIER23  = os.getenv("OPENROUTER_MODEL_TIER23",   "perplexity/sonar-reasoning-pro")
-
-# Structured JSON schema enforced on every OpenRouter response.
-# Using response_format eliminates the need for regex-based JSON extraction
-# and guarantees a parseable result on every call.
-_CONTACT_JSON_SCHEMA = {
-    "name": "contact_result",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "found_name":  {"type": "string"},
-            "found_title": {"type": "string"},
-            "found_email": {"type": "string"},
-            "found_phone": {"type": "string"},
-            "confidence":  {
-                "type": "string",
-                "enum": ["high", "medium", "low", "not_found"]
-            },
-            "source_url":  {"type": "string"},
-            "source_name": {"type": "string"},
-            "reasoning":   {"type": "string"},
-        },
-        "required": ["found_name", "found_title", "found_email",
-                     "found_phone", "confidence", "source_url", "source_name", "reasoning"],
-        "additionalProperties": False,
-     },
-}
-GCS_CACHE_BUCKET    = os.getenv("GCS_CACHE_BUCKET", "")
-
-# Titles that identify facility-level leadership we care about
-TARGET_TITLES = {"executive director", "administrator"}
-
-RATE_LIMIT_SECONDS = 2.5  # Pause between OpenRouter calls to avoid rate-limiting
-
-# ── Workflow 2: DH fast-track configuration ───────────────────────────────────
-
-# Title keywords that identify true C-suite executives.  Contacts whose DH title
-# matches any of these are NEVER sent to Sonar Pro — DH is the authoritative
-# source for this cohort and state association directories will never list them.
-_DH_CSUITE_KEYWORDS: frozenset[str] = frozenset({
-    "chief executive", "ceo",
-    "chief operating", "coo",
-    "chief financial", "cfo",
-    "chief nursing", "cno",
-    "chief clinical", "cco",
-    "chief administrative", "cao",
-    "president",
-    "owner",
-})
-
-# How many months a DH LAST_UPDATE date can be in the past before we consider
-# the record stale and worth re-verifying via Sonar Pro.
-_DH_FRESHNESS_MONTHS: int = 12
+# OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL, OPENROUTER_MODEL_TIER23,
+# RATE_LIMIT_SECONDS, RESEARCH_SYSTEM_PROMPT, _CONTACT_JSON_SCHEMA,
+# _MAX_WORKERS, _OPENROUTER_SEMAPHORE, call_openrouter, parse_found_name, normalize_phone
+# imported from state_association.llm_client
 
 
 def _is_csuite_title(title: str) -> bool:
-    """Return True if *title* matches a C-suite keyword that should bypass Sonar Pro."""
-    t = (title or "").lower()
-    return any(kw in t for kw in _DH_CSUITE_KEYWORDS)
+    """
+    Return True if *title* identifies a true C-suite executive that should bypass
+    Sonar Pro (DH is authoritative; state association directories never list them).
+
+    Uses DH_CSUITE_PATTERN (word-boundary regex) rather than the old frozenset
+    substring approach, which produced false positives:
+      - "president" matched all "vice president" / "senior vice president" titles
+      - "cco" matched the substring in "Accounts" (Payable Manager)
+      - "owner" matched "Owner Of <side-business>" side-business descriptions
+    """
+    if not title:
+        return False
+    return bool(_DH_CSUITE_PATTERN.search(title))
 
 
 def _dh_record_is_fresh(last_update: str) -> bool:
     """
-    Return True if the DH LAST_UPDATE date (ISO string YYYY-MM-DD or similar)
-    is within _DH_FRESHNESS_MONTHS months of today.
+    Return True if the DH LAST_UPDATE value indicates the record is within
+    _DH_FRESHNESS_MONTHS months of today.
 
-    Returns False (treat as stale) if the date cannot be parsed.
+    Handles two formats that DH uses:
+      - ISO date strings: "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+      - Human-readable relative strings: "15 days ago", "3 months ago",
+        "Within the last year", "Within the last 6 months", etc.
+
+    Returns False (treat as stale) if the value cannot be interpreted.
     """
     if not last_update:
         return False
+    raw = str(last_update).strip().lower()
+
+    # ── Human-readable relative strings DH uses ───────────────────────────────
+    # "Within the last year" / "Within the last X months" → treat as fresh
+    if raw.startswith("within the last"):
+        return True
+
+    # "X days ago" → fresh if X <= _DH_FRESHNESS_MONTHS * 30
+    days_match = re.match(r"^(\d+)\s+days?\s+ago$", raw)
+    if days_match:
+        return int(days_match.group(1)) <= _DH_FRESHNESS_MONTHS * 30
+
+    # "X months ago" → fresh if X <= _DH_FRESHNESS_MONTHS
+    months_match = re.match(r"^(\d+)\s+months?\s+ago$", raw)
+    if months_match:
+        return int(months_match.group(1)) <= _DH_FRESHNESS_MONTHS
+
+    # "X years ago" → always stale
+    if re.match(r"^\d+\s+years?\s+ago$", raw):
+        return False
+
+    # ── ISO date strings ──────────────────────────────────────────────────────
     try:
-        # Accept both YYYY-MM-DD and datetime strings
-        date_part = str(last_update).strip()[:10]
+        date_part = raw[:10]
         parts = date_part.split("-")
         if len(parts) != 3:
             return False
@@ -203,113 +191,8 @@ def _dh_record_is_fresh(last_update: str) -> bool:
     except (ValueError, IndexError):
         return False
 
-# ─── LLM helpers ──────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
-
-# Stable system prompt shared by both research workflows.
-# Kept here so the user portions returned by the prompt builders stay variable-only,
-# enabling safe response caching (temperature=0).
-RESEARCH_SYSTEM_PROMPT = """\
-You are a healthcare market research specialist finding verified contact information \
-for facility leadership (Administrator, Executive Director, Director of Nursing) at \
-US senior care facilities.
-
-Search methodology — follow this order for every lookup:
-1. Check the specific association directory or URL listed in the request
-2. Search CMS Care Compare (medicare.gov/care-compare) for the facility or person
-3. Check the facility or operator's own website for a staff/leadership page
-4. Search LinkedIn as a last resort: "[Facility Name] administrator site:linkedin.com"
-
-Accuracy rules (strictly enforced):
-- Report ONLY names found directly on a verifiable source — do not infer or combine partial information
-- confidence="high"      → name appears on an official association directory or CMS listing
-- confidence="medium"    → name found on facility website or operator site only
-- confidence="low"       → found on LinkedIn, a news mention, or a source that may be outdated
-- confidence="not_found" → no verified name located; never guess or hallucinate a name
-
-Always cite the exact URL where you found the name.
-In the "source_name" field, write the human-readable name of the specific website or publication where you found this person — be specific about the organization and page type (examples: "Washington State Assisted Living Association member directory", "Colorado HCAP facility search", "Brookdale Living corporate news blog", "CMS Care Compare facility listing", "facility website leadership page", "LinkedIn profile"). Do not write a URL here — write a plain-English name a salesperson would recognize.
-In the "reasoning" field, write 2–5 sentences explaining: which specific source confirmed this person's name and title, any date visible on that source (event date, publication date, page last-updated), why you are confident this is the current person and not a former employee, and any corroborating sources. If multiple sources agree, name them. If the source is recent (within 12 months), say so explicitly.
-Your response MUST be a single valid JSON object matching the required schema — no extra text.\
-"""
-
-# Disk cache for LLM responses — used as fallback when GCS_CACHE_BUCKET is not set.
-# Safe because all calls use temperature=0. Delete to force fresh lookups.
-_LLM_CACHE_DIR = Path(__file__).parent / ".llm_cache"
-
-# GCS cache client — lazily initialized on first use, shared across all threads.
-_gcs_client_lock     = threading.Lock()
-_gcs_client_instance = None   # google.cloud.storage.Client or False (unavailable)
-
-
-def _get_gcs_client():
-    """Return a shared GCS client, or False if GCS is unavailable/unconfigured."""
-    global _gcs_client_instance
-    if _gcs_client_instance is None:
-        with _gcs_client_lock:
-            if _gcs_client_instance is None:
-                try:
-                    from google.cloud import storage as _gcs
-                    _gcs_client_instance = _gcs.Client()
-                except Exception as exc:
-                    logger.warning("GCS client unavailable (%s) — using disk cache", exc)
-                    _gcs_client_instance = False
-    return _gcs_client_instance
-
-
-def _gcs_cache_get(key: str) -> Optional[str]:
-    """Return cached LLM response from GCS, or None on miss/error."""
-    client = _get_gcs_client()
-    if not client:
-        return None
-    try:
-        blob = client.bucket(GCS_CACHE_BUCKET).blob(f"llm_cache/{key}.json")
-        if blob.exists():
-            logger.info("GCS LLM cache hit (key=%s)", key)
-            return json.loads(blob.download_as_text())["response"]
-    except Exception as exc:
-        logger.warning("GCS cache get failed (key=%s): %s", key, exc)
-    return None
-
-
-def _gcs_cache_set(key: str, response: str) -> None:
-    """Write LLM response to GCS cache. Fails silently."""
-    client = _get_gcs_client()
-    if not client:
-        return
-    try:
-        blob = client.bucket(GCS_CACHE_BUCKET).blob(f"llm_cache/{key}.json")
-        blob.upload_from_string(
-            json.dumps({"response": response}),
-            content_type="application/json",
-        )
-    except Exception as exc:
-        logger.warning("GCS cache set failed (key=%s): %s", key, exc)
-
-
-# Persistent HTTP session for OpenRouter — reuses TCP connections across calls.
-def _build_openrouter_session() -> requests.Session:
-    retry = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
-    session.mount("https://", adapter)
-    session.headers.update({
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-        "HTTP-Referer":  "https://github.com/HubSpot-Definitive-Matching",
-        "X-Title":       "State Association Matcher",
-    })
-    return session
-
-
-_OPENROUTER_SESSION = _build_openrouter_session()
-
-# Concurrency settings for workflow loops.
-# _MAX_WORKERS threads run simultaneously; the semaphore limits live API calls
-# to the same number so rate limiting stays predictable.
-_MAX_WORKERS        = 3
-_OPENROUTER_SEMAPHORE = threading.Semaphore(_MAX_WORKERS)
 
 # Output filenames (timestamped so successive runs never overwrite each other)
 _TS                = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -339,173 +222,7 @@ _STATE_ABBREV_TO_NAME: dict[str, str] = {
 _GUIDE_CACHE: tuple[list[dict], list[dict]] | None = None
 
 
-# ─── OpenRouter helpers ───────────────────────────────────────────────────────
-
-def call_openrouter(
-    system_prompt: str,
-    user_prompt: str,
-    model: str = OPENROUTER_MODEL,
-    response_format: Optional[dict] = None,
-    extra_params: Optional[dict] = None,
-) -> str:
-    """
-    Call the OpenRouter chat-completions endpoint and return the response text.
-
-    Uses temperature=0 for deterministic structured output and a shared persistent
-    HTTP session (TCP connection reuse).  Responses are cached:
-      - In GCS (cross-instance, persistent) when GCS_CACHE_BUCKET env var is set.
-      - On disk (.llm_cache/) as a fallback for local development.
-
-    Args:
-        system_prompt:   The system-role message.
-        user_prompt:     The user-role message.
-        model:           OpenRouter model slug.
-        response_format: Optional dict passed as ``response_format`` in the payload.
-                         Pass ``{"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}``
-                         to enforce structured JSON output and skip regex parsing.
-        extra_params:    Optional dict of additional top-level payload keys, e.g.
-                         ``{"reasoning_effort": "high"}`` for sonar-reasoning-pro.
-
-    Raises:
-        RuntimeError: if OPENROUTER_API_KEY is not set or the request fails.
-    """
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError(
-            "OPENROUTER_API_KEY is not set. "
-            "Export it as an environment variable before running this script."
-        )
-
-    # ── Cache key (shared between GCS and disk backends) ─────────────────────
-    # Include model + extra_params in the key so different parameter sets
-    # never collide in the cache.
-    cache_seed = system_prompt + user_prompt + model
-    if response_format:
-        cache_seed += json.dumps(response_format, sort_keys=True)
-    if extra_params:
-        cache_seed += json.dumps(extra_params, sort_keys=True)
-    cache_key = hashlib.sha256(cache_seed.encode()).hexdigest()[:20]
-
-    # ── GCS cache lookup (production) ───────────────────────────────────────
-    if GCS_CACHE_BUCKET:
-        cached = _gcs_cache_get(cache_key)
-        if cached is not None:
-            return cached
-    else:
-        # ── Disk cache fallback (local dev) ─────────────────────────────────
-        cache_file = _LLM_CACHE_DIR / f"{cache_key}.json"
-        if cache_file.exists():
-            logger.info("Disk LLM cache hit (key=%s)", cache_key)
-            return json.loads(cache_file.read_text())["response"]
-
-    # ── Build payload ─────────────────────────────────────────────────────────────────
-    payload: dict = {
-        "model":       model,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-    }
-    if response_format:
-        payload["response_format"] = response_format
-    if extra_params:
-        payload.update(extra_params)
-
-    # ── Call OpenRouter via shared session ────────────────────────────────────
-    try:
-        response = _OPENROUTER_SESSION.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            json=payload,
-            timeout=120,  # increased for reasoning-pro which can take longer
-        )
-        response.raise_for_status()
-        data = response.json()
-        result = data["choices"][0]["message"]["content"].strip()
-    except requests.HTTPError as e:
-        raise RuntimeError(f"OpenRouter HTTP error: {e.response.status_code} — {e.response.text}") from e
-    except Exception as e:
-        raise RuntimeError(f"OpenRouter call failed: {e}") from e
-
-    # ── Cache write ──────────────────────────────────────────────────────────────────
-    if GCS_CACHE_BUCKET:
-        _gcs_cache_set(cache_key, result)
-    else:
-        _LLM_CACHE_DIR.mkdir(exist_ok=True)
-        ((_LLM_CACHE_DIR / f"{cache_key}.json")).write_text(json.dumps({"response": result}))
-
-    return result
-
-
-def parse_found_name(research_text: str) -> tuple[str, str, str, str, str, str, str]:
-    """
-    Extract structured contact fields from an OpenRouter research response.
-
-    Handles two response formats:
-      1. Structured output (response_format=json_schema): the entire response IS
-         a valid JSON object — parsed directly with no regex.
-      2. Legacy free-text output: the JSON block is embedded inside a ```json
-         fenced code block or as a bare object at the end of the response.
-
-    Returns (found_name, found_title, confidence, found_email, found_phone, reasoning, source_name).
-    Returns ("", "", "not_found", "", "", "", "") if parsing fails entirely.
-    """
-    import re
-    import json
-
-    def _extract_fields(data: dict) -> tuple[str, str, str, str, str, str, str]:
-        name        = str(data.get("found_name",  "") or "").strip()
-        title       = str(data.get("found_title", "") or "").strip()
-        conf        = str(data.get("confidence",  "not_found") or "not_found").strip().lower()
-        email       = str(data.get("found_email", "") or "").strip()
-        phone       = str(data.get("found_phone", "") or "").strip()
-        reasoning   = str(data.get("reasoning",   "") or "").strip()
-        source_name = str(data.get("source_name", "") or "").strip()
-        if conf not in ("high", "medium", "low", "not_found"):
-            logger.warning(
-                "parse_found_name: unexpected confidence value %r — treating as not_found", conf
-            )
-            conf = "not_found"
-        return name, title, conf, email, phone, reasoning, source_name
-
-    # ── Path 1: structured output — the whole response is a JSON object ──────────
-    stripped = research_text.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            data = json.loads(stripped)
-            if "found_name" in data or "confidence" in data:
-                return _extract_fields(data)
-        except (json.JSONDecodeError, AttributeError):
-            pass  # fall through to legacy path
-
-    # ── Path 2: legacy free-text — JSON embedded in a fenced code block ────────
-    matches = re.findall(r"```json\s*(\{.*?\})\s*```", research_text, re.DOTALL)
-    if not matches:
-        # Try bare JSON object as fallback
-        matches = re.findall(r'\{"found_name".*?\}', research_text, re.DOTALL)
-
-    for raw in reversed(matches):  # use last match (most likely the structured block)
-        try:
-            data = json.loads(raw)
-            return _extract_fields(data)
-        except (json.JSONDecodeError, AttributeError):
-            continue
-
-    logger.warning(
-        "parse_found_name: no valid JSON block in response (response_len=%d)",
-        len(research_text),
-    )
-    return "", "", "not_found", "", "", "", ""
-
-
-def normalize_phone(phone: str) -> str:
-    """
-    Normalize a phone number for comparison by removing all non-digit characters.
-    Returns empty string if no digits found.
-    """
-    if not phone:
-        return ""
-    digits = "".join(c for c in str(phone) if c.isdigit())
-    return digits if len(digits) >= 10 else ""
+# call_openrouter, parse_found_name, normalize_phone — imported from state_association.llm_client
 
 
 def lookup_hubspot_contact_enhanced(
@@ -1111,6 +828,7 @@ def _build_corporate_contact_research_prompt(
     corporation_name: str,
     corporate_domain: str,
     facility_type: str,
+    linkedin_url: str = "",
 ) -> str:
     """
     Build a domain-targeted Sonar Pro prompt for stale VP / Regional Director
@@ -1122,6 +840,11 @@ def _build_corporate_contact_research_prompt(
       - The DH record is stale (older than _DH_FRESHNESS_MONTHS months)
       - The title is NOT C-suite (those are fast-tracked directly from DH)
       - The title IS a regional or VP-level role
+
+    When *linkedin_url* is provided (from DH or HubSpot), a "Step 0" is
+    prepended that directs Sonar Pro to check that profile directly before
+    doing any broader search.  This is the most reliable verification path
+    because the person's own LinkedIn shows their current employer.
 
     The ``search_domain_filter`` key is injected into the OpenRouter payload
     (via extra_params) by the caller so Perplexity restricts its web search to
@@ -1140,34 +863,50 @@ def _build_corporate_contact_research_prompt(
 
     is_regional = _is_regional_title(title)
 
-    if is_regional:
-        # Regional roles are almost never listed on the corporate About Us page.
-        # Pivot to a LinkedIn-targeted search after checking the corporate site.
-        search_instructions = f"""\
-Search these sources in order, stopping when you find a verified match:
-1. {domain_display} — look for pages titled 'About Us', 'Leadership', 'Our Team',
-   'Management', or 'Investor Relations' that list regional executives.
-2. LinkedIn: search for \"{corporation_name}\" \"{title}\" to find the current person
-   holding this role.  Prefer profiles showing a current position at {corporation_name}.
-3. LinkedIn: try the variant search \"{corporation_name} regional\" to surface regional
-   leadership not listed by exact title."""
+    # If we have a LinkedIn URL for this specific person, make it Step 0 —
+    # the most direct verification path.  Sonar Pro can load the profile and
+    # confirm whether their current employer matches {corporation_name}.
+    if linkedin_url:
+        step0 = (
+            f"0. Go directly to this LinkedIn profile: {linkedin_url}\n"
+            f"   Check whether their current employer is {corporation_name} and whether their title "
+            f"matches or is consistent with \"{title}\".\n"
+            f"   If confirmed, you can stop here — return high or medium confidence based on the recency shown.\n"
+        )
+        step_offset = 1
     else:
-        search_instructions = f"""\
-Search these sources in order, stopping when you find a verified match:
-1. {domain_display} — look specifically for pages titled 'About Us', 'Leadership Team',
-   'Management', 'Our Team', or 'Investor Relations / Governance' that list senior
-   executives.  Common URL patterns: /about-us, /leadership-team, /management,
-   /corporate-governance, /investor-relations/management.
-2. LinkedIn: search for \"{corporation_name}\" \"{title}\" to confirm or supplement the
-   corporate website finding."""
+        step0 = ""
+        step_offset = 0
 
-    return f"""I need you to find the current {title} at {corporation_name},
+    if is_regional:
+        search_instructions = (
+            f"{step0}"
+            f"{step_offset + 1}. {domain_display} — look for pages titled 'About Us', 'Leadership', 'Our Team',\n"
+            f"   'Management', or 'Investor Relations' that list regional executives.\n"
+            f"{step_offset + 2}. LinkedIn: search for \"{corporation_name}\" \"{title}\" to find the current person\n"
+            f"   holding this role.  Prefer profiles showing a current position at {corporation_name}.\n"
+            f"{step_offset + 3}. LinkedIn: try the variant search \"{corporation_name} regional\" to surface regional\n"
+            f"   leadership not listed by exact title."
+        )
+    else:
+        search_instructions = (
+            f"{step0}"
+            f"{step_offset + 1}. {domain_display} — look specifically for pages titled 'About Us', 'Leadership Team',\n"
+            f"   'Management', 'Our Team', or 'Investor Relations / Governance' that list senior\n"
+            f"   executives.  Common URL patterns: /about-us, /leadership-team, /management,\n"
+            f"   /corporate-governance, /investor-relations/management.\n"
+            f"{step_offset + 2}. LinkedIn: search for \"{corporation_name}\" \"{title}\" to confirm or supplement the\n"
+            f"   corporate website finding."
+        )
+
+    return f"""I need you to verify whether {contact_name} is currently the {title} at {corporation_name},
 a {type_desc}.
 
 Contact on file in Definitive Healthcare (may be outdated):
   Name:  {contact_name}
   Title: {title}
 
+Search these sources in order, stopping when you find a verified match:
 {search_instructions}
 
 For each source you check, briefly note: source name → result (found / not found / inaccessible).
@@ -1178,12 +917,13 @@ Return a JSON object with these fields:
 - found_email: publicly listed email address, or empty string
 - found_phone: publicly listed phone number, or empty string
 - confidence:  "high" (official corporate website or investor relations page),
-               "medium" (operator news / press release),
-               "low" (LinkedIn or possibly outdated source),
+               "medium" (operator news / press release or LinkedIn showing current role),
+               "low" (LinkedIn showing unclear tenure or possibly outdated source),
                or "not_found" (no verified name located)
 - source_url:  exact URL where the name was found, or empty string
 - source_name: plain-English name of that source (e.g. "{domain_display} leadership page",
-               "LinkedIn profile — {corporation_name}")"""
+               "LinkedIn profile — {corporation_name}")
+- reasoning:   1–3 sentence explanation of what you found and why you assigned that confidence"""
 
 
 def _build_facility_research_prompt(
@@ -1302,6 +1042,13 @@ def load_corporate_level_contacts(
         bigquery.ScalarQueryParameter("network_id", "INT64", network_id),
     ])
 
+    # Titles containing these prefixes are former/retired employees — exclude entirely
+    # so we don't burn Sonar Pro calls on contacts who no longer work here.
+    _FORMER_FILTER = r"^(former|retired|ex-)\s"
+
+    # Functional areas we are not interested in enriching — exclude regardless of seniority.
+    _EXCLUDED_FUNCTIONS = r"marketing|development|\bcompliance\b|general counsel|plant operations|clinical services"
+
     # ── Source 1: Executives table (contacts listed directly under the network ID) ──
     exec_query = f"""
     SELECT
@@ -1321,6 +1068,8 @@ def load_corporate_level_contacts(
     FROM `{DH_TABLES['executives']}`
     WHERE HOSPITAL_ID = @network_id
       AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_FORMER_FILTER}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_EXCLUDED_FUNCTIONS}')
     """
     try:
         rows = [dict(r) for r in client.query(exec_query, job_config=_net_cfg).result()]
@@ -1348,6 +1097,8 @@ def load_corporate_level_contacts(
     FROM `{DH_TABLES['corporation']}`
     WHERE HOSPITAL_ID = @network_id
       AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_FORMER_FILTER}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_EXCLUDED_FUNCTIONS}')
     """
     try:
         rows = [dict(r) for r in client.query(corp_query, job_config=_net_cfg).result()]
@@ -1375,6 +1126,8 @@ def load_corporate_level_contacts(
     FROM `{DH_TABLES['full_feed']}`
     WHERE HOSPITAL_ID = @network_id
       AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_FORMER_FILTER}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_EXCLUDED_FUNCTIONS}')
     """
     try:
         rows = [dict(r) for r in client.query(feed_query, job_config=_net_cfg).result()]
@@ -1389,11 +1142,27 @@ def load_corporate_level_contacts(
 
     df = pd.DataFrame(all_rows)
 
-    # Deduplicate: keep one row per EXECUTIVE_ID (prefer december_full_feed > corporate > executives)
+    # Deduplicate step 1: keep one row per EXECUTIVE_ID, preferring the richest source.
+    # (same person can appear in multiple tables with the same EXECUTIVE_ID)
     priority = {"december_full_feed": 0, "corporate_executives": 1, "executives": 2}
     df["_priority"] = df["source_table"].map(priority).fillna(9)
     df = df.sort_values("_priority").drop_duplicates(subset=["EXECUTIVE_ID"], keep="first")
     df = df.drop(columns=["_priority"])
+
+    # Deduplicate step 2: same person with DIFFERENT EXECUTIVE_IDs across tables.
+    # Normalise full name (lower, strip) and keep the first occurrence (highest-priority
+    # source already sorted above).
+    df["_norm_name"] = (
+        df["FIRST_NAME"].fillna("").str.strip().str.lower()
+        + " "
+        + df["LAST_NAME"].fillna("").str.strip().str.lower()
+    ).str.strip()
+    before = len(df)
+    df = df.drop_duplicates(subset=["_norm_name"], keep="first")
+    df = df.drop(columns=["_norm_name"])
+    dupes_removed = before - len(df)
+    if dupes_removed:
+        print(f"    Removed {dupes_removed} cross-table name duplicate(s)")
 
     print(f"  ✓ {len(df)} corporate executive contacts ready for research")
     return df.reset_index(drop=True)
@@ -1618,7 +1387,12 @@ def _research_one_contact(
     title       = str(row.get("title", "")).title()
     state       = str(row.get("state", ""))
     email       = str(row.get("EMAIL") or "")
-    phone       = str(row.get("DIRECT_PHONE") or row.get("LOCATION_PHONE") or "")
+    # Use only DIRECT_PHONE as the individual's phone number.
+    # LOCATION_PHONE is the facility's main switchboard — shared by everyone at
+    # that location — so using it as a personal number causes multiple executives
+    # to get the same phone written to their contact records.  FullEnrich is more
+    # likely to surface an actual direct line for corporate contacts.
+    phone       = str(row.get("DIRECT_PHONE") or "")
     linkedin    = str(row.get("LINKEDIN_PROFILE") or "")
     source      = str(row.get("source_table", ""))
     last_update = str(row.get("LAST_UPDATE") or "")
@@ -1641,7 +1415,7 @@ def _research_one_contact(
         "network_id":          network_id,
         "research_confidence": "high",   # sourced directly from Definitive Healthcare
         "source_path":         "definitive_healthcare",
-        "dh_last_update":      last_update[:10] if last_update else "",
+        "dh_last_update":      last_update if last_update else "",
         "research_findings":   "",
         "research_error":      "",
         "researched_at":       datetime.now().isoformat(),
@@ -1668,12 +1442,12 @@ def _research_one_contact(
         result["research_reasoning"] = (
             f"Contact sourced directly from Definitive Healthcare ({source} table). "
             f"{reason}. "
-            + (f"DH record last updated {last_update[:10]}." if last_update else "DH update date not available.")
+            + (f"DH record last updated: {last_update}." if last_update else "DH update date not available.")
         )
         return result
 
     if is_fresh:
-        reason = f"DH record updated within {_DH_FRESHNESS_MONTHS} months ({last_update[:10]})"
+        reason = f"DH record updated within {_DH_FRESHNESS_MONTHS} months ({last_update})"
         print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
         result["research_findings"] = (
             f'{{"found_name": "{contact_name}", "found_title": "{title}", '
@@ -1693,7 +1467,7 @@ def _research_one_contact(
     # These roles have higher turnover and the DH record is older than
     # _DH_FRESHNESS_MONTHS months, so a live web search is worthwhile.
     try:
-        stale_label = f"stale DH record ({last_update[:10]})" if last_update else "no DH update date"
+        stale_label = f"stale DH record ({last_update})" if last_update else "no DH update date"
 
         # ── Prompt selection ──────────────────────────────────────────────────
         # When the corporation's website domain is known, use the domain-targeted
@@ -1710,15 +1484,20 @@ def _research_one_contact(
                 corporation_name=corporation_name,
                 corporate_domain=bare_domain,
                 facility_type=facility_type,
+                linkedin_url=linkedin,
             )
             # Inject search_domain_filter so Perplexity restricts its web crawl
-            # to the corporate domain.  This dramatically reduces hallucinations
-            # and off-domain results for regional roles.
+            # to the corporate domain.  When we also have a LinkedIn URL for the
+            # specific person, add linkedin.com so the profile check isn't blocked
+            # by the domain filter.
+            domain_filter = [bare_domain]
+            if linkedin:
+                domain_filter.append("linkedin.com")
             extra_params: dict = {
                 "reasoning_effort":   "high",
-                "search_domain_filter": [bare_domain],
+                "search_domain_filter": domain_filter,
             }
-            prompt_label = f"domain-targeted ({bare_domain})"
+            prompt_label = f"domain-targeted ({bare_domain})" + (" + LinkedIn profile" if linkedin else "")
         else:
             prompt = _build_contact_research_prompt(
                 contact_name=contact_name,
@@ -1743,7 +1522,9 @@ def _research_one_contact(
                 response_format=structured_format,
                 extra_params=extra_params,
             )
-            time.sleep(RATE_LIMIT_SECONDS)
+        # Sleep AFTER releasing the semaphore so the next waiting thread can
+        # start its API call immediately rather than waiting out our rate-limit pause.
+        time.sleep(RATE_LIMIT_SECONDS)
         print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result
         result["source_path"] = "sonar_pro"
@@ -1859,7 +1640,9 @@ def _research_one_facility(
                 response_format=structured_format,
                 extra_params=extra,
             )
-            time.sleep(RATE_LIMIT_SECONDS)
+        # Sleep AFTER releasing the semaphore so the next waiting thread can
+        # start its API call immediately rather than waiting out our rate-limit pause.
+        time.sleep(RATE_LIMIT_SECONDS)
         print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result[:2000]
 
