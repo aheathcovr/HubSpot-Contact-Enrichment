@@ -943,12 +943,12 @@ def _run_workflow1_single_facility(
                 r.update({
                     "found_name":          fe["full_name"],
                     "found_title":         fe["title"],
-                    "research_confidence": "low",
+                    "research_confidence": "low_fullenrich",
+                    "source_tier":         "",   # not found via state directory
                     "found_email":         "",
                     "found_phone":         "",
                     "found_linkedin":      fe.get("linkedin_url", ""),
-                    # linkedin_url in research_findings so _extract_urls picks it up for the note
-                    "research_findings":   fe.get("linkedin_url", ""),
+                    "research_findings":   "",   # LinkedIn URL shown via found_linkedin, not as a web-search source
                     "research_error":      "",
                     "hubspot_contact_ids": "",
                 })
@@ -964,10 +964,11 @@ def _run_workflow1_single_facility(
 
 
 _CONFIDENCE_LABELS = {
-    "high":      "HIGH  — found on official association directory or CMS listing",
-    "medium":    "MED   — found on facility/operator website",
-    "low":       "LOW   — found on LinkedIn or potentially outdated source",
-    "not_found": "—     — not found",
+    "high":           "HIGH  — found on official association directory or CMS listing",
+    "medium":         "MED   — found on facility/operator website",
+    "low":            "LOW   — found on LinkedIn or potentially outdated source",
+    "low_fullenrich": "LOW   — found via FullEnrich contact search (LinkedIn-sourced data)",
+    "not_found":      "—     — not found",
 }
 
 _TIER_LABELS = {
@@ -1123,7 +1124,9 @@ def _build_note(
             for u in all_urls[:15]
         )
         h += f"<li>Sources cited by the web search agent:<br>{sources_html}</li>"
-    if tier_str == "1":
+    if fe_people_search:
+        h += "<li>FullEnrich People Search returned these contacts from LinkedIn profile data &mdash; verify via the LinkedIn links in Results above</li>"
+    elif tier_str == "1":
         h += "<li>State association directory was public &mdash; check the URL in sources above</li>"
     elif tier_str == "2":
         h += "<li>State association directory requires login &mdash; verify through direct outreach</li>"
