@@ -73,14 +73,23 @@ CORP_HIERARCHY_TYPE = "Corporation / Operator"
 # Titles searched by FullEnrich when Sonar Pro + DH both find nothing (Workflow 1)
 LEADERSHIP_TITLES = ["Administrator", "Executive Director", "Director of Nursing"]
 
-# Corporate titles searched by FullEnrich as a supplement in Workflow 2
+# Corporate titles searched by FullEnrich as a supplement in Workflow 2.
+# Must mirror the intent of DH_W2_TITLE_PATTERN in state_association_matcher.py
+# so the fallback searches for the same cohort as the primary DH query.
 W2_CORPORATE_TITLES = [
     "Chief Executive Officer",
     "Chief Operating Officer",
     "Chief Financial Officer",
+    "Chief Nursing Officer",
+    "Chief Clinical Officer",
+    "Chief Administrative Officer",
+    "President",
     "Vice President of Operations",
     "Senior Vice President of Operations",
+    "Senior Vice President",
+    "Vice President",
     "Regional Vice President of Operations",
+    "Regional Vice President",
     "Regional Director of Operations",
     "Owner",
 ]
@@ -249,6 +258,12 @@ def _compute_data_freshness(
     Encodes which system identified the contact and how recently
     that system verified them at this facility.
     """
+    if source_path == "definitive_healthcare":
+        # Fast-tracked directly from DH without Sonar Pro verification
+        if dh_last_update:
+            return f"Definitive Healthcare — last updated {dh_last_update}"
+        return "Definitive Healthcare — update date not available"
+
     if source_path == "sonar_pro":
         d = _extract_most_recent_date(research_reasoning)
         source_label = research_source_name if research_source_name else "web search"
@@ -1247,6 +1262,7 @@ def _build_note(
 
     # ── Research Process (dynamic step outcomes) ──────────────────────────────
     existing_contact_actions = [a for a in actions if a.source_path == "existing_contact"]
+    dh_fasttrack_actions     = [a for a in actions if a.source_path == "definitive_healthcare"]
     sonar_pro_actions        = [a for a in actions if a.source_path == "sonar_pro"]
     fe_ps_actions            = [a for a in actions if a.source_path == "fullenrich_people_search"]
     fe_ps_ran_not_found      = any(a.fe_people_search_ran for a in actions)
@@ -1279,6 +1295,17 @@ def _build_note(
                 for a in existing_contact_actions if a.dh_verification_detail
             )
             h += f"<li><b>Definitive Healthcare verification</b> &mdash; {parts}</li>"
+    elif dh_fasttrack_actions:
+        # Workflow 2 fast-track: contacts sourced directly from DH, no Sonar Pro
+        names = ", ".join(
+            f"{a.contact_name} ({a.contact_title})"
+            for a in dh_fasttrack_actions if a.contact_name
+        )
+        h += (
+            f"<li><b>Definitive Healthcare data</b> &mdash; ⚡ Fast-tracked: "
+            f"{len(dh_fasttrack_actions)} corporate executive(s) sourced directly from DH "
+            f"(C-suite or fresh record — state association search skipped): {names}</li>"
+        )
     else:
         # Full research path
         h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"

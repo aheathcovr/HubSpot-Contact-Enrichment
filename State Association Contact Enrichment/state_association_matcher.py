@@ -52,7 +52,7 @@ import time
 import csv
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -104,10 +104,12 @@ DH_TABLES = {
 
 # BigQuery RE2 pattern used to filter corporate executive titles in Workflow 2.
 # Matches: CEO/Chief Executive, COO/Chief Operating, CFO/Chief Financial,
-# Vice President (any), Regional Director (any), standalone President.
+# CNO/Chief Nursing, CCO/Chief Clinical, Vice President (any),
+# Regional Director (any), standalone President.
 DH_W2_TITLE_PATTERN = (
-    r"chief executive|chief operating|chief financial"
-    r"|\bceo\b|\bcoo\b|\bcfo\b"
+    r"chief executive|chief operating|chief financial|chief nursing|chief clinical"
+    r"|chief administrative"
+    r"|\bceo\b|\bcoo\b|\bcfo\b|\bcno\b|\bcco\b|\bcao\b"
     r"|senior vice president"
     r"|vice president"
     r"|regional director"
@@ -152,6 +154,54 @@ GCS_CACHE_BUCKET    = os.getenv("GCS_CACHE_BUCKET", "")
 TARGET_TITLES = {"executive director", "administrator"}
 
 RATE_LIMIT_SECONDS = 2.5  # Pause between OpenRouter calls to avoid rate-limiting
+
+# ── Workflow 2: DH fast-track configuration ───────────────────────────────────
+
+# Title keywords that identify true C-suite executives.  Contacts whose DH title
+# matches any of these are NEVER sent to Sonar Pro — DH is the authoritative
+# source for this cohort and state association directories will never list them.
+_DH_CSUITE_KEYWORDS: frozenset[str] = frozenset({
+    "chief executive", "ceo",
+    "chief operating", "coo",
+    "chief financial", "cfo",
+    "chief nursing", "cno",
+    "chief clinical", "cco",
+    "chief administrative", "cao",
+    "president",
+    "owner",
+})
+
+# How many months a DH LAST_UPDATE date can be in the past before we consider
+# the record stale and worth re-verifying via Sonar Pro.
+_DH_FRESHNESS_MONTHS: int = 12
+
+
+def _is_csuite_title(title: str) -> bool:
+    """Return True if *title* matches a C-suite keyword that should bypass Sonar Pro."""
+    t = (title or "").lower()
+    return any(kw in t for kw in _DH_CSUITE_KEYWORDS)
+
+
+def _dh_record_is_fresh(last_update: str) -> bool:
+    """
+    Return True if the DH LAST_UPDATE date (ISO string YYYY-MM-DD or similar)
+    is within _DH_FRESHNESS_MONTHS months of today.
+
+    Returns False (treat as stale) if the date cannot be parsed.
+    """
+    if not last_update:
+        return False
+    try:
+        # Accept both YYYY-MM-DD and datetime strings
+        date_part = str(last_update).strip()[:10]
+        parts = date_part.split("-")
+        if len(parts) != 3:
+            return False
+        record_date = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+        cutoff = datetime.now() - timedelta(days=_DH_FRESHNESS_MONTHS * 30)
+        return record_date >= cutoff
+    except (ValueError, IndexError):
+        return False
 
 # ─── LLM helpers ──────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
@@ -1482,6 +1532,18 @@ def _research_one_contact(
     """
     Worker for workflow_2.  Runs in a thread pool — one unassociated contact per call.
 
+    Fast-track bypass (no Sonar Pro call):
+      - C-suite titles (CEO, COO, CFO, CNO, CCO, CAO, President, Owner): DH is the
+        authoritative source for these roles.  State association directories and CMS
+        Care Compare never list corporate C-suite executives, so running Sonar Pro
+        against those sources is wasteful and produces false negatives.
+      - Any title whose DH LAST_UPDATE is within _DH_FRESHNESS_MONTHS months: the
+        record is considered current and is written directly to HubSpot.
+
+    Sonar Pro still runs for VP / Regional Director / Regional VP contacts whose DH
+    record is stale (older than _DH_FRESHNESS_MONTHS months), because turnover is
+    higher in those roles and a web search can surface a more current name.
+
     Acquires _OPENROUTER_SEMAPHORE before calling the API to cap concurrency at
     _MAX_WORKERS, then sleeps RATE_LIMIT_SECONDS inside the semaphore so each slot
     turns over at a controlled rate before being released.
@@ -1490,12 +1552,13 @@ def _research_one_contact(
         f"{row.get('FIRST_NAME', '')} {row.get('LAST_NAME', '')}".strip()
         or str(row.get("EXECUTIVE_NAME", "Unknown"))
     )
-    title    = str(row.get("title", "")).title()
-    state    = str(row.get("state", ""))
-    email    = str(row.get("EMAIL") or "")
-    phone    = str(row.get("DIRECT_PHONE") or row.get("LOCATION_PHONE") or "")
-    linkedin = str(row.get("LINKEDIN_PROFILE") or "")
-    source   = str(row.get("source_table", ""))
+    title       = str(row.get("title", "")).title()
+    state       = str(row.get("state", ""))
+    email       = str(row.get("EMAIL") or "")
+    phone       = str(row.get("DIRECT_PHONE") or row.get("LOCATION_PHONE") or "")
+    linkedin    = str(row.get("LINKEDIN_PROFILE") or "")
+    source      = str(row.get("source_table", ""))
+    last_update = str(row.get("LAST_UPDATE") or "")
 
     result: dict = {
         "workflow":            "2 - Unassociated Contact",
@@ -1505,15 +1568,67 @@ def _research_one_contact(
         "email":               email,
         "phone":               phone,
         "linkedin":            linkedin,
+        "found_name":          contact_name,
+        "found_title":         title,
+        "found_email":         email,
+        "found_phone":         phone,
+        "found_linkedin":      linkedin,
         "definitive_source":   source,
         "corporation_name":    corporation_name,
         "network_id":          network_id,
         "research_confidence": "high",   # sourced directly from Definitive Healthcare
+        "source_path":         "definitive_healthcare",
+        "dh_last_update":      last_update[:10] if last_update else "",
         "research_findings":   "",
         "research_error":      "",
         "researched_at":       datetime.now().isoformat(),
     }
 
+    # ── Fast-track decision ───────────────────────────────────────────────────
+    # C-suite titles are never found on state association directories or CMS Care
+    # Compare, so Sonar Pro would always return not_found for them.  Skip it.
+    # Any title with a fresh DH record is also trusted directly.
+    is_csuite = _is_csuite_title(title)
+    is_fresh  = _dh_record_is_fresh(last_update)
+
+    if is_csuite:
+        reason = "C-suite title — DH is authoritative; state associations do not list corporate executives"
+        print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
+        result["research_findings"] = (
+            f'{{"found_name": "{contact_name}", "found_title": "{title}", '
+            f'"found_email": "{email}", "found_phone": "{phone}", '
+            f'"confidence": "high", "source_url": "", '
+            f'"source_name": "Definitive Healthcare", '
+            f'"reasoning": "Fast-tracked: {reason}"\'}}'
+        )
+        result["research_source_name"] = "Definitive Healthcare"
+        result["research_reasoning"] = (
+            f"Contact sourced directly from Definitive Healthcare ({source} table). "
+            f"{reason}. "
+            + (f"DH record last updated {last_update[:10]}." if last_update else "DH update date not available.")
+        )
+        return result
+
+    if is_fresh:
+        reason = f"DH record updated within {_DH_FRESHNESS_MONTHS} months ({last_update[:10]})"
+        print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
+        result["research_findings"] = (
+            f'{{"found_name": "{contact_name}", "found_title": "{title}", '
+            f'"found_email": "{email}", "found_phone": "{phone}", '
+            f'"confidence": "high", "source_url": "", '
+            f'"source_name": "Definitive Healthcare", '
+            f'"reasoning": "Fast-tracked: {reason}"\'}}'
+        )
+        result["research_source_name"] = "Definitive Healthcare"
+        result["research_reasoning"] = (
+            f"Contact sourced directly from Definitive Healthcare ({source} table). "
+            f"{reason}. High confidence — record is current."
+        )
+        return result
+
+    # ── Sonar Pro research (stale VP / Regional Director records only) ────────
+    # These roles have higher turnover and the DH record is older than
+    # _DH_FRESHNESS_MONTHS months, so a live web search is worthwhile.
     try:
         prompt = _build_contact_research_prompt(
             contact_name=contact_name,
@@ -1524,10 +1639,11 @@ def _research_one_contact(
         )
 
         # Workflow 2 contacts are unassociated (no direct facility URL), so they
-        # always benefit from the deeper reasoning model.
+        # benefit from the deeper reasoning model.
         structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
 
-        print(f"    → {contact_name}: querying Sonar Reasoning Pro (high effort)...")
+        stale_label = f"stale DH record ({last_update[:10]})" if last_update else "no DH update date"
+        print(f"    → {contact_name} ({title}): querying Sonar Reasoning Pro [{stale_label}]...")
         with _OPENROUTER_SEMAPHORE:
             research_result = call_openrouter(
                 RESEARCH_SYSTEM_PROMPT,
@@ -1539,6 +1655,35 @@ def _research_one_contact(
             time.sleep(RATE_LIMIT_SECONDS)
         print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result
+        result["source_path"] = "sonar_pro"
+
+        # Parse the structured response and promote fields to top-level result keys
+        # so the downstream _process_found_contact pipeline sees them.
+        found_name, found_title, confidence, found_email, found_phone, reasoning, source_name = (
+            parse_found_name(research_result)
+        )
+        if found_name and confidence != "not_found":
+            result.update({
+                "found_name":          found_name,
+                "found_title":         found_title,
+                "found_email":         found_email or email,
+                "found_phone":         found_phone or phone,
+                "found_linkedin":      linkedin,
+                "research_confidence": confidence,
+                "research_reasoning":  reasoning,
+                "research_source_name": source_name,
+            })
+        else:
+            # Sonar found nothing — fall back to the DH record itself so we
+            # don't silently discard a contact we know exists.
+            result.update({
+                "research_confidence": "low",
+                "research_reasoning":  (
+                    f"Sonar Pro could not verify {contact_name} on a live source "
+                    f"(DH record is {stale_label}). Falling back to DH data — treat with caution."
+                ),
+                "research_source_name": "Definitive Healthcare (unverified — stale record)",
+            })
     except RuntimeError as e:
         result["research_error"] = str(e)
         print(f"    ✗ {contact_name}: failed — {e}")
