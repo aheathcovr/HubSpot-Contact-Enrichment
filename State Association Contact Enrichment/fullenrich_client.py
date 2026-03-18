@@ -134,23 +134,56 @@ def _location_score(person: dict, target_city: str, target_state: str) -> int:
     return 0
 
 
+# FullEnrich seniority level values accepted by the API.
+# Used in corporate mode to narrow results to senior leadership.
+_CSUITE_SENIORITY   = ["C-Level"]
+_VP_SENIORITY       = ["C-Level", "VP"]
+_DIRECTOR_SENIORITY = ["C-Level", "VP", "Director"]
+
+# Map title keywords → seniority filter list for corporate searches.
+# Checked in order; first match wins.
+_TITLE_SENIORITY_MAP: list[tuple[re.Pattern, list[str]]] = [
+    (re.compile(r"\b(chief|\bceo\b|\bcoo\b|\bcfo\b|\bcno\b|\bcco\b|\bcao\b|president|owner)\b", re.I), _CSUITE_SENIORITY),
+    (re.compile(r"\b(senior vice president|svp|vice president|\bvp\b)\b", re.I),                     _VP_SENIORITY),
+    (re.compile(r"\b(regional director|director)\b", re.I),                                          _DIRECTOR_SENIORITY),
+]
+
+
+def _seniority_for_title(title: str) -> list[str]:
+    """Return the appropriate FullEnrich seniority filter list for *title*."""
+    for pattern, levels in _TITLE_SENIORITY_MAP:
+        if pattern.search(title or ""):
+            return levels
+    return _DIRECTOR_SENIORITY   # safe default for any unrecognised corporate title
+
+
 def _search_one_title(
     api_key: str,
     title: str,
     company_name: str = "",
     domain: str = "",
     limit: int = 1,
+    seniority_levels: list[str] | None = None,
 ) -> list[dict]:
     """
     Call the FullEnrich People Search API for a single title filter.
 
     Uses domain (current_company_domains) when available, falls back to
     company name (current_company_names). Returns raw person dicts or [].
+
+    When *seniority_levels* is provided (corporate mode), the
+    ``current_position_seniority_level`` filter is added to the payload to
+    narrow results to senior leadership and reduce false positives.
     """
     payload: dict = {
         "current_position_titles": [{"value": title, "exact_match": False}],
         "limit": limit,
     }
+
+    if seniority_levels:
+        payload["current_position_seniority_level"] = [
+            {"value": lvl, "exact_match": False} for lvl in seniority_levels
+        ]
 
     if domain:
         payload["current_company_domains"] = [{"value": domain, "exact_match": True}]
@@ -321,6 +354,7 @@ def search_facility_contacts(
     state: str,
     titles: list[str],
     domain: str = "",
+    corporate_mode: bool = False,
 ) -> list[dict]:
     """
     Search FullEnrich for people at the facility matching any of *titles*.
@@ -332,6 +366,20 @@ def search_facility_contacts(
     When searching by company name, fetches up to 5 candidates per title and picks
     the one whose person location best matches *city* / *state*, reducing the risk of
     returning a contact from a same-named facility in a different state.
+
+    **corporate_mode=True** enables two behaviours optimised for corporate/network
+    searches (Workflow 2):
+
+    1. **Seniority filters** — each title search injects
+       ``current_position_seniority_level`` filters derived from the title keyword
+       (e.g. "Chief" → C-Level only; "Vice President" → C-Level + VP).  This
+       dramatically reduces false positives from mid-level staff with similar
+       title fragments.
+
+    2. **Location bypass** — ``min_score`` is forced to 0 regardless of whether
+       city/state are set.  A CFO based in Nashville working for a national operator
+       is correct regardless of the HQ state; applying the state-match guard would
+       incorrectly reject them.
 
     Makes one primary API call per title (plus one fallback call when domain returns
     empty). Deduplicates results by full name across all titles.
@@ -354,17 +402,33 @@ def search_facility_contacts(
     contacts: list[dict] = []
     seen_names: set[str] = set()
 
-    # Require at least a state match when the facility location is known.
-    # This prevents shared corporate domains (e.g. brookdale.com) from returning
-    # employees at the wrong facility in a different state.
-    min_score = 1 if (city or state) else 0
+    if corporate_mode:
+        # Corporate searches: bypass location filtering entirely.
+        # A national operator's CFO may be based anywhere; the state of the
+        # corporate HQ is irrelevant and would cause valid contacts to be rejected.
+        min_score = 0
+        logger.debug(
+            "FullEnrich corporate_mode=True for %r — location scoring disabled, "
+            "seniority filters enabled",
+            identifier,
+        )
+    else:
+        # Require at least a state match when the facility location is known.
+        # This prevents shared corporate domains (e.g. brookdale.com) from returning
+        # employees at the wrong facility in a different state.
+        min_score = 1 if (city or state) else 0
 
     for title_filter in titles:
+        # In corporate mode, derive a seniority filter from the title keyword so
+        # the API returns only appropriately senior people.
+        seniority = _seniority_for_title(title_filter) if corporate_mode else None
+
         # Domain search: fetch multiple candidates so location scoring can pick
         # the right facility — a single result gives nothing to compare against.
         if bare_domain:
             raw_people = _search_one_title(
-                api_key=api_key, title=title_filter, domain=bare_domain, limit=5,
+                api_key=api_key, title=title_filter, domain=bare_domain,
+                limit=5, seniority_levels=seniority,
             )
             # Fall back to name search if domain not indexed in FullEnrich
             if not raw_people and company_name:
@@ -374,13 +438,13 @@ def search_facility_contacts(
                 )
                 raw_people = _search_one_title(
                     api_key=api_key, title=title_filter,
-                    company_name=company_name, limit=5,
+                    company_name=company_name, limit=5, seniority_levels=seniority,
                 )
         else:
             # Name-only search: fetch more candidates so we can pick by location
             raw_people = _search_one_title(
                 api_key=api_key, title=title_filter,
-                company_name=company_name, limit=5,
+                company_name=company_name, limit=5, seniority_levels=seniority,
             )
 
         contact = _best_candidate(

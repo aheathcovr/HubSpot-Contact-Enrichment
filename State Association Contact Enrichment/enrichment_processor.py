@@ -651,8 +651,37 @@ def _process_found_contact(
                         matched_contact_id, exc,
                     )
 
-            # ── FullEnrich: find missing email and/or phone ───────────────────
-            if not existing_email or not existing_phone:
+            # ── DH-sourced email: write to HubSpot if the contact has none ──────────
+            # When the contact was fast-tracked from Definitive Healthcare,
+            # found_email / found_phone are already populated from DH.  Write
+            # them directly to HubSpot before considering FullEnrich, so we
+            # don’t burn a FullEnrich Bulk Enrich credit for data DH already
+            # provided.
+            hs_updates: dict = {}
+            if not existing_email and enriched_email and email_validation.get("status") != "INVALID":
+                hs_updates["email"] = enriched_email
+                logger.info(
+                    "Writing DH-sourced email %r to contact %s (no existing email)",
+                    enriched_email, matched_contact_id,
+                )
+            if not existing_phone and enriched_phone:
+                hs_updates["phone"] = enriched_phone
+                logger.info(
+                    "Writing DH-sourced phone %r to contact %s (no existing phone)",
+                    enriched_phone, matched_contact_id,
+                )
+            if hs_updates:
+                hs.update_contact(matched_contact_id, hs_updates)
+                hs_updates = {}   # reset so FullEnrich block below can reuse
+
+            # ── FullEnrich: fill any fields still missing after DH data applied ──
+            # Only call FullEnrich Bulk Enrich if at least one of email / phone
+            # is still absent after applying DH-sourced data above.  This avoids
+            # spending a credit when DH already provided both fields.
+            email_still_missing = not (existing_email or enriched_email)
+            phone_still_missing = not (existing_phone or enriched_phone)
+
+            if email_still_missing or phone_still_missing:
                 fe_first, fe_last = _split_name(found_name)
                 fe_info = enrich_contact_info(
                     firstname=fe_first,
@@ -661,9 +690,8 @@ def _process_found_contact(
                     domain=facility_domain,
                     linkedin_url=found_linkedin,
                 )
-                hs_updates: dict = {}
 
-                if not existing_email and fe_info.get("email"):
+                if email_still_missing and fe_info.get("email"):
                     new_email = fe_info["email"]
                     ev = verify_email_millionverifier(new_email)
                     enriched_email_status = ev.get("status", "")
@@ -684,13 +712,13 @@ def _process_found_contact(
                             f"<b>Reason:</b> FullEnrich found this address but MillionVerifier flagged it as INVALID<br>"
                         )
 
-                if not existing_phone and fe_info.get("phone"):
+                if phone_still_missing and fe_info.get("phone"):
                     hs_updates["phone"] = fe_info["phone"]
                     enriched_phone = fe_info["phone"]
                     note_lines.append(_phone_added_line(fe_info))
 
                 # Additional DELIVERABLE emails → hs_additional_emails
-                primary_for_extras = hs_updates.get("email") or existing_email
+                primary_for_extras = hs_updates.get("email") or existing_email or enriched_email
                 alt_emails = _collect_additional_emails(fe_info, primary_for_extras)
                 if alt_emails:
                     hs_updates["hs_additional_emails"] = alt_emails
@@ -703,7 +731,9 @@ def _process_found_contact(
             if linkedin_to_write and not existing_linkedin:
                 try:
                     hs.update_contact(matched_contact_id, {"hs_linkedin_url": linkedin_to_write})
-                    source = "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
+                    source = "Definitive Healthcare" if source_path == "definitive_healthcare" and found_linkedin else (
+                        "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
+                    )
                     note_lines.append(
                         f"<b>✚ LinkedIn added:</b> <a href=\"{linkedin_to_write}\">{linkedin_to_write}</a><br>"
                         f"<b>Source:</b> {source}<br>"
@@ -1606,6 +1636,7 @@ def run_enrichment(company_id: str) -> None:
                     network_id=network_id,
                     corporation_name=company_name,
                     facility_type=props.get("facility_type", ""),
+                    corporate_domain=props.get("website", "") or "",
                 )
                 logger.info(f"Workflow 2 complete: {len(results)} contacts researched")
             except ValueError:
@@ -1637,6 +1668,7 @@ def run_enrichment(company_id: str) -> None:
             state=props.get("state", "") or "",
             titles=W2_CORPORATE_TITLES,
             domain=props.get("website", "") or "",
+            corporate_mode=True,   # disables location scoring, enables seniority filters
         )
         fe_added = 0
         for fe in fe_corp_contacts:

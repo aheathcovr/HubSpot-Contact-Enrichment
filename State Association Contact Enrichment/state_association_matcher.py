@@ -1092,6 +1092,100 @@ Return a JSON object with these fields:
 - source_name: plain-English name of that source (e.g. "Washington State Assisted Living Association member directory")"""
 
 
+# Regex to identify regional/VP-level titles that should use the corporate domain
+# Sonar Pro prompt rather than the state association prompt.
+_REGIONAL_TITLE_RE = re.compile(
+    r"\b(regional|vice president|\bvp\b|svp|senior vice president|director of operations)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_regional_title(title: str) -> bool:
+    """Return True if *title* is a regional or VP-level role (not C-suite)."""
+    return bool(_REGIONAL_TITLE_RE.search(title or ""))
+
+
+def _build_corporate_contact_research_prompt(
+    contact_name: str,
+    title: str,
+    corporation_name: str,
+    corporate_domain: str,
+    facility_type: str,
+) -> str:
+    """
+    Build a domain-targeted Sonar Pro prompt for stale VP / Regional Director
+    records in Workflow 2.
+
+    Unlike _build_contact_research_prompt (which searches state association
+    directories), this prompt restricts the search to the corporation's own
+    website and LinkedIn.  It is used when:
+      - The DH record is stale (older than _DH_FRESHNESS_MONTHS months)
+      - The title is NOT C-suite (those are fast-tracked directly from DH)
+      - The title IS a regional or VP-level role
+
+    The ``search_domain_filter`` key is injected into the OpenRouter payload
+    (via extra_params) by the caller so Perplexity restricts its web search to
+    the corporate domain and common investor-relations subdomains.
+    """
+    type_desc = {
+        "SNF":  "skilled nursing facility (SNF) operator",
+        "ALF":  "assisted living facility (ALF) operator",
+        "BOTH": "skilled nursing and assisted living operator",
+    }.get((facility_type or "").upper(), "long-term care operator")
+
+    # Derive the bare domain for display in the prompt
+    bare = re.sub(r"^https?://", "", corporate_domain.strip())
+    bare = re.sub(r"^www\.", "", bare).split("/")[0].strip().lower()
+    domain_display = bare or corporation_name
+
+    is_regional = _is_regional_title(title)
+
+    if is_regional:
+        # Regional roles are almost never listed on the corporate About Us page.
+        # Pivot to a LinkedIn-targeted search after checking the corporate site.
+        search_instructions = f"""\
+Search these sources in order, stopping when you find a verified match:
+1. {domain_display} — look for pages titled 'About Us', 'Leadership', 'Our Team',
+   'Management', or 'Investor Relations' that list regional executives.
+2. LinkedIn: search for \"{corporation_name}\" \"{title}\" to find the current person
+   holding this role.  Prefer profiles showing a current position at {corporation_name}.
+3. LinkedIn: try the variant search \"{corporation_name} regional\" to surface regional
+   leadership not listed by exact title."""
+    else:
+        search_instructions = f"""\
+Search these sources in order, stopping when you find a verified match:
+1. {domain_display} — look specifically for pages titled 'About Us', 'Leadership Team',
+   'Management', 'Our Team', or 'Investor Relations / Governance' that list senior
+   executives.  Common URL patterns: /about-us, /leadership-team, /management,
+   /corporate-governance, /investor-relations/management.
+2. LinkedIn: search for \"{corporation_name}\" \"{title}\" to confirm or supplement the
+   corporate website finding."""
+
+    return f"""I need you to find the current {title} at {corporation_name},
+a {type_desc}.
+
+Contact on file in Definitive Healthcare (may be outdated):
+  Name:  {contact_name}
+  Title: {title}
+
+{search_instructions}
+
+For each source you check, briefly note: source name → result (found / not found / inaccessible).
+
+Return a JSON object with these fields:
+- found_name:  full name as listed at the source, or empty string if not found
+- found_title: exact job title as listed at the source, or empty string
+- found_email: publicly listed email address, or empty string
+- found_phone: publicly listed phone number, or empty string
+- confidence:  "high" (official corporate website or investor relations page),
+               "medium" (operator news / press release),
+               "low" (LinkedIn or possibly outdated source),
+               or "not_found" (no verified name located)
+- source_url:  exact URL where the name was found, or empty string
+- source_name: plain-English name of that source (e.g. "{domain_display} leadership page",
+               "LinkedIn profile — {corporation_name}")"""
+
+
 def _build_facility_research_prompt(
     facility_name: str,
     city: str,
@@ -1528,6 +1622,7 @@ def _research_one_contact(
     corporation_name: str,
     network_id: int,
     facility_type: str,
+    corporate_domain: str = "",
 ) -> dict:
     """
     Worker for workflow_2.  Runs in a thread pool — one unassociated contact per call.
@@ -1543,6 +1638,13 @@ def _research_one_contact(
     Sonar Pro still runs for VP / Regional Director / Regional VP contacts whose DH
     record is stale (older than _DH_FRESHNESS_MONTHS months), because turnover is
     higher in those roles and a web search can surface a more current name.
+
+    When *corporate_domain* is provided, stale VP/Regional records are researched
+    using a domain-targeted prompt (_build_corporate_contact_research_prompt) that
+    focuses on the corporation's own website and LinkedIn, rather than state
+    association directories which will never list these roles.  The domain is also
+    injected as ``search_domain_filter`` in the OpenRouter payload so Perplexity
+    restricts its web crawl to the corporate domain.
 
     Acquires _OPENROUTER_SEMAPHORE before calling the API to cap concurrency at
     _MAX_WORKERS, then sleeps RATE_LIMIT_SECONDS inside the semaphore so each slot
@@ -1630,27 +1732,55 @@ def _research_one_contact(
     # These roles have higher turnover and the DH record is older than
     # _DH_FRESHNESS_MONTHS months, so a live web search is worthwhile.
     try:
-        prompt = _build_contact_research_prompt(
-            contact_name=contact_name,
-            title=title,
-            corporation_name=corporation_name,
-            state=state,
-            facility_type=facility_type,
-        )
+        stale_label = f"stale DH record ({last_update[:10]})" if last_update else "no DH update date"
+
+        # ── Prompt selection ──────────────────────────────────────────────────
+        # When the corporation's website domain is known, use the domain-targeted
+        # prompt that focuses on the corporate website and LinkedIn.  This is far
+        # more likely to find a VP or Regional Director than state association
+        # directories, which never list these roles.
+        # Fall back to the state-association prompt only when no domain is available.
+        if corporate_domain:
+            bare_domain = re.sub(r"^https?://", "", corporate_domain.strip())
+            bare_domain = re.sub(r"^www\.", "", bare_domain).split("/")[0].strip().lower()
+            prompt = _build_corporate_contact_research_prompt(
+                contact_name=contact_name,
+                title=title,
+                corporation_name=corporation_name,
+                corporate_domain=bare_domain,
+                facility_type=facility_type,
+            )
+            # Inject search_domain_filter so Perplexity restricts its web crawl
+            # to the corporate domain.  This dramatically reduces hallucinations
+            # and off-domain results for regional roles.
+            extra_params: dict = {
+                "reasoning_effort":   "high",
+                "search_domain_filter": [bare_domain],
+            }
+            prompt_label = f"domain-targeted ({bare_domain})"
+        else:
+            prompt = _build_contact_research_prompt(
+                contact_name=contact_name,
+                title=title,
+                corporation_name=corporation_name,
+                state=state,
+                facility_type=facility_type,
+            )
+            extra_params = {"reasoning_effort": "high"}
+            prompt_label = "state-association fallback (no domain)"
 
         # Workflow 2 contacts are unassociated (no direct facility URL), so they
         # benefit from the deeper reasoning model.
         structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
 
-        stale_label = f"stale DH record ({last_update[:10]})" if last_update else "no DH update date"
-        print(f"    → {contact_name} ({title}): querying Sonar Reasoning Pro [{stale_label}]...")
+        print(f"    → {contact_name} ({title}): querying Sonar Reasoning Pro [{stale_label}, {prompt_label}]...")
         with _OPENROUTER_SEMAPHORE:
             research_result = call_openrouter(
                 RESEARCH_SYSTEM_PROMPT,
                 prompt,
                 model=OPENROUTER_MODEL_TIER23,
                 response_format=structured_format,
-                extra_params={"reasoning_effort": "high"},
+                extra_params=extra_params,
             )
             time.sleep(RATE_LIMIT_SECONDS)
         print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
@@ -1820,10 +1950,15 @@ def workflow_2_research_contacts(
     network_id: int,
     corporation_name: str,
     facility_type: str,
+    corporate_domain: str = "",
 ) -> list[dict]:
     """
     Workflow 2: Find corporate-level ED/Administrator contacts in Definitive that
     are not assigned to a specific facility, then research them on the web.
+
+    *corporate_domain* (e.g. "brookdale.com") is passed to _research_one_contact
+    so that stale VP / Regional Director records can be verified against the
+    corporation's own website rather than state association directories.
     """
     print("\n" + "=" * 70)
     print("  WORKFLOW 2 — Researching Unassociated Definitive Contacts")
@@ -1845,7 +1980,8 @@ def workflow_2_research_contacts(
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                _research_one_contact, row, corporation_name, network_id, facility_type
+                _research_one_contact, row, corporation_name, network_id,
+                facility_type, corporate_domain,
             ): i
             for i, row in enumerate(rows)
         }
