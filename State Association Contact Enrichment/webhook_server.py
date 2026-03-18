@@ -221,6 +221,7 @@ async def handle_webhook(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Missing signature"}, status_code=401)
 
     url = str(request.url)
+    logger.info(f"Validating signature against url={url!r}")
     valid = _validate_hubspot_signature(
         secret=HUBSPOT_WEBHOOK_SECRET,
         method="POST",
