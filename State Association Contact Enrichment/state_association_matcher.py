@@ -1286,20 +1286,15 @@ def get_facility_ids_for_network(client: bigquery.Client, network_id: int) -> li
 def load_corporate_level_contacts(
     client: bigquery.Client,
     network_id: int,
-    facility_ids: list[int],
 ) -> pd.DataFrame:
     """
-    Load contacts from Definitive who are:
-      - Titled "Executive Director" or "Administrator"
-      - Associated with the NETWORK_ID at the corporation level
-        (HOSPITAL_ID = network_id in the Executives or Corporate Executives table)
-      - NOT also appearing at a specific child facility
+    Load contacts from Definitive who are titled as corporate executives
+    (CEO, COO, CFO, President, VP, etc.) and associated with the NETWORK_ID
+    at the corporation level (HOSPITAL_ID = network_id).
 
-    Returns a DataFrame of contacts suitable for state-association research.
+    Returns a DataFrame of contacts suitable for research.
     """
     print(f"\n  Querying corporate-level contacts for NETWORK_ID={network_id}...")
-
-    facility_id_set: set[int] = set(facility_ids)
 
     all_rows: list[dict] = []
 
@@ -1394,47 +1389,13 @@ def load_corporate_level_contacts(
 
     df = pd.DataFrame(all_rows)
 
-    # ── Find which EXECUTIVE_IDs also appear at a child facility ──────────────
-    exec_ids = df["EXECUTIVE_ID"].dropna().unique().tolist()
-
-    # Build set of exec_ids that have a facility-level row in ANY Definitive source
-    facility_exec_ids: set = set()
-    if exec_ids and facility_ids:
-        exec_ids_list = [int(e) for e in exec_ids]
-        fac_ids_list  = [int(f) for f in facility_ids]
-
-        for table_key in ("executives", "full_feed"):
-            fac_check_query = f"""
-            SELECT DISTINCT EXECUTIVE_ID
-            FROM `{DH_TABLES[table_key]}`
-            WHERE EXECUTIVE_ID IN UNNEST(@exec_ids)
-              AND CAST(HOSPITAL_ID AS INT64) IN UNNEST(@fac_ids)
-            """
-            fac_check_cfg = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ArrayQueryParameter("exec_ids", "INT64", exec_ids_list),
-                bigquery.ArrayQueryParameter("fac_ids",  "INT64", fac_ids_list),
-            ])
-            try:
-                rows = client.query(fac_check_query, job_config=fac_check_cfg).result()
-                ids  = {row.EXECUTIVE_ID for row in rows}
-                facility_exec_ids.update(ids)
-            except Exception as e:
-                print(f"    ⚠ Facility cross-check ({table_key}) failed: {e}")
-
-    # ── Exclude contacts that already have a facility-level assignment ─────────
-    before = len(df)
-    df = df[~df["EXECUTIVE_ID"].isin(facility_exec_ids)].copy()
-    excluded = before - len(df)
-    if excluded:
-        print(f"  ✓ Excluded {excluded} contact(s) already assigned to a child facility")
-
     # Deduplicate: keep one row per EXECUTIVE_ID (prefer december_full_feed > corporate > executives)
     priority = {"december_full_feed": 0, "corporate_executives": 1, "executives": 2}
     df["_priority"] = df["source_table"].map(priority).fillna(9)
     df = df.sort_values("_priority").drop_duplicates(subset=["EXECUTIVE_ID"], keep="first")
     df = df.drop(columns=["_priority"])
 
-    print(f"  ✓ {len(df)} corporate-only ED/Administrator contacts ready for research")
+    print(f"  ✓ {len(df)} corporate executive contacts ready for research")
     return df.reset_index(drop=True)
 
 
@@ -1964,10 +1925,7 @@ def workflow_2_research_contacts(
     print("  WORKFLOW 2 — Researching Unassociated Definitive Contacts")
     print("=" * 70)
 
-    facility_ids = get_facility_ids_for_network(client, network_id)
-    print(f"  Total child facilities under NETWORK_ID {network_id}: {len(facility_ids)}")
-
-    contacts_df = load_corporate_level_contacts(client, network_id, facility_ids)
+    contacts_df = load_corporate_level_contacts(client, network_id)
     if contacts_df.empty:
         print("  ℹ No contacts to research for Workflow 2.")
         return []
