@@ -22,6 +22,7 @@ Environment variables:
   BQ_LOCATION               BigQuery location (default: US)
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -102,11 +103,13 @@ def _validate_hubspot_signature(
         return False
 
     message = method.upper() + url + body.decode("utf-8", errors="replace") + timestamp
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    expected = base64.b64encode(
+        hmac.new(
+            secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("utf-8")
 
     return hmac.compare_digest(expected, signature_v3)
 
