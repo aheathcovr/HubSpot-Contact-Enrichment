@@ -27,7 +27,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -172,6 +172,55 @@ def _names_match(found_name: str, hs_firstname: str, hs_lastname: str) -> bool:
         first.lower() == (hs_firstname or "").strip().lower()
         and last.lower() == (hs_lastname or "").strip().lower()
     )
+
+
+# ── Source recency helpers ────────────────────────────────────────────────────
+
+_MONTH_MAP: dict[str, int] = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+
+_MONTH_PATTERN = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|october|november|december"
+    r"|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)[.,\s]+(\d{4})\b",
+    re.IGNORECASE,
+)
+_ISO_DATE_PATTERN = re.compile(r"\b(20\d{2})-(0[1-9]|1[0-2])-\d{2}\b")
+
+
+def _extract_most_recent_date(text: str) -> datetime | None:
+    """Return the most recent month+year date mentioned in *text*, or None."""
+    if not text:
+        return None
+    dates: list[datetime] = []
+    for m in _MONTH_PATTERN.finditer(text):
+        month_num = _MONTH_MAP.get(m.group(1).lower())
+        year = int(m.group(2))
+        if month_num and 2015 <= year <= 2035:
+            dates.append(datetime(year, month_num, 1))
+    for m in _ISO_DATE_PATTERN.finditer(text):
+        dates.append(datetime(int(m.group(1)), int(m.group(2)), 1))
+    return max(dates) if dates else None
+
+
+def _is_source_stale(reasoning: str) -> tuple[bool, str]:
+    """
+    Return (stale, label) where stale=True when the most recent date cited
+    in *reasoning* is more than 12 months ago.
+
+    label is a human-readable string like "January 2024".
+    """
+    d = _extract_most_recent_date(reasoning)
+    if d is None:
+        return False, ""
+    cutoff = datetime.now() - timedelta(days=365)
+    if d < cutoff:
+        label = d.strftime("%B %Y")
+        return True, label
+    return False, ""
 
 
 # ── Note helpers — all output HTML (HubSpot renders note body as HTML) ────────
@@ -1010,6 +1059,7 @@ def _build_note(
     results: list[dict],
     actions: list[ContactAction],
     errors: list[str],
+    portal_id: int = 0,
 ) -> str:
     """
     Build the salesperson-readable HTML summary note for the company record.
@@ -1134,8 +1184,19 @@ def _build_note(
             conf_label = _CONFIDENCE_LABELS.get(action.confidence, action.confidence)
             h += f"<b>Contact:</b> {action.contact_name}, {action.contact_title}<br>"
             h += f"<b>Confidence:</b> {conf_label}<br>"
+
+            # Data completeness summary
+            email_check   = "✓" if action.found_email else "✗"
+            phone_check   = "✓" if action.found_phone else "✗"
+            linkedin_check = "✓" if action.found_linkedin else "✗"
+            h += f"<b>Data:</b> Email {email_check} &nbsp;|&nbsp; Phone {phone_check} &nbsp;|&nbsp; LinkedIn {linkedin_check}<br>"
+
             if action.research_reasoning:
                 h += f"<b>Why:</b> {action.research_reasoning}<br>"
+                stale, stale_label = _is_source_stale(action.research_reasoning)
+                if stale:
+                    h += f"<em>&#9888; Source may be outdated &mdash; most recent date cited: {stale_label}</em><br>"
+
             if action.found_email:
                 vstatus  = action.email_validation_status
                 vquality = action.email_validation_quality
@@ -1158,8 +1219,15 @@ def _build_note(
                 h += f"<b>Phone:</b> {action.found_phone}<br>"
             if action.found_linkedin:
                 h += f"<b>LinkedIn:</b> <a href=\"{action.found_linkedin}\">{action.found_linkedin}</a><br>"
+
             act_label = _ACTION_LABELS.get(action.action, action.action)
-            contact_ref = f" #{action.contact_id}" if action.contact_id else ""
+            if action.contact_id and portal_id:
+                contact_url = f"https://app.hubspot.com/contacts/{portal_id}/contact/{action.contact_id}"
+                contact_ref = f" &mdash; <a href=\"{contact_url}\">{action.contact_name} #{action.contact_id}</a>"
+            elif action.contact_id:
+                contact_ref = f" #{action.contact_id}"
+            else:
+                contact_ref = ""
             h += f"<b>HubSpot:</b> {act_label}{contact_ref}<br>"
 
         elif action.action == "no_contact_found":
@@ -1216,6 +1284,12 @@ def run_enrichment(company_id: str) -> None:
     logger.info(f"Starting enrichment for company_id={company_id}")
     hs = HubSpotClient()
     errors: list[str] = []
+
+    portal_id = 0
+    try:
+        portal_id = hs.get_portal_id()
+    except Exception as exc:
+        logger.warning(f"Could not fetch HubSpot portal ID: {exc}")
 
     # ── Step 1: Load company properties ──────────────────────────────────────
     try:
@@ -1450,6 +1524,7 @@ def run_enrichment(company_id: str) -> None:
             results=results,
             actions=actions,
             errors=errors,
+            portal_id=portal_id,
         )
         hs.create_note_on_company(company_id, note_body)
         logger.info(f"Note written to company {company_id}")

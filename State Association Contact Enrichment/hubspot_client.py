@@ -371,6 +371,15 @@ class HubSpotClient:
         logger.info(f"Created note (engagement {engagement_id}) on contact {contact_id}")
         return engagement_id
 
+    # ── Account info ──────────────────────────────────────────────────────────
+
+    def get_portal_id(self) -> int:
+        """Return this account's HubSpot portal ID (cached after first call)."""
+        if not hasattr(self, "_portal_id"):
+            data = self._get("/account-info/v3/details")
+            self._portal_id = int(data["portalId"])
+        return self._portal_id
+
     # ── Date helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
