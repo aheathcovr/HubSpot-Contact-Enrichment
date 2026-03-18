@@ -106,6 +106,7 @@ class ContactAction:
     found_linkedin: str = ""
     email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
     email_validation_quality: str = ""  # good | ok | bad | ""
+    fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -638,6 +639,7 @@ def _process_found_contact(
                 _base["found_email"] = new_email
                 _base["email_validation_status"] = ev.get("status", "")
                 _base["email_validation_quality"] = ev.get("quality", "")
+                _base["fe_email_found"] = True
                 new_note_lines.append(_email_added_line(new_email, new_fe_info, ev))
             else:
                 new_note_lines.append(
@@ -1040,12 +1042,19 @@ def _build_note(
         else:
             h += "<li>MillionVerifier API &mdash; <em>skipped (MILLIONVERIFIER_API_KEY not configured)</em></li>"
 
-    if any(a.found_linkedin for a in actions):
+    fe_people_search = any(a.found_linkedin for a in actions)
+    fe_bulk_enrich = any(a.fe_email_found for a in actions)
+    if fe_people_search or fe_bulk_enrich:
         fe_active = bool(os.getenv("FULLENRICH_API_KEY", "").strip())
         if fe_active:
-            h += "<li>FullEnrich People Search &mdash; contact discovery fallback (Sonar Pro returned nothing)</li>"
+            if fe_people_search and not fe_bulk_enrich:
+                h += "<li>FullEnrich People Search &mdash; contact discovery fallback (Sonar Pro returned nothing)</li>"
+            elif fe_bulk_enrich and not fe_people_search:
+                h += "<li>FullEnrich Bulk Enrich &mdash; email enrichment for found contact</li>"
+            else:
+                h += "<li>FullEnrich &mdash; contact discovery + email enrichment</li>"
         else:
-            h += "<li>FullEnrich People Search &mdash; <em>skipped (FULLENRICH_API_KEY not configured)</em></li>"
+            h += "<li>FullEnrich &mdash; <em>skipped (FULLENRICH_API_KEY not configured)</em></li>"
     h += "</ol><br>"
 
     # ── Per-contact results ───────────────────────────────────────────────────
