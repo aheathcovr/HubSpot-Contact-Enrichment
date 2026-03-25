@@ -70,7 +70,9 @@ from state_association.llm_client import (
     OPENROUTER_MODEL_TIER23,
     RATE_LIMIT_SECONDS,
     RESEARCH_SYSTEM_PROMPT,
+    W2_DISCOVERY_SYSTEM_PROMPT,
     _CONTACT_JSON_SCHEMA,
+    _CONTACT_LIST_JSON_SCHEMA,
     _MAX_WORKERS,
     _OPENROUTER_SEMAPHORE,
     call_openrouter,
@@ -1685,6 +1687,160 @@ def _research_one_facility(
         print(f"    ✗ {facility_name}: failed — {e}")
 
     return result
+
+
+# ─── Workflow 2 corporate-website discovery ───────────────────────────────────
+
+def _build_w2_discovery_prompt(
+    corporation_name: str,
+    corporate_domain: str,
+    facility_type: str,
+    titles: list,
+) -> str:
+    """
+    Build the Sonar Pro prompt for a proactive corporate-website sweep.
+
+    Unlike _build_corporate_contact_research_prompt (which verifies a specific
+    named person from DH), this prompt asks Sonar to DISCOVER up to 10 current
+    executives from the corporation's own website and LinkedIn, restricted to
+    the W2_CORPORATE_TITLES cohort.
+    """
+    type_desc = {
+        "SNF":  "skilled nursing facility (SNF) operator",
+        "ALF":  "assisted living facility (ALF) operator",
+        "BOTH": "skilled nursing and assisted living operator",
+    }.get((facility_type or "").upper(), "long-term care operator")
+
+    domain_display = corporate_domain or corporation_name
+    title_list = "\n".join(f"  - {t}" for t in titles)
+
+    return f"""Find up to 10 current corporate executives at {corporation_name}, \
+a {type_desc}.
+
+Only return contacts whose titles match one of these target roles — reject any other titles:
+{title_list}
+
+Search these sources in order, stopping when you have found up to 10 verified contacts:
+1. {domain_display} — check pages titled 'About Us', 'Leadership', 'Our Team', \
+'Management', 'Corporate Governance', or 'Investor Relations'.
+   Common URL patterns to try: /about-us, /about/leadership, /leadership-team, \
+/our-team, /management, /corporate-governance, /investor-relations/management.
+2. LinkedIn — search for people currently employed at "{corporation_name}" in the \
+target roles. Example: site:linkedin.com/in "{corporation_name}" "Chief Executive Officer".
+
+Return a JSON object with a "contacts" array (up to 10 items).
+If no verified contacts are found at all, return {{"contacts": []}}.
+Do NOT include anyone whose current title is outside the target role list above."""
+
+
+def search_corporation_website_for_executives(
+    corporation_name: str,
+    corporate_domain: str,
+    facility_type: str,
+    known_names: set,
+) -> list:
+    """
+    Call Sonar Reasoning Pro to discover corporate executives directly from the
+    corporation's own website and LinkedIn.
+
+    Runs for every Workflow 2 enrichment — additive to DH results.  Results are
+    filtered against DH_W2_TITLE_PATTERN so only the target cohort is returned,
+    and deduplicated against *known_names* (a set of lowercase names already
+    found by the DH query).
+
+    Returns a list of result dicts compatible with the W2 pipeline format.
+    *known_names* is mutated in-place: each accepted name is added so downstream
+    callers (FullEnrich supplement) can continue deduplication without re-reading
+    the returned list.
+    """
+    from config import W2_CORPORATE_TITLES, DH_W2_TITLE_PATTERN
+
+    if not corporate_domain:
+        print("  W2 Sonar discovery: no corporate domain on record — skipping")
+        return []
+
+    bare_domain = re.sub(r"^https?://", "", corporate_domain.strip())
+    bare_domain = re.sub(r"^www\.", "", bare_domain).split("/")[0].strip().lower()
+    if not bare_domain:
+        print("  W2 Sonar discovery: could not derive bare domain — skipping")
+        return []
+
+    title_re = re.compile(DH_W2_TITLE_PATTERN, re.IGNORECASE)
+
+    prompt = _build_w2_discovery_prompt(
+        corporation_name=corporation_name,
+        corporate_domain=bare_domain,
+        facility_type=facility_type,
+        titles=W2_CORPORATE_TITLES,
+    )
+    extra_params: dict = {
+        "reasoning_effort":    "high",
+        "search_domain_filter": [bare_domain, "linkedin.com"],
+    }
+    structured_format = {"type": "json_schema", "json_schema": _CONTACT_LIST_JSON_SCHEMA}
+
+    print(f"  W2 Sonar discovery: querying Sonar Reasoning Pro for executives at {bare_domain}...")
+    with _OPENROUTER_SEMAPHORE:
+        raw = call_openrouter(
+            W2_DISCOVERY_SYSTEM_PROMPT,
+            prompt,
+            model=OPENROUTER_MODEL_TIER23,
+            response_format=structured_format,
+            extra_params=extra_params,
+        )
+    time.sleep(RATE_LIMIT_SECONDS)
+
+    try:
+        data = json.loads(raw)
+        contacts = data.get("contacts", [])
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        print("  W2 Sonar discovery: failed to parse JSON response — skipping")
+        return []
+
+    results = []
+    for c in contacts[:10]:  # hard cap at 10
+        full_name = (c.get("full_name") or "").strip()
+        title     = (c.get("title") or "").strip()
+
+        if not full_name or not title:
+            continue
+
+        # Reject titles outside the target cohort
+        if not title_re.search(title):
+            print(f"  W2 Sonar discovery: dropping '{full_name}' — title '{title}' not in target list")
+            continue
+
+        # Deduplicate against names already found by DH (and previously accepted discoveries)
+        name_key = full_name.lower()
+        if name_key in known_names:
+            continue
+
+        confidence = c.get("confidence", "low")
+        results.append({
+            "workflow":             "2 - Unassociated Contact",
+            "contact_name":         full_name,
+            "title":                title,
+            "email":                c.get("email", ""),
+            "phone":                c.get("phone", ""),
+            "linkedin":             "",
+            "found_name":           full_name,
+            "found_title":          title,
+            "found_email":          c.get("email", ""),
+            "found_phone":          c.get("phone", ""),
+            "found_linkedin":       "",
+            "research_findings":    c.get("source_url", ""),
+            "research_confidence":  confidence,
+            "research_reasoning":   c.get("reasoning", ""),
+            "research_source_name": c.get("source_name", ""),
+            "source_path":          "sonar_pro_discovery",
+            "source_tier":          "",
+            "hubspot_contact_ids":  "",
+            "research_error":       "",
+        })
+        known_names.add(name_key)
+
+    print(f"  W2 Sonar discovery: {len(results)} new contact(s) accepted after title filter")
+    return results
 
 
 # ─── Workflow runners ─────────────────────────────────────────────────────────

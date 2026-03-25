@@ -45,6 +45,7 @@ from state_association_matcher import (
     find_facilities_missing_leadership,
     lookup_hubspot_contact_enhanced,
     parse_found_name,
+    search_corporation_website_for_executives,
     verify_contact_in_definitive,
     workflow_2_research_contacts,
     RATE_LIMIT_SECONDS,
@@ -1432,13 +1433,14 @@ def _build_note(
     )
 
     # ── Research Process (dynamic step outcomes) ──────────────────────────────
-    existing_contact_actions = [a for a in actions if a.source_path == "existing_contact"]
-    dh_fasttrack_actions     = [a for a in actions if a.source_path == "definitive_healthcare"]
-    sonar_pro_actions        = [a for a in actions if a.source_path == "sonar_pro"]
-    fe_ps_actions            = [a for a in actions if a.source_path == "fullenrich_people_search"]
-    fe_ps_ran_not_found      = any(a.fe_people_search_ran for a in actions)
-    fe_people_search         = bool(fe_ps_actions)   # used later for How to Verify
-    fe_bulk_enrich_actions   = [a for a in actions if a.fe_email_found]
+    existing_contact_actions  = [a for a in actions if a.source_path == "existing_contact"]
+    dh_fasttrack_actions      = [a for a in actions if a.source_path == "definitive_healthcare"]
+    sonar_pro_actions         = [a for a in actions if a.source_path == "sonar_pro"]
+    sonar_discovery_actions   = [a for a in actions if a.source_path == "sonar_pro_discovery"]
+    fe_ps_actions             = [a for a in actions if a.source_path == "fullenrich_people_search"]
+    fe_ps_ran_not_found       = any(a.fe_people_search_ran for a in actions)
+    fe_people_search          = bool(fe_ps_actions)   # used later for How to Verify
+    fe_bulk_enrich_actions    = [a for a in actions if a.fe_email_found]
 
     h += "<b>Research Process</b><br><ol>"
 
@@ -1466,7 +1468,7 @@ def _build_note(
                 for a in existing_contact_actions if a.dh_verification_detail
             )
             h += f"<li><b>Definitive Healthcare verification</b> &mdash; {parts}</li>"
-    elif dh_fasttrack_actions and not sonar_pro_actions and not fe_ps_actions and not fe_ps_ran_not_found:
+    elif dh_fasttrack_actions and not sonar_pro_actions and not sonar_discovery_actions and not fe_ps_actions and not fe_ps_ran_not_found:
         # Workflow 2 pure fast-track: all contacts C-suite from DH, no Sonar Pro needed
         names = ", ".join(
             f"{a.contact_name} ({a.contact_title})"
@@ -1477,7 +1479,8 @@ def _build_note(
             f"{len(dh_fasttrack_actions)} corporate executive(s) sourced directly from DH "
             f"(C-suite or fresh record — Sonar Pro bypassed): {names}</li>"
         )
-    elif dh_fasttrack_actions or sonar_pro_actions or fe_ps_actions or fe_ps_ran_not_found:
+        h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No additional executives found on corporate site or LinkedIn</li>"
+    elif dh_fasttrack_actions or sonar_pro_actions or sonar_discovery_actions or fe_ps_actions or fe_ps_ran_not_found:
         # Workflow 2 mixed path: some contacts fast-tracked, others needed Sonar Pro
         h += "<li><b>Definitive Healthcare data</b> &mdash; queried BigQuery corporate executives table</li>"
         if dh_fasttrack_actions:
@@ -1489,7 +1492,19 @@ def _build_note(
                 f"<li><b>C-suite fast-track</b> &mdash; ⚡ {len(dh_fasttrack_actions)} executive(s) "
                 f"sourced directly (DH authoritative, Sonar Pro bypassed): {ft_names}</li>"
             )
-        # Sonar Pro outcome for non-C-suite contacts
+        # Sonar Pro website discovery outcome
+        disc_found = [a for a in sonar_discovery_actions if a.action in ("created_new", "associated_existing")]
+        if disc_found:
+            disc_names = ", ".join(
+                f"{a.contact_name} ({a.contact_title})" for a in disc_found if a.contact_name
+            )
+            h += (
+                f"<li><b>Sonar Pro website discovery</b> &mdash; ✓ Found {len(disc_found)} executive(s) "
+                f"on corporate site / LinkedIn: {disc_names}</li>"
+            )
+        else:
+            h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No additional executives found on corporate site or LinkedIn</li>"
+        # Sonar Pro outcome for non-C-suite DH contacts (stale VP / Regional verification)
         sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
         sonar_missed = (
             any(a.source_path == "sonar_pro" and a.action == "no_contact_found" for a in actions)
@@ -1499,9 +1514,9 @@ def _build_note(
         if sonar_found:
             a = sonar_found[0]
             conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
-            h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+            h += f"<li><b>Sonar Pro DH verification</b> &mdash; ✓ Verified {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
         elif sonar_missed:
-            h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No contact identified for remaining executives</li>"
+            h += "<li><b>Sonar Pro DH verification</b> &mdash; ✗ Could not verify remaining DH executives on live sources</li>"
         if fe_ps_actions:
             fe_names = ", ".join(
                 f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
@@ -1510,8 +1525,9 @@ def _build_note(
         elif fe_ps_ran_not_found:
             h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
     elif "Workflow 2" in workflow_label:
-        # Workflow 2 zero-results: DH had no executives, FullEnrich found nothing
+        # Workflow 2 zero-results: DH, Sonar discovery, and FullEnrich all found nothing
         h += "<li><b>Definitive Healthcare data</b> &mdash; no corporate executives found in BigQuery</li>"
+        h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No executives found on corporate site or LinkedIn</li>"
         h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
     else:
         # Full research path
@@ -1856,14 +1872,34 @@ def run_enrichment(company_id: str) -> None:
             logger.info(msg)
             errors.append(msg)
 
-        # ── FullEnrich supplement: find corporate executives not in DH ────────
-        # Runs regardless of whether DH returned results, so FullEnrich fills
-        # gaps when DH has no record or definitive_id is missing.
-        dh_names = {
+        # ── Sonar Pro website discovery: sweep corporate site + LinkedIn ─────
+        # Runs for every W2 enrichment (additive to DH results).  The corporate
+        # domain is injected as search_domain_filter so Perplexity restricts its
+        # crawl to the operator's own pages and LinkedIn.  Results are filtered to
+        # W2_CORPORATE_TITLES and deduplicated against DH-found names.
+        known_names: set = {
             (r.get("contact_name") or "").lower().strip()
             for r in results
             if r.get("contact_name")
         }
+        logger.info(
+            f"W2 Sonar discovery: sweeping corporate website for executives at '{company_name}'"
+        )
+        sonar_disc_contacts = search_corporation_website_for_executives(
+            corporation_name=company_name,
+            corporate_domain=props.get("website", "") or "",
+            facility_type=props.get("facility_type", "") or "",
+            known_names=known_names,  # mutated in-place — FullEnrich deduplicates against it
+        )
+        if sonar_disc_contacts:
+            results.extend(sonar_disc_contacts)
+            logger.info(f"W2 Sonar discovery added {len(sonar_disc_contacts)} new contact(s)")
+        else:
+            logger.info("W2 Sonar discovery: no new contacts found")
+
+        # ── FullEnrich supplement: find corporate executives not in DH or Sonar ─
+        # known_names already includes both DH and Sonar discovery names, so
+        # FullEnrich only adds contacts missed by both prior steps.
         logger.info(
             f"W2 FullEnrich supplement: searching for corporate executives at '{company_name}'"
         )
@@ -1877,7 +1913,7 @@ def run_enrichment(company_id: str) -> None:
         )
         fe_added = 0
         for fe in fe_corp_contacts:
-            if (fe["full_name"] or "").lower().strip() not in dh_names:
+            if (fe["full_name"] or "").lower().strip() not in known_names:
                 results.append({
                     "workflow":            "2 - Unassociated Contact",
                     "contact_name":        fe["full_name"],
@@ -1897,7 +1933,7 @@ def run_enrichment(company_id: str) -> None:
                     "hubspot_contact_ids": "",
                     "research_error":      "",
                 })
-                dh_names.add((fe["full_name"] or "").lower().strip())
+                known_names.add((fe["full_name"] or "").lower().strip())
                 fe_added += 1
         if fe_added:
             logger.info(f"W2 FullEnrich supplement added {fe_added} new contact(s)")
