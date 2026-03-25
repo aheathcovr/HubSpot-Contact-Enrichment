@@ -1509,6 +1509,10 @@ def _build_note(
             h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
         elif fe_ps_ran_not_found:
             h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
+    elif "Workflow 2" in workflow_label:
+        # Workflow 2 zero-results: DH had no executives, FullEnrich found nothing
+        h += "<li><b>Definitive Healthcare data</b> &mdash; no corporate executives found in BigQuery</li>"
+        h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
     else:
         # Full research path
         h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
