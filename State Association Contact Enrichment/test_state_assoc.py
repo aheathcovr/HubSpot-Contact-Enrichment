@@ -107,8 +107,12 @@ def main():
         parse_found_name,
         lookup_hubspot_contact_enhanced,
         _format_hubspot_matches_enhanced,
+        OPENROUTER_MODEL,
+        OPENROUTER_MODEL_TIER23,
         RATE_LIMIT_SECONDS,
         RESEARCH_SYSTEM_PROMPT,
+        _CONTACT_JSON_SCHEMA,
+        _OPENROUTER_SEMAPHORE,
     )
     
     results = []
@@ -136,19 +140,38 @@ def main():
         hubspot_match_summary = ""
         
         try:
-            prompt, source_tier = _build_facility_research_prompt(
+            prompt, source_tier, domain_filter = _build_facility_research_prompt(
                 facility_name=facility_name,
                 city=city,
                 state=state,
                 facility_type=fac_type,
                 corporation_name=corp_name,
             )
-            print(f"  → Calling Perplexity Sonar Pro...")
-            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+            if source_tier == "1":
+                model = OPENROUTER_MODEL
+                extra = {"search_recency_filter": "year"}
+                if domain_filter:
+                    extra["search_domain_filter"] = domain_filter
+            elif source_tier == "2":
+                model = OPENROUTER_MODEL_TIER23
+                extra = {"reasoning_effort": "medium", "search_recency_filter": "year"}
+            else:
+                model = OPENROUTER_MODEL_TIER23
+                extra = {"reasoning_effort": "high", "search_recency_filter": "year"}
+            structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
+            print(f"  → Calling Sonar (tier {source_tier})...")
+            with _OPENROUTER_SEMAPHORE:
+                research_result = call_openrouter(
+                    RESEARCH_SYSTEM_PROMPT, prompt,
+                    model=model,
+                    response_format=structured_format,
+                    extra_params=extra,
+                )
+            time.sleep(RATE_LIMIT_SECONDS)
             print(f"  ✓ Response received ({len(research_result)} chars)")
-            
-            # Parse the found name (now includes email and phone)
-            found_name, found_title, confidence, found_email, found_phone = parse_found_name(research_result)
+
+            # Parse the found name
+            found_name, found_title, confidence, found_email, found_phone, reasoning, source_name = parse_found_name(research_result)
             
             if found_name and confidence != "not_found":
                 print(f"  🔎 Found: {found_name} ({found_title}, confidence={confidence})")

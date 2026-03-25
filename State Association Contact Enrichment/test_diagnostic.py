@@ -34,7 +34,12 @@ from state_association_matcher import (
     parse_found_name,
     lookup_hubspot_contact_enhanced,
     _format_hubspot_matches_enhanced,
+    OPENROUTER_MODEL,
+    OPENROUTER_MODEL_TIER23,
     RESEARCH_SYSTEM_PROMPT,
+    _CONTACT_JSON_SCHEMA,
+    _OPENROUTER_SEMAPHORE,
+    RATE_LIMIT_SECONDS,
     BQ_PROJECT_ID,
     BQ_LOCATION,
     DH_TABLES,
@@ -313,15 +318,27 @@ def run_diagnostic():
 
         # ── 5. OpenRouter web research ─────────────────────────────────────
         print(f"\n  ⑤ OpenRouter (Sonar Pro) web research:")
-        prompt, source_tier = _build_facility_research_prompt(
+        prompt, source_tier, domain_filter = _build_facility_research_prompt(
             facility_name=fname,
             city=city,
             state=state,
             facility_type=ftype,
             corporation_name=corp_name,
         )
+        if source_tier == "1":
+            _model = OPENROUTER_MODEL
+            _extra = {"search_recency_filter": "year"}
+            if domain_filter:
+                _extra["search_domain_filter"] = domain_filter
+        elif source_tier == "2":
+            _model = OPENROUTER_MODEL_TIER23
+            _extra = {"reasoning_effort": "medium", "search_recency_filter": "year"}
+        else:
+            _model = OPENROUTER_MODEL_TIER23
+            _extra = {"reasoning_effort": "high", "search_recency_filter": "year"}
+        _structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
         print(f"     Source tier: {source_tier}")
-        print(f"     Calling Sonar Pro...")
+        print(f"     Calling Sonar (tier {source_tier})...")
 
         research_result = ""
         found_name = found_title = found_email = found_phone = ""
@@ -329,11 +346,18 @@ def run_diagnostic():
         parse_error = ""
 
         try:
-            research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+            with _OPENROUTER_SEMAPHORE:
+                research_result = call_openrouter(
+                    RESEARCH_SYSTEM_PROMPT, prompt,
+                    model=_model,
+                    response_format=_structured_format,
+                    extra_params=_extra,
+                )
+            import time as _time; _time.sleep(RATE_LIMIT_SECONDS)
             cached_flag = " (cached)" if len(research_result) > 0 else ""
             print(f"     ✓ Response received ({len(research_result)} chars{cached_flag})")
 
-            found_name, found_title, confidence, found_email, found_phone = parse_found_name(
+            found_name, found_title, confidence, found_email, found_phone, _reasoning, _src_name = parse_found_name(
                 research_result
             )
 

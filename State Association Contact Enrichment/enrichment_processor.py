@@ -48,8 +48,12 @@ from state_association_matcher import (
     search_corporation_website_for_executives,
     verify_contact_in_definitive,
     workflow_2_research_contacts,
+    OPENROUTER_MODEL,
+    OPENROUTER_MODEL_TIER23,
     RATE_LIMIT_SECONDS,
     RESEARCH_SYSTEM_PROMPT,
+    _CONTACT_JSON_SCHEMA,
+    _OPENROUTER_SEMAPHORE,
 )
 from utils.bigquery_client import init_bigquery_client
 
@@ -1272,7 +1276,7 @@ def _run_workflow1_single_facility(
     }
 
     try:
-        prompt, source_tier = _build_facility_research_prompt(
+        prompt, source_tier, domain_filter = _build_facility_research_prompt(
             facility_name=facility_name,
             city=city,
             state=state,
@@ -1283,8 +1287,31 @@ def _run_workflow1_single_facility(
         )
         result["source_tier"] = source_tier
 
-        logger.info(f"  Calling OpenRouter for {facility_name}...")
-        research_result = call_openrouter(RESEARCH_SYSTEM_PROMPT, prompt)
+        # Mirror the tiered model / params logic used in _research_one_facility
+        if source_tier == "1":
+            model = OPENROUTER_MODEL
+            extra: dict = {"search_recency_filter": "year"}
+            if domain_filter:
+                extra["search_domain_filter"] = domain_filter
+        elif source_tier == "2":
+            model = OPENROUTER_MODEL_TIER23
+            extra = {"reasoning_effort": "medium", "search_recency_filter": "year"}
+        else:
+            model = OPENROUTER_MODEL_TIER23
+            extra = {"reasoning_effort": "high", "search_recency_filter": "year"}
+
+        structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
+
+        logger.info(f"  Calling OpenRouter for {facility_name} (tier {source_tier})...")
+        with _OPENROUTER_SEMAPHORE:
+            research_result = call_openrouter(
+                RESEARCH_SYSTEM_PROMPT,
+                prompt,
+                model=model,
+                response_format=structured_format,
+                extra_params=extra,
+            )
+        time.sleep(RATE_LIMIT_SECONDS)
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 

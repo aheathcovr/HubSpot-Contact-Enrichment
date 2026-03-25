@@ -936,14 +936,16 @@ def _build_facility_research_prompt(
     corporation_name: str,
     address: str = "",
     website: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, list]:
     """
     Build the OpenRouter prompt for researching a facility missing leadership.
 
-    Returns (prompt_text, source_tier) where source_tier is "1", "2", or "3":
-      "1" = specific association URL(s) injected from the guide
-      "2" = login-required association noted; fallbacks used
-      "3" = no public association contacts; fallbacks only
+    Returns (prompt_text, source_tier, domain_filter) where:
+      source_tier "1" = specific association URL(s) injected from the guide
+      source_tier "2" = login-required association noted; fallbacks used
+      source_tier "3" = no public association contacts; fallbacks only
+      domain_filter    = list of bare domains for search_domain_filter (Tier 1 only;
+                         empty list for Tier 2/3 where open web search is needed)
     """
     type_desc = {
         "SNF":  "skilled nursing facility",
@@ -992,7 +994,28 @@ Return a JSON object with these fields:
 - source_url:  exact URL where the name was found, or empty string
 - source_name: plain-English name of that source (e.g. "Colorado HCAP facility search", "CMS Care Compare listing")"""
 
-    return prompt, tier
+    # Build domain filter for Tier 1 calls so Perplexity restricts its crawl to
+    # the authoritative association site(s) + CMS Care Compare.  Tier 2/3 need
+    # open web search because there is no publicly accessible directory URL.
+    if tier == "1":
+        tier_1_sources = [
+            s for s in matching_sources
+            if not s.get("login_required", False) and s.get("contacts_available")
+        ]
+        domain_filter: list = []
+        for s in tier_1_sources:
+            url = s.get("directory_url") or ""
+            if url:
+                bare = re.sub(r"^https?://", "", url.strip())
+                bare = re.sub(r"^www\.", "", bare).split("/")[0].strip().lower()
+                if bare and bare not in domain_filter:
+                    domain_filter.append(bare)
+        if "medicare.gov" not in domain_filter:
+            domain_filter.append("medicare.gov")
+    else:
+        domain_filter = []
+
+    return prompt, tier, domain_filter
 
 
 # ─── BigQuery data-loading helpers ───────────────────────────────────────────
@@ -1496,8 +1519,9 @@ def _research_one_contact(
             if linkedin:
                 domain_filter.append("linkedin.com")
             extra_params: dict = {
-                "reasoning_effort":   "high",
+                "reasoning_effort":     "high",
                 "search_domain_filter": domain_filter,
+                "search_recency_filter": "year",
             }
             prompt_label = f"domain-targeted ({bare_domain})" + (" + LinkedIn profile" if linkedin else "")
         else:
@@ -1508,7 +1532,7 @@ def _research_one_contact(
                 state=state,
                 facility_type=facility_type,
             )
-            extra_params = {"reasoning_effort": "high"}
+            extra_params = {"reasoning_effort": "high", "search_recency_filter": "year"}
             prompt_label = "state-association fallback (no domain)"
 
         # Workflow 2 contacts are unassociated (no direct facility URL), so they
@@ -1608,7 +1632,7 @@ def _research_one_facility(
     }
 
     try:
-        prompt, source_tier = _build_facility_research_prompt(
+        prompt, source_tier, domain_filter = _build_facility_research_prompt(
             facility_name=facility_name,
             city=city,
             state=state,
@@ -1617,17 +1641,27 @@ def _research_one_facility(
         )
         result["source_tier"] = source_tier
 
-        # ── Tiered model selection (Rec #2) ────────────────────────────────────────────
-        # Tier 1 → sonar-pro (direct association URL, cheaper, fast)
-        # Tier 2/3 → sonar-reasoning-pro + reasoning_effort=high (no direct URL;
-        #             deeper multi-step reasoning needed to locate the contact)
+        # ── Tiered model selection ─────────────────────────────────────────────
+        # Tier 1 → sonar-pro + search_domain_filter pinned to the association
+        #           site(s) and CMS Care Compare.  Direct URL available; cheaper
+        #           model sufficient.
+        # Tier 2 → sonar-reasoning-pro + reasoning_effort=medium (login-required
+        #           association; fallback sources needed, moderate complexity)
+        # Tier 3 → sonar-reasoning-pro + reasoning_effort=high (no directory at
+        #           all; needs deep open web search to locate the contact)
         if source_tier == "1":
-            model       = OPENROUTER_MODEL
-            extra       = None
+            model = OPENROUTER_MODEL
+            extra: dict = {"search_recency_filter": "year"}
+            if domain_filter:
+                extra["search_domain_filter"] = domain_filter
             model_label = "Sonar Pro"
+        elif source_tier == "2":
+            model       = OPENROUTER_MODEL_TIER23
+            extra       = {"reasoning_effort": "medium", "search_recency_filter": "year"}
+            model_label = "Sonar Reasoning Pro (medium effort)"
         else:
             model       = OPENROUTER_MODEL_TIER23
-            extra       = {"reasoning_effort": "high"}
+            extra       = {"reasoning_effort": "high", "search_recency_filter": "year"}
             model_label = "Sonar Reasoning Pro (high effort)"
 
         # ── Structured JSON output (Rec #1) ──────────────────────────────────────────
@@ -1774,27 +1808,27 @@ def search_corporation_website_for_executives(
         titles=W2_CORPORATE_TITLES,
     )
     extra_params: dict = {
-        "reasoning_effort":    "high",
+        "reasoning_effort":     "high",
         "search_domain_filter": [bare_domain, "linkedin.com"],
+        "search_recency_filter": "year",
     }
     structured_format = {"type": "json_schema", "json_schema": _CONTACT_LIST_JSON_SCHEMA}
 
     print(f"  W2 Sonar discovery: querying Sonar Reasoning Pro for executives at {bare_domain}...")
-    with _OPENROUTER_SEMAPHORE:
-        raw = call_openrouter(
-            W2_DISCOVERY_SYSTEM_PROMPT,
-            prompt,
-            model=OPENROUTER_MODEL_TIER23,
-            response_format=structured_format,
-            extra_params=extra_params,
-        )
-    time.sleep(RATE_LIMIT_SECONDS)
-
     try:
+        with _OPENROUTER_SEMAPHORE:
+            raw = call_openrouter(
+                W2_DISCOVERY_SYSTEM_PROMPT,
+                prompt,
+                model=OPENROUTER_MODEL_TIER23,
+                response_format=structured_format,
+                extra_params=extra_params,
+            )
+        time.sleep(RATE_LIMIT_SECONDS)
         data = json.loads(raw)
         contacts = data.get("contacts", [])
-    except (json.JSONDecodeError, AttributeError, TypeError):
-        print("  W2 Sonar discovery: failed to parse JSON response — skipping")
+    except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+        print(f"  W2 Sonar discovery: API/parse error ({exc}) — skipping")
         return []
 
     results = []

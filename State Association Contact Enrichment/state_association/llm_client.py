@@ -194,6 +194,7 @@ def call_openrouter(
     model: str = OPENROUTER_MODEL,
     response_format: Optional[dict] = None,
     extra_params: Optional[dict] = None,
+    timeout: int = 240,
 ) -> str:
     """
     Call the OpenRouter chat-completions endpoint and return the response text.
@@ -250,7 +251,7 @@ def call_openrouter(
         response = _OPENROUTER_SESSION.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
             json=payload,
-            timeout=120,
+            timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
