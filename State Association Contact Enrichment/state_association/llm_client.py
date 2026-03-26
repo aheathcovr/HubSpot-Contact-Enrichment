@@ -40,6 +40,46 @@ _OPENROUTER_SEMAPHORE = threading.Semaphore(_MAX_WORKERS)
 # Structured JSON schema enforced on every OpenRouter response.
 # Using response_format eliminates the need for regex-based JSON extraction
 # and guarantees a parseable result on every call.
+# Schema for multi-contact discovery calls (Workflow 2 website sweep).
+# Returns an object with a "contacts" array so a single Sonar call can surface
+# up to 10 corporate executives rather than requiring one call per title.
+_CONTACT_LIST_JSON_SCHEMA: dict = {
+    "name": "contact_list_result",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "contacts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "full_name":   {"type": "string"},
+                        "title":       {"type": "string"},
+                        "email":       {"type": "string"},
+                        "phone":       {"type": "string"},
+                        "source_url":  {"type": "string"},
+                        "source_name": {"type": "string"},
+                        "confidence":  {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                        },
+                        "reasoning":   {"type": "string"},
+                    },
+                    "required": [
+                        "full_name", "title", "email", "phone",
+                        "source_url", "source_name", "confidence", "reasoning",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["contacts"],
+        "additionalProperties": False,
+    },
+}
+
+# System prompt for the per-contact single-object schema.
 _CONTACT_JSON_SCHEMA: dict = {
     "name": "contact_result",
     "strict": True,
@@ -91,6 +131,39 @@ In the "reasoning" field, write 2–5 sentences explaining: which specific sourc
 Your response MUST be a single valid JSON object matching the required schema — no extra text.\
 """
 
+# System prompt for Workflow 2 corporate-website discovery calls.
+# Used with _CONTACT_LIST_JSON_SCHEMA — returns an array of up to 10 executives.
+W2_DISCOVERY_SYSTEM_PROMPT: str = """\
+You are a healthcare industry research specialist finding current corporate executive \
+contacts for long-term care and senior housing operators.
+
+Your task is to find up to 10 currently-employed corporate executives at the named company, \
+restricted strictly to these seniority levels: C-suite officers (CEO, COO, CFO, CNO, CCO, CAO), \
+President, Owner, Vice President (any variant), Senior Vice President (any variant), \
+Regional Vice President, Regional Director of Operations.
+
+Search methodology — follow this order:
+1. Check the company's own website — look specifically for pages titled 'About Us', \
+'Leadership', 'Our Team', 'Management', 'Corporate Governance', or 'Investor Relations'. \
+Common URL patterns: /about-us, /about/leadership, /leadership-team, /our-team, \
+/management, /corporate-governance, /investor-relations/management.
+2. Search LinkedIn for people with a current position at this company in the target roles. \
+Use searches like: "{company name}" "CEO" site:linkedin.com/in
+
+Accuracy rules (strictly enforced):
+- Return ONLY people with a verified CURRENT role at this company — not former employees
+- confidence="high"   → name found on the official corporate website
+- confidence="medium" → name found on LinkedIn showing a current role at this company
+- confidence="low"    → name found in a press release, news article, or indirect source
+- Never fabricate names, titles, emails, or phone numbers
+- Return an empty contacts array if no verified executives are found
+
+In the "source_name" field write the human-readable name of the page or profile \
+(e.g. "Acme Health leadership page", "LinkedIn profile — Acme Health"). Do not write a URL here.
+In the "reasoning" field write 1–3 sentences: which source confirmed the name and title, \
+the recency of that source, and why you believe this is the current person in the role.
+Your response MUST be a single valid JSON object with a "contacts" array — no extra text.\
+"""
 
 # ── HTTP session ───────────────────────────────────────────────────────────────
 
@@ -121,6 +194,7 @@ def call_openrouter(
     model: str = OPENROUTER_MODEL,
     response_format: Optional[dict] = None,
     extra_params: Optional[dict] = None,
+    timeout: int = 240,
 ) -> str:
     """
     Call the OpenRouter chat-completions endpoint and return the response text.
@@ -177,7 +251,7 @@ def call_openrouter(
         response = _OPENROUTER_SESSION.post(
             f"{OPENROUTER_BASE_URL}/chat/completions",
             json=payload,
-            timeout=120,
+            timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
