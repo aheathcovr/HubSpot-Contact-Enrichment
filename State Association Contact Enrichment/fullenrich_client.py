@@ -108,7 +108,13 @@ def _location_score(person: dict, target_city: str, target_state: str) -> int:
     Returns:
         2 — city AND state match
         1 — state match only
-        0 — no location data or no match
+        0 — no location data available (can't verify either way)
+       -1 — CONFIRMED state mismatch (person has location data showing different state)
+
+    The -1 distinction is critical: it prevents a person confirmed to be in a
+    different state (e.g. an Administrator in Texas when we're looking for
+    Tennessee) from being accepted simply because they scored the same as
+    "no data".  A confirmed wrong-state match is always worse than "unknown".
 
     Used to rank candidates when multiple same-named facilities exist in different states.
     """
@@ -131,6 +137,12 @@ def _location_score(person: dict, target_city: str, target_state: str) -> int:
         return 2
     if state_match:
         return 1
+    # Person has location data but the state doesn't match — this is a confirmed
+    # wrong-state match, not merely "no data".  Return -1 so it ranks below
+    # candidates with no location info (score 0) and is always rejected when
+    # min_score >= 0.
+    if region and target_state:
+        return -1
     return 0
 
 
@@ -283,7 +295,7 @@ def _best_candidate(
     """
     From a list of FullEnrich person dicts, return the best location-matched contact.
 
-    Scoring: 2 = city+state match, 1 = state match, 0 = no data.
+    Scoring: 2 = city+state match, 1 = state match, 0 = no data, -1 = confirmed state mismatch.
     Falls back to the first result when no location data is available (unless
     min_score > 0, in which case score-0 candidates are rejected entirely).
     Logs the score so operators can judge match quality.
@@ -291,7 +303,7 @@ def _best_candidate(
     Skips candidates whose actual title is a tech/IT role (e.g. "Database Administrator")
     so that searches for healthcare "Administrator" don't return IT staff.
 
-    min_score=1 should be passed whenever city and state are known, to avoid
+    min_score=1 should be passed whenever a target state is known, to avoid
     returning a contact from a different state (e.g. a shared corporate domain
     like brookdale.com matching Brookdale employees in the wrong state).
     """
@@ -324,7 +336,7 @@ def _best_candidate(
     if not contact["full_name"]:
         return None
 
-    score_label = {2: "city+state", 1: "state-only", 0: "no-location-data"}[best_score]
+    score_label = {2: "city+state", 1: "state-only", 0: "no-location-data", -1: "state-MISMATCH"}[best_score]
 
     if best_score < min_score:
         logger.warning(
@@ -363,9 +375,14 @@ def search_facility_contacts(
     the company identifier via `current_company_domains` (exact match) — immune to
     name collision. Falls back to *company_name* if domain search returns nothing.
 
-    When searching by company name, fetches up to 5 candidates per title and picks
-    the one whose person location best matches *city* / *state*, reducing the risk of
-    returning a contact from a same-named facility in a different state.
+    When searching by domain or company name, fetches up to 10 candidates per title
+    and picks the one whose person location best matches *city* / *state*, reducing
+    the risk of returning a contact from a same-named facility in a different state.
+
+    When a domain search returns people but none match the target location
+    (all rejected by location scoring), the function automatically retries the
+    search by company name, which may surface different candidates or include
+    location metadata the domain search omitted.
 
     **corporate_mode=True** enables two behaviours optimised for corporate/network
     searches (Workflow 2):
@@ -382,7 +399,8 @@ def search_facility_contacts(
        incorrectly reject them.
 
     Makes one primary API call per title (plus one fallback call when domain returns
-    empty). Deduplicates results by full name across all titles.
+    empty, or when domain results are all rejected by location scoring).
+    Deduplicates results by full name across all titles.
 
     Returns a list of dicts: [{full_name, title, linkedin_url}, ...]
     Returns [] if the API key is not set, no results are found, or any error occurs.
@@ -425,31 +443,62 @@ def search_facility_contacts(
 
         # Domain search: fetch multiple candidates so location scoring can pick
         # the right facility — a single result gives nothing to compare against.
+        # Limit for domain-based searches — shared domains like brookdale.com
+        # may return Administrators/EDs from dozens of facilities across the
+        # country.  Fetch more candidates so location scoring has a better
+        # chance of finding the right person at the target facility.
+        _DOMAIN_LIMIT = 10
+        _NAME_LIMIT = 10
+
         if bare_domain:
             raw_people = _search_one_title(
                 api_key=api_key, title=title_filter, domain=bare_domain,
-                limit=5, seniority_levels=seniority,
+                limit=_DOMAIN_LIMIT, seniority_levels=seniority,
             )
-            # Fall back to name search if domain not indexed in FullEnrich
-            if not raw_people and company_name:
+            # Fall back to name search in two cases:
+            #   1. Domain not indexed in FullEnrich (empty results)
+            #   2. Domain returned results but ALL were rejected by location
+            #      scoring (wrong state) — a company-name search may surface
+            #      different candidates or include location metadata the domain
+            #      search omitted.
+            contact = _best_candidate(
+                raw_people, city, state, identifier, title_filter, min_score=min_score,
+            )
+            if not contact and raw_people and company_name:
+                logger.info(
+                    "FullEnrich domain search for %r/%r returned %d result(s) but "
+                    "none matched target location (%s, %s) — retrying by company name",
+                    bare_domain, title_filter, len(raw_people), city, state,
+                )
+                raw_people = _search_one_title(
+                    api_key=api_key, title=title_filter,
+                    company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
+                )
+                contact = _best_candidate(
+                    raw_people, city, state, identifier, title_filter, min_score=min_score,
+                )
+            elif not raw_people and company_name:
                 logger.debug(
                     "FullEnrich domain search empty for %r/%r — retrying by company name",
                     bare_domain, title_filter,
                 )
                 raw_people = _search_one_title(
                     api_key=api_key, title=title_filter,
-                    company_name=company_name, limit=5, seniority_levels=seniority,
+                    company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
+                )
+                contact = _best_candidate(
+                    raw_people, city, state, identifier, title_filter, min_score=min_score,
                 )
         else:
-            # Name-only search: fetch more candidates so we can pick by location
+            # Name-only search
             raw_people = _search_one_title(
                 api_key=api_key, title=title_filter,
-                company_name=company_name, limit=5, seniority_levels=seniority,
+                company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
+            )
+            contact = _best_candidate(
+                raw_people, city, state, identifier, title_filter, min_score=min_score,
             )
 
-        contact = _best_candidate(
-            raw_people, city, state, identifier, title_filter, min_score=min_score,
-        )
         if contact and contact["full_name"] not in seen_names:
             seen_names.add(contact["full_name"])
             contacts.append(contact)
