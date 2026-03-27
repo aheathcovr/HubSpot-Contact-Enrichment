@@ -1557,38 +1557,68 @@ def _build_note(
         h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No executives found on corporate site or LinkedIn</li>"
         h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
     else:
-        # Full research path
-        h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
-        if tier_str:
-            tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
-            h += f"<li><b>State association directory</b> &mdash; {tier_label}</li>"
-        else:
-            h += "<li><b>State association directory</b> &mdash; no state directory available; web search used</li>"
+        # Workflow-aware fallback when no specific research actions were captured.
+        if "Workflow 2" in workflow_label:
+            # Corporation / Workflow 2: BHQ corporate executives table + Sonar Pro
+            h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
 
-        # Sonar Pro outcome
-        sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
-        sonar_missed = (
-            any(a.source_path == "sonar_pro" and a.action == "no_contact_found" for a in actions)
-            or fe_ps_actions          # FE PS only runs after Sonar Pro finds nothing
-            or fe_ps_ran_not_found
-        )
-        if sonar_found:
-            a = sonar_found[0]
-            conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
-            h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
-        elif sonar_missed:
-            h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No contact identified</li>"
-        else:
-            h += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
-
-        # FullEnrich People Search outcome
-        if fe_ps_actions:
-            fe_names = ", ".join(
-                f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
+            # Sonar Pro outcome
+            sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
+            sonar_missed = (
+                any(a.source_path == "sonar_pro" and a.action == "no_contact_found" for a in actions)
+                or fe_ps_actions
+                or fe_ps_ran_not_found
             )
-            h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
-        elif fe_ps_ran_not_found:
-            h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
+            if sonar_found:
+                a = sonar_found[0]
+                conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
+                h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+            elif sonar_missed:
+                h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No corporate contacts identified via web search</li>"
+            else:
+                h += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
+
+            # FullEnrich People Search — always runs for W2
+            if fe_ps_actions:
+                fe_names = ", ".join(
+                    f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
+                )
+                h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
+            else:
+                h += "<li><b>FullEnrich People Search</b> &mdash; no additional corporate contacts found</li>"
+        else:
+            # Facility / Workflow 1: state association directories + Sonar Pro
+            h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
+            if tier_str:
+                tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
+                h += f"<li><b>State association directory</b> &mdash; {tier_label}</li>"
+            else:
+                h += "<li><b>State association directory</b> &mdash; no state directory available; web search used</li>"
+
+            # Sonar Pro outcome
+            sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
+            sonar_missed = (
+                any(a.source_path == "sonar_pro" and a.action == "no_contact_found" for a in actions)
+                or fe_ps_actions
+                or fe_ps_ran_not_found
+            )
+            if sonar_found:
+                a = sonar_found[0]
+                conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
+                h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+            elif sonar_missed:
+                h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No contact identified</li>"
+            else:
+                h += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
+
+            # FullEnrich People Search outcome
+            if fe_ps_actions:
+                fe_names = ", ".join(
+                    f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
+                )
+                h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
+            elif fe_ps_ran_not_found:
+                h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
 
     # MillionVerifier outcome (runs when any email is present)
     emails_checked = [a for a in actions if a.email_validation_status and a.action != "error"]
@@ -1957,6 +1987,8 @@ def run_enrichment(company_id: str) -> None:
                     "research_findings":   fe.get("linkedin_url", ""),
                     "research_confidence": "low",
                     "source_tier":         "",
+                    "source_path":         "fullenrich_people_search",
+                    "fe_updated_at":       fe.get("updated_at", "") or fe.get("current_start", ""),
                     "hubspot_contact_ids": "",
                     "research_error":      "",
                 })
