@@ -31,11 +31,27 @@ OPENROUTER_BASE_URL  = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL         = os.getenv("OPENROUTER_MODEL",        "perplexity/sonar-pro")
 OPENROUTER_MODEL_TIER23  = os.getenv("OPENROUTER_MODEL_TIER23", "perplexity/sonar-reasoning-pro")
 
-RATE_LIMIT_SECONDS: float = 2.5  # Pause between calls to avoid rate-limiting
+# Per-workflow rate limits.  Sonar-pro (W1) is fast; reasoning-pro (W2) is
+# self-rate-limited by its own latency so a shorter pause is sufficient.
+W1_RATE_LIMIT_SECONDS: float = 1.5
+W2_RATE_LIMIT_SECONDS: float = 3.0
+RATE_LIMIT_SECONDS: float = W1_RATE_LIMIT_SECONDS  # legacy alias
 
-# Maximum concurrent OpenRouter calls; semaphore keeps live calls predictable.
-_MAX_WORKERS: int = 3
-_OPENROUTER_SEMAPHORE = threading.Semaphore(_MAX_WORKERS)
+# Timeout for reasoning-pro calls (W2).  High-effort reasoning can take 45–90 s;
+# the default 240 s is kept for sonar-pro but reasoning calls get extra headroom.
+W2_TIMEOUT: int = 360
+
+# Separate concurrency pools per workflow.
+# W1 uses sonar-pro (fast, cheap) → more parallelism.
+# W2 uses sonar-reasoning-pro (slow, expensive) → fewer concurrent calls.
+_W1_MAX_WORKERS: int = 4
+_W2_MAX_WORKERS: int = 2
+_W1_SEMAPHORE = threading.Semaphore(_W1_MAX_WORKERS)
+_W2_SEMAPHORE = threading.Semaphore(_W2_MAX_WORKERS)
+
+# Legacy alias kept so any external callers don't break immediately.
+_MAX_WORKERS: int = _W1_MAX_WORKERS
+_OPENROUTER_SEMAPHORE = _W1_SEMAPHORE
 
 # Structured JSON schema enforced on every OpenRouter response.
 # Using response_format eliminates the need for regex-based JSON extraction
@@ -163,6 +179,44 @@ In the "source_name" field write the human-readable name of the page or profile 
 In the "reasoning" field write 1–3 sentences: which source confirmed the name and title, \
 the recency of that source, and why you believe this is the current person in the role.
 Your response MUST be a single valid JSON object with a "contacts" array — no extra text.\
+"""
+
+# System prompt for Workflow 2 single-contact verification calls.
+# Used in _research_one_contact() when a stale DH VP/Regional Director record
+# needs live-web confirmation.  Distinct from RESEARCH_SYSTEM_PROMPT (which
+# instructs the model to find facility administrators) and from
+# W2_DISCOVERY_SYSTEM_PROMPT (which asks for a bulk list of up to 10 executives).
+W2_VERIFY_SYSTEM_PROMPT: str = """\
+You are a healthcare industry research specialist verifying whether a specific executive \
+is currently employed at a named long-term care or senior housing corporation.
+
+You are given a name and title from Definitive Healthcare (which may be outdated). \
+Your task is to confirm whether that person still holds that role, using the most \
+current publicly available sources.
+
+Search methodology — follow the steps provided in the user prompt, which may include:
+1. The person's LinkedIn profile (if provided) — the most direct verification path; \
+check that their current employer matches the named corporation.
+2. The corporation's official website — look for pages titled 'About Us', 'Leadership', \
+'Our Team', 'Management', or 'Investor Relations / Corporate Governance'.
+3. LinkedIn search for people currently employed at the corporation in the target role.
+
+Accuracy rules (strictly enforced):
+- Only confirm a person if you find them listed as CURRENTLY employed in a matching role
+- confidence="high"      → confirmed on the official corporate website or an \
+investor-relations / governance page
+- confidence="medium"    → confirmed on LinkedIn showing a current role at the company, \
+or in a press release or news article dated within the last 12 months
+- confidence="low"       → found on LinkedIn but tenure or current status is unclear, \
+or source may be outdated
+- confidence="not_found" → cannot confirm the person is currently in this role — do not guess
+
+Always cite the exact URL where you found the person.
+In the "source_name" field write the human-readable name of the page or profile \
+(e.g. "Acme Health leadership page", "LinkedIn profile — Acme Health"). Do not write a URL here.
+In the "reasoning" field write 1–3 sentences: which source confirmed the name and title, \
+the recency of that source, and why you believe this is the current person in the role.
+Your response MUST be a single valid JSON object matching the required schema — no extra text.\
 """
 
 # ── HTTP session ───────────────────────────────────────────────────────────────

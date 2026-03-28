@@ -68,13 +68,18 @@ from state_association.llm_client import (
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
     OPENROUTER_MODEL_TIER23,
-    RATE_LIMIT_SECONDS,
+    W1_RATE_LIMIT_SECONDS,
+    W2_RATE_LIMIT_SECONDS,
+    W2_TIMEOUT,
     RESEARCH_SYSTEM_PROMPT,
     W2_DISCOVERY_SYSTEM_PROMPT,
+    W2_VERIFY_SYSTEM_PROMPT,
     _CONTACT_JSON_SCHEMA,
     _CONTACT_LIST_JSON_SCHEMA,
-    _MAX_WORKERS,
-    _OPENROUTER_SEMAPHORE,
+    _W1_MAX_WORKERS,
+    _W1_SEMAPHORE,
+    _W2_MAX_WORKERS,
+    _W2_SEMAPHORE,
     call_openrouter,
     normalize_phone,
     parse_found_name,
@@ -121,12 +126,16 @@ DH_TABLES = {
     "full_feed":    f"{BQ_PROJECT_ID}.definitive_healthcare.December SNF AND ALF Contact Full Feed",
 }
 
+STATE_ASSOC_TABLE = f"{BQ_PROJECT_ID}.state_associations.state_association_snf_al_il_information"
+
 # DH_W2_TITLE_PATTERN, TARGET_TITLES, _DH_CSUITE_KEYWORDS, _DH_FRESHNESS_MONTHS
 # imported from config.py
 
 # OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL, OPENROUTER_MODEL_TIER23,
-# RATE_LIMIT_SECONDS, RESEARCH_SYSTEM_PROMPT, _CONTACT_JSON_SCHEMA,
-# _MAX_WORKERS, _OPENROUTER_SEMAPHORE, call_openrouter, parse_found_name, normalize_phone
+# W1_RATE_LIMIT_SECONDS, W2_RATE_LIMIT_SECONDS, W2_TIMEOUT,
+# RESEARCH_SYSTEM_PROMPT, W2_DISCOVERY_SYSTEM_PROMPT, W2_VERIFY_SYSTEM_PROMPT,
+# _CONTACT_JSON_SCHEMA, _CONTACT_LIST_JSON_SCHEMA,
+# _W1_SEMAPHORE, _W2_SEMAPHORE, call_openrouter, parse_found_name, normalize_phone
 # imported from state_association.llm_client
 
 
@@ -1012,6 +1021,14 @@ Return a JSON object with these fields:
                     domain_filter.append(bare)
         if "medicare.gov" not in domain_filter:
             domain_filter.append("medicare.gov")
+        # If we know the facility's own website, add it so Perplexity can check
+        # the facility's staff/leadership page without that domain being blocked
+        # by the association-only filter.
+        if website:
+            bare_site = re.sub(r"^https?://", "", website.strip())
+            bare_site = re.sub(r"^www\.", "", bare_site).split("/")[0].strip().lower()
+            if bare_site and bare_site not in domain_filter:
+                domain_filter.append(bare_site)
     else:
         domain_filter = []
 
@@ -1214,6 +1231,7 @@ def load_hubspot_child_facilities(
         properties_address                        AS address,
         properties_zip                            AS zip,
         properties_phone                          AS phone,
+        properties_website                        AS website,
         CAST(properties_definitive_healthcare_id AS STRING) AS definitive_id
     FROM `{HUBSPOT_COMPANIES_TABLE}`
     WHERE (archived IS NOT TRUE OR archived IS NULL)
@@ -1294,6 +1312,141 @@ def find_facilities_missing_leadership(
     missing = child_facilities[~child_facilities["hubspot_id"].isin(covered_ids)].copy()
     print(f"  ✓ {len(missing)} facilities missing an ED/Administrator contact")
     return missing.reset_index(drop=True)
+
+
+# ─── State association BigQuery table lookup ──────────────────────────────────
+
+# Priority-ordered column name candidates for each contact field.
+# The table schema may vary; we try these in order and take the first non-empty value.
+_SA_NAME_COLS  = [
+    "administrator_name", "admin_name", "executive_director_name", "ed_name",
+    "contact_name", "director_name", "full_name",
+]
+_SA_TITLE_COLS = [
+    "administrator_title", "contact_title", "title", "job_title",
+]
+_SA_PHONE_COLS = [
+    "administrator_phone", "admin_phone", "executive_director_phone", "ed_phone",
+    "contact_phone", "phone", "telephone",
+]
+_SA_EMAIL_COLS = [
+    "administrator_email", "admin_email", "executive_director_email", "ed_email",
+    "contact_email", "email",
+]
+_SA_URL_COLS = [
+    "source_url", "url", "directory_url", "facility_url", "profile_url",
+]
+
+
+def _map_state_assoc_row(row: dict) -> Optional[dict]:
+    """
+    Map a raw BigQuery row from the state association table to a standard contact dict.
+    Uses priority-ordered column name lists to handle varying schemas.
+    Returns None if no usable name is found.
+    """
+    row_lc = {k.lower(): v for k, v in row.items()}
+
+    def _get(cols: list) -> str:
+        for col in cols:
+            val = row_lc.get(col)
+            if val and str(val).strip() not in ("", "None", "nan"):
+                return str(val).strip()
+        return ""
+
+    found_name  = _get(_SA_NAME_COLS)
+    found_title = _get(_SA_TITLE_COLS)
+    found_phone = _get(_SA_PHONE_COLS)
+    found_email = _get(_SA_EMAIL_COLS)
+    source_url  = _get(_SA_URL_COLS)
+
+    if not found_name:
+        return None
+
+    return {
+        "found_name":          found_name,
+        "found_title":         found_title or "Administrator",
+        "found_phone":         normalize_phone(found_phone) if found_phone else "",
+        "found_email":         found_email,
+        # Store source_url in research_findings so _extract_urls() picks it up
+        # for the note's "Sources cited" / "How to Verify" section.
+        "research_findings":   source_url,
+        "research_confidence": "high",
+        "source_tier":         "1",
+        "source_path":         "state_association_bq_table",
+    }
+
+
+def query_state_association_bq_table(
+    client: bigquery.Client,
+    facility_name: str,
+    city: str,
+    state: str,
+) -> Optional[dict]:
+    """
+    Look up contact data for a facility in the
+    state_associations.state_association_snf_al_il_information BigQuery table.
+
+    Tries an exact facility-name + state match first, then a LIKE match
+    (table facility_name contains the search term) as a fallback.
+
+    Returns a contact dict with keys:
+        found_name, found_title, found_phone, found_email,
+        research_confidence ("high"), source_tier ("1"),
+        source_path ("state_association_bq_table")
+    or None if no match is found or the query fails.
+    """
+    if not facility_name or not state:
+        return None
+
+    name_clean  = facility_name.strip()
+    state_clean = state.strip().upper()
+
+    strategies = [
+        # 1. Exact facility_name + state
+        (
+            f"""
+            SELECT *
+            FROM `{STATE_ASSOC_TABLE}`
+            WHERE LOWER(TRIM(facility_name)) = LOWER(@name)
+              AND UPPER(TRIM(state)) = @state
+            LIMIT 5
+            """,
+            [
+                bigquery.ScalarQueryParameter("name",  "STRING", name_clean),
+                bigquery.ScalarQueryParameter("state", "STRING", state_clean),
+            ],
+        ),
+        # 2. Facility name contains the search term + state
+        (
+            f"""
+            SELECT *
+            FROM `{STATE_ASSOC_TABLE}`
+            WHERE LOWER(facility_name) LIKE CONCAT('%', LOWER(@name), '%')
+              AND UPPER(TRIM(state)) = @state
+            LIMIT 5
+            """,
+            [
+                bigquery.ScalarQueryParameter("name",  "STRING", name_clean),
+                bigquery.ScalarQueryParameter("state", "STRING", state_clean),
+            ],
+        ),
+    ]
+
+    for sql, params in strategies:
+        try:
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            rows = list(client.query(sql, job_config=job_config).result())
+            if not rows:
+                continue
+            contact = _map_state_assoc_row(dict(rows[0]))
+            if contact:
+                return contact
+        except Exception as exc:
+            logger.warning("State association BQ table query failed for '%s' (%s): %s",
+                           facility_name, state, exc)
+            return None
+
+    return None
 
 
 def verify_contact_in_definitive(
@@ -1401,9 +1554,9 @@ def _research_one_contact(
     injected as ``search_domain_filter`` in the OpenRouter payload so Perplexity
     restricts its web crawl to the corporate domain.
 
-    Acquires _OPENROUTER_SEMAPHORE before calling the API to cap concurrency at
-    _MAX_WORKERS, then sleeps RATE_LIMIT_SECONDS inside the semaphore so each slot
-    turns over at a controlled rate before being released.
+    Acquires _W2_SEMAPHORE before calling the API to cap concurrency at
+    _W2_MAX_WORKERS, then sleeps W2_RATE_LIMIT_SECONDS after releasing the semaphore
+    so the next waiting thread can start immediately.
     """
     contact_name = (
         f"{row.get('FIRST_NAME', '')} {row.get('LAST_NAME', '')}".strip()
@@ -1456,13 +1609,16 @@ def _research_one_contact(
     if is_csuite:
         reason = "C-suite title — DH is authoritative; state associations do not list corporate executives"
         print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
-        result["research_findings"] = (
-            f'{{"found_name": "{contact_name}", "found_title": "{title}", '
-            f'"found_email": "{email}", "found_phone": "{phone}", '
-            f'"confidence": "high", "source_url": "", '
-            f'"source_name": "Definitive Healthcare", '
-            f'"reasoning": "Fast-tracked: {reason}"\'}}'
-        )
+        result["research_findings"] = json.dumps({
+            "found_name":  contact_name,
+            "found_title": title,
+            "found_email": email,
+            "found_phone": phone,
+            "confidence":  "high",
+            "source_url":  "",
+            "source_name": "Definitive Healthcare",
+            "reasoning":   f"Fast-tracked: {reason}",
+        })
         result["research_source_name"] = "Definitive Healthcare"
         result["research_reasoning"] = (
             f"Contact sourced directly from Definitive Healthcare ({source} table). "
@@ -1474,13 +1630,16 @@ def _research_one_contact(
     if is_fresh:
         reason = f"DH record updated within {_DH_FRESHNESS_MONTHS} months ({last_update})"
         print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
-        result["research_findings"] = (
-            f'{{"found_name": "{contact_name}", "found_title": "{title}", '
-            f'"found_email": "{email}", "found_phone": "{phone}", '
-            f'"confidence": "high", "source_url": "", '
-            f'"source_name": "Definitive Healthcare", '
-            f'"reasoning": "Fast-tracked: {reason}"\'}}'
-        )
+        result["research_findings"] = json.dumps({
+            "found_name":  contact_name,
+            "found_title": title,
+            "found_email": email,
+            "found_phone": phone,
+            "confidence":  "high",
+            "source_url":  "",
+            "source_name": "Definitive Healthcare",
+            "reasoning":   f"Fast-tracked: {reason}",
+        })
         result["research_source_name"] = "Definitive Healthcare"
         result["research_reasoning"] = (
             f"Contact sourced directly from Definitive Healthcare ({source} table). "
@@ -1525,32 +1684,36 @@ def _research_one_contact(
             }
             prompt_label = f"domain-targeted ({bare_domain})" + (" + LinkedIn profile" if linkedin else "")
         else:
-            prompt = _build_contact_research_prompt(
+            # No corporate domain on record — state association directories never
+            # list VPs or Regional Directors, so skip them entirely and go straight
+            # to LinkedIn, which is the only viable public source in this case.
+            prompt = _build_w2_linkedin_fallback_prompt(
                 contact_name=contact_name,
                 title=title,
                 corporation_name=corporation_name,
-                state=state,
                 facility_type=facility_type,
+                linkedin_url=linkedin,
             )
             extra_params = {"reasoning_effort": "high", "search_recency_filter": "year"}
-            prompt_label = "state-association fallback (no domain)"
+            prompt_label = "LinkedIn-only fallback (no domain)"
 
         # Workflow 2 contacts are unassociated (no direct facility URL), so they
         # benefit from the deeper reasoning model.
         structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
 
         print(f"    → {contact_name} ({title}): querying Sonar Reasoning Pro [{stale_label}, {prompt_label}]...")
-        with _OPENROUTER_SEMAPHORE:
+        with _W2_SEMAPHORE:
             research_result = call_openrouter(
-                RESEARCH_SYSTEM_PROMPT,
+                W2_VERIFY_SYSTEM_PROMPT,
                 prompt,
                 model=OPENROUTER_MODEL_TIER23,
                 response_format=structured_format,
                 extra_params=extra_params,
+                timeout=W2_TIMEOUT,
             )
         # Sleep AFTER releasing the semaphore so the next waiting thread can
         # start its API call immediately rather than waiting out our rate-limit pause.
-        time.sleep(RATE_LIMIT_SECONDS)
+        time.sleep(W2_RATE_LIMIT_SECONDS)
         print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result
         result["source_path"] = "sonar_pro"
@@ -1606,6 +1769,8 @@ def _research_one_facility(
     facility_type = str(row.get("facility_type", ""))
     hubspot_id    = str(row.get("hubspot_id", ""))
     definitive_id = str(row.get("definitive_id", ""))
+    address       = str(row.get("address", "") or "")
+    website       = str(row.get("website", "") or "")
 
     result: dict = {
         "workflow":              "1 - Facility Missing Contact",
@@ -1631,6 +1796,29 @@ def _research_one_facility(
         "researched_at":         datetime.now().isoformat(),
     }
 
+    # ── State association BigQuery table check (cheapest source — run first) ───
+    sa_contact = query_state_association_bq_table(client, facility_name, city, state)
+    if sa_contact:
+        print(f"    ✓ {facility_name}: found in state association BQ table — {sa_contact['found_name']}")
+        result.update(sa_contact)
+        matches, match_strategy = lookup_hubspot_contact_enhanced(
+            client=client,
+            full_name=sa_contact["found_name"],
+            email=sa_contact.get("found_email", ""),
+            phone=sa_contact.get("found_phone", ""),
+            facility_hubspot_id=hubspot_id,
+            parent_hubspot_id=hubspot_corp_id,
+        )
+        ids, detail, summary = _format_hubspot_matches_enhanced(
+            matches, match_strategy=match_strategy, facility_name=facility_name
+        )
+        result.update({
+            "hubspot_contact_ids":   ids,
+            "hubspot_match_detail":  detail,
+            "hubspot_match_summary": summary,
+        })
+        return result
+
     try:
         prompt, source_tier, domain_filter = _build_facility_research_prompt(
             facility_name=facility_name,
@@ -1638,6 +1826,8 @@ def _research_one_facility(
             state=state,
             facility_type=facility_type,
             corporation_name=corporation_name,
+            address=address,
+            website=website,
         )
         result["source_tier"] = source_tier
 
@@ -1668,7 +1858,7 @@ def _research_one_facility(
         structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
 
         print(f"    → {facility_name}: querying {model_label} (tier {source_tier})...")
-        with _OPENROUTER_SEMAPHORE:
+        with _W1_SEMAPHORE:
             research_result = call_openrouter(
                 RESEARCH_SYSTEM_PROMPT,
                 prompt,
@@ -1678,7 +1868,7 @@ def _research_one_facility(
             )
         # Sleep AFTER releasing the semaphore so the next waiting thread can
         # start its API call immediately rather than waiting out our rate-limit pause.
-        time.sleep(RATE_LIMIT_SECONDS)
+        time.sleep(W1_RATE_LIMIT_SECONDS)
         print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
         result["research_findings"] = research_result[:2000]
 
@@ -1721,6 +1911,61 @@ def _research_one_facility(
         print(f"    ✗ {facility_name}: failed — {e}")
 
     return result
+
+
+def _build_w2_linkedin_fallback_prompt(
+    contact_name: str,
+    title: str,
+    corporation_name: str,
+    facility_type: str,
+    linkedin_url: str = "",
+) -> str:
+    """
+    Build a LinkedIn-only verification prompt for W2 contacts where no corporate
+    domain is available.
+
+    State association directories never list VPs or Regional Directors, so the
+    old fallback (_build_contact_research_prompt) was wasting API calls on an
+    impossible search.  This prompt restricts Sonar to LinkedIn only — the only
+    viable public source when the corporate website domain is unknown.
+    """
+    type_desc = {
+        "SNF":  "skilled nursing facility (SNF) operator",
+        "ALF":  "assisted living facility (ALF) operator",
+        "BOTH": "skilled nursing and assisted living operator",
+    }.get((facility_type or "").upper(), "long-term care operator")
+
+    if linkedin_url:
+        step0 = (
+            f"0. Go directly to this LinkedIn profile: {linkedin_url}\n"
+            f"   Confirm whether their current employer is {corporation_name} and whether "
+            f"their title matches or is consistent with \"{title}\".\n"
+            f"   If confirmed, return high or medium confidence and stop here.\n"
+        )
+    else:
+        step0 = ""
+
+    return f"""I need you to verify whether {contact_name} is currently the {title} at \
+{corporation_name}, a {type_desc}.
+
+No corporate website domain is on record, so search LinkedIn only:
+{step0}\
+1. LinkedIn: search for "{contact_name}" "{corporation_name}" to find their current profile.
+2. LinkedIn: search for "{corporation_name}" "{title}" to find whoever currently holds this role.
+
+For each source you check, briefly note: source name → result (found / not found / inaccessible).
+
+Return a JSON object with these fields:
+- found_name:  full name as listed on the source, or empty string if not found
+- found_title: exact job title as listed, or empty string
+- found_email: publicly listed email address, or empty string
+- found_phone: publicly listed phone number, or empty string
+- confidence:  "medium" (LinkedIn showing a current role at this company),
+               "low" (LinkedIn with unclear tenure or possibly outdated),
+               or "not_found" (no verified current role located)
+- source_url:  exact URL where the name was found, or empty string
+- source_name: plain-English name (e.g. "LinkedIn profile — {corporation_name}")
+- reasoning:   1–3 sentences explaining what you found and why you assigned that confidence"""
 
 
 # ─── Workflow 2 corporate-website discovery ───────────────────────────────────
@@ -1808,7 +2053,9 @@ def search_corporation_website_for_executives(
         titles=W2_CORPORATE_TITLES,
     )
     extra_params: dict = {
-        "reasoning_effort":     "high",
+        # Discovery is already well-targeted (domain-filtered, specific title list),
+        # so medium effort is sufficient and faster/cheaper than high.
+        "reasoning_effort":     "medium",
         "search_domain_filter": [bare_domain, "linkedin.com"],
         "search_recency_filter": "year",
     }
@@ -1816,15 +2063,16 @@ def search_corporation_website_for_executives(
 
     print(f"  W2 Sonar discovery: querying Sonar Reasoning Pro for executives at {bare_domain}...")
     try:
-        with _OPENROUTER_SEMAPHORE:
+        with _W2_SEMAPHORE:
             raw = call_openrouter(
                 W2_DISCOVERY_SYSTEM_PROMPT,
                 prompt,
                 model=OPENROUTER_MODEL_TIER23,
                 response_format=structured_format,
                 extra_params=extra_params,
+                timeout=W2_TIMEOUT,
             )
-        time.sleep(RATE_LIMIT_SECONDS)
+        time.sleep(W2_RATE_LIMIT_SECONDS)
         data = json.loads(raw)
         contacts = data.get("contacts", [])
     except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
@@ -1905,10 +2153,10 @@ def workflow_2_research_contacts(
 
     rows  = contacts_df.to_dict("records")
     total = len(rows)
-    print(f"\n  🔍 Researching {total} contact(s) ({_MAX_WORKERS} concurrent)...")
+    print(f"\n  🔍 Researching {total} contact(s) ({_W2_MAX_WORKERS} concurrent)...")
 
     ordered: list[dict] = [{}] * total
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=_W2_MAX_WORKERS) as executor:
         futures = {
             executor.submit(
                 _research_one_contact, row, corporation_name, network_id,
@@ -1951,10 +2199,10 @@ def workflow_1_research_facilities(
 
     rows  = missing.to_dict("records")
     total = len(rows)
-    print(f"\n  🔍 Researching {total} facilit(y/ies) ({_MAX_WORKERS} concurrent)...")
+    print(f"\n  🔍 Researching {total} facilit(y/ies) ({_W1_MAX_WORKERS} concurrent)...")
 
     ordered: list[dict] = [{}] * total
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=_W1_MAX_WORKERS) as executor:
         futures = {
             executor.submit(
                 _research_one_facility, row, hubspot_corp_id, corporation_name, client
