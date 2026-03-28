@@ -78,6 +78,7 @@ from state_association.llm_client import (
     _CONTACT_LIST_JSON_SCHEMA,
     _W1_MAX_WORKERS,
     _W1_SEMAPHORE,
+    _OPENROUTER_SEMAPHORE,
     _W2_MAX_WORKERS,
     _W2_SEMAPHORE,
     call_openrouter,
