@@ -41,16 +41,18 @@ from fullenrich_client import enrich_contact_info, search_facility_contacts
 from hubspot_client import HubSpotClient, HubSpotError
 from state_association_matcher import (
     _build_facility_research_prompt,
+    _format_hubspot_matches_enhanced,
     call_openrouter,
     find_facilities_missing_leadership,
     lookup_hubspot_contact_enhanced,
     parse_found_name,
+    query_state_association_bq_table,
     search_corporation_website_for_executives,
     verify_contact_in_definitive,
     workflow_2_research_contacts,
     OPENROUTER_MODEL,
     OPENROUTER_MODEL_TIER23,
-    RATE_LIMIT_SECONDS,
+    W1_RATE_LIMIT_SECONDS,
     RESEARCH_SYSTEM_PROMPT,
     _CONTACT_JSON_SCHEMA,
     _OPENROUTER_SEMAPHORE,
@@ -259,6 +261,9 @@ def _compute_data_freshness(
                 date_label = fe_updated_at[:10]
             return f"FullEnrich People Search / LinkedIn (profile updated {date_label})"
         return "FullEnrich People Search / LinkedIn — profile date not available"
+
+    if source_path == "state_association_bq_table":
+        return "State Association Directory (Tier 1 — public directory)"
 
     if source_path == "existing_contact":
         if dh_verified and dh_last_update:
@@ -507,10 +512,10 @@ def _enrich_and_associate_existing_contact(
             try:
                 raw = str(last_enriched_raw).strip()
                 if raw.isdigit():
-                    last_dt = datetime.utcfromtimestamp(int(raw) / 1000)
+                    last_dt = datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc)
                 else:
-                    last_dt = datetime.strptime(raw[:10], "%Y-%m-%d")
-                days_since = (datetime.utcnow() - last_dt).days
+                    last_dt = datetime.strptime(raw[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                days_since = (datetime.now(timezone.utc) - last_dt).days
                 if days_since < 30:
                     logger.info(
                         f"Skipping MV/FullEnrich for contact {matched_contact_id}: "
@@ -1266,7 +1271,7 @@ def _run_workflow1_single_facility(
         "found_phone": "",
         "research_confidence": "not_found",
         "source_tier": "3",
-        "source_path": "sonar_pro",   # Sonar Pro always runs on this path
+        "source_path": "sonar_pro",
         "hubspot_contact_ids": "",
         "hubspot_match_detail": "",
         "hubspot_match_summary": "",
@@ -1274,6 +1279,29 @@ def _run_workflow1_single_facility(
         "research_error": "",
         "researched_at": datetime.now().isoformat(),
     }
+
+    # ── State association BigQuery table check (cheapest source — run first) ───
+    sa_contact = query_state_association_bq_table(bq_client, facility_name, city, state)
+    if sa_contact:
+        logger.info(f"  ✓ Found in state association BQ table: {sa_contact['found_name']}")
+        result.update(sa_contact)
+        matches, match_strategy = lookup_hubspot_contact_enhanced(
+            client=bq_client,
+            full_name=sa_contact["found_name"],
+            email=sa_contact.get("found_email", ""),
+            phone=sa_contact.get("found_phone", ""),
+            facility_hubspot_id=company_id,
+            parent_hubspot_id=props.get("hs_parent_company_id", ""),
+        )
+        ids, detail, summary = _format_hubspot_matches_enhanced(
+            matches, match_strategy=match_strategy, facility_name=facility_name
+        )
+        result.update({
+            "hubspot_contact_ids": ids,
+            "hubspot_match_detail": detail,
+            "hubspot_match_summary": summary,
+        })
+        return [result]
 
     try:
         prompt, source_tier, domain_filter = _build_facility_research_prompt(
@@ -1311,7 +1339,7 @@ def _run_workflow1_single_facility(
                 response_format=structured_format,
                 extra_params=extra,
             )
-        time.sleep(RATE_LIMIT_SECONDS)
+        time.sleep(W1_RATE_LIMIT_SECONDS)
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 
@@ -1465,13 +1493,29 @@ def _build_note(
     sonar_pro_actions         = [a for a in actions if a.source_path == "sonar_pro"]
     sonar_discovery_actions   = [a for a in actions if a.source_path == "sonar_pro_discovery"]
     fe_ps_actions             = [a for a in actions if a.source_path == "fullenrich_people_search"]
+    sa_bq_actions             = [a for a in actions if a.source_path == "state_association_bq_table"]
     fe_ps_ran_not_found       = any(a.fe_people_search_ran for a in actions)
     fe_people_search          = bool(fe_ps_actions)   # used later for How to Verify
     fe_bulk_enrich_actions    = [a for a in actions if a.fe_email_found]
 
     h += "<b>Research Process</b><br><ol>"
 
-    if existing_contact_actions:
+    if sa_bq_actions:
+        # Fast path: facility contact found directly in state association BigQuery table
+        found_actions  = [a for a in sa_bq_actions if a.action in ("created_new", "associated_existing")]
+        missed_actions = [a for a in sa_bq_actions if a.action == "no_contact_found"]
+        if found_actions:
+            names = ", ".join(
+                f"{a.contact_name} ({a.contact_title})"
+                for a in found_actions if a.contact_name
+            )
+            h += (
+                f"<li><b>State association database</b> &mdash; ✓ Found in BigQuery "
+                f"state_association_snf_al_il_information table: {names}</li>"
+            )
+        if missed_actions:
+            h += "<li><b>State association database</b> &mdash; ✗ Not found in state association BigQuery table</li>"
+    elif existing_contact_actions:
         # Fast path: facility already had an Admin/ED in HubSpot
         names = ", ".join(
             f"{a.contact_name} ({a.contact_title})"
@@ -1761,6 +1805,13 @@ def _build_note(
             display = u[:80] + ("..." if len(u) > 80 else "")
             h += f"<li><a href=\"{u}\">{display}</a></li>"
         h += "</ul>"
+    elif sa_bq_actions and not fe_people_search:
+        h += (
+            "Contact sourced from the state association BigQuery table "
+            "(<code>state_associations.state_association_snf_al_il_information</code>) — "
+            "no source URL was stored for this record. Verify by checking the relevant "
+            "state association directory for this facility.<br>"
+        )
     elif fe_people_search:
         h += "Contacts were found via FullEnrich People Search — verify using the LinkedIn profile links in Results above.<br>"
     else:
@@ -1821,10 +1872,10 @@ def run_enrichment(company_id: str) -> None:
         try:
             raw = str(last_enriched_raw).strip()
             if raw.isdigit():
-                last_dt = datetime.utcfromtimestamp(int(raw) / 1000)
+                last_dt = datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc)
             else:
-                last_dt = datetime.strptime(raw[:10], "%Y-%m-%d")
-            days_since = (datetime.utcnow() - last_dt).days
+                last_dt = datetime.strptime(raw[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            days_since = (datetime.now(timezone.utc) - last_dt).days
             if days_since < 30:
                 logger.info(
                     f"Skipping {company_id}: enriched {days_since} day(s) ago "

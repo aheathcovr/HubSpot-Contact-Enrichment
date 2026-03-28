@@ -169,6 +169,12 @@ class HubSpotClient:
                 existing_id = match.group(1)
                 logger.info(f"Contact already exists (409), using existing ID={existing_id}")
                 return existing_id
+            # Fallback: check JSON body keys directly (future-proofing if HubSpot
+            # changes the error message format)
+            json_id = str(body.get("existingId", "") or body.get("existing_id", "")).strip()
+            if json_id.isdigit():
+                logger.info(f"Contact already exists (409), recovered ID from JSON body={json_id}")
+                return json_id
             # If we can't parse the ID fall through to the error
             raise HubSpotError(
                 f"Contact creation 409 but could not parse existing ID: {message}",

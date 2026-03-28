@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import time
+import uuid
 
 import requests
 
@@ -336,7 +337,7 @@ def _best_candidate(
     if not contact["full_name"]:
         return None
 
-    score_label = {2: "city+state", 1: "state-only", 0: "no-location-data", -1: "state-MISMATCH"}[best_score]
+    score_label = {2: "city+state", 1: "state-only", 0: "no-location-data", -1: "state-MISMATCH"}.get(best_score, f"score-{best_score}")
 
     if best_score < min_score:
         logger.warning(
@@ -632,7 +633,7 @@ def enrich_contact_info(
         contact_record["linkedin_url"] = linkedin_url
 
     # Job name must be unique enough to avoid collisions on concurrent runs
-    job_name = f"revops-{firstname.lower()}-{lastname.lower()}-{int(time.time())}"
+    job_name = f"revops-{firstname.lower()}-{lastname.lower()}-{uuid.uuid4().hex[:8]}"
 
     try:
         resp = requests.post(

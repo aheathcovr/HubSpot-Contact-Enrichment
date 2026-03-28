@@ -51,7 +51,7 @@ import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -110,6 +110,27 @@ except ImportError:
     print("✗ ERROR: BigQuery dependencies not available.")
     print("   Install with: pip install google-cloud-bigquery")
     sys.exit(1)
+
+# ─── URL helpers ──────────────────────────────────────────────────────────────
+
+def _extract_bare_domain(url: str) -> str:
+    """Return hostname from a URL, stripping scheme, www., port, and path.
+
+    Examples:
+        "https://www.example.com:8080/path" → "example.com"
+        "example.com"                       → "example.com"
+        ""                                  → ""
+    """
+    if not url:
+        return ""
+    from urllib.parse import urlparse
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    host = urlparse(url).hostname or ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host.lower()
+
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 BQ_PROJECT_ID = os.getenv("BQ_PROJECT_ID", "gen-lang-client-0844868008")
@@ -196,8 +217,8 @@ def _dh_record_is_fresh(last_update: str) -> bool:
         parts = date_part.split("-")
         if len(parts) != 3:
             return False
-        record_date = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
-        cutoff = datetime.now() - timedelta(days=_DH_FRESHNESS_MONTHS * 30)
+        record_date = datetime(int(parts[0]), int(parts[1]), int(parts[2]), tzinfo=timezone.utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_DH_FRESHNESS_MONTHS * 30)
         return record_date >= cutoff
     except (ValueError, IndexError):
         return False
@@ -868,8 +889,7 @@ def _build_corporate_contact_research_prompt(
     }.get((facility_type or "").upper(), "long-term care operator")
 
     # Derive the bare domain for display in the prompt
-    bare = re.sub(r"^https?://", "", corporate_domain.strip())
-    bare = re.sub(r"^www\.", "", bare).split("/")[0].strip().lower()
+    bare = _extract_bare_domain(corporate_domain)
     domain_display = bare or corporation_name
 
     is_regional = _is_regional_title(title)
@@ -1015,8 +1035,7 @@ Return a JSON object with these fields:
         for s in tier_1_sources:
             url = s.get("directory_url") or ""
             if url:
-                bare = re.sub(r"^https?://", "", url.strip())
-                bare = re.sub(r"^www\.", "", bare).split("/")[0].strip().lower()
+                bare = _extract_bare_domain(url)
                 if bare and bare not in domain_filter:
                     domain_filter.append(bare)
         if "medicare.gov" not in domain_filter:
@@ -1025,8 +1044,7 @@ Return a JSON object with these fields:
         # the facility's staff/leadership page without that domain being blocked
         # by the association-only filter.
         if website:
-            bare_site = re.sub(r"^https?://", "", website.strip())
-            bare_site = re.sub(r"^www\.", "", bare_site).split("/")[0].strip().lower()
+            bare_site = _extract_bare_domain(website)
             if bare_site and bare_site not in domain_filter:
                 domain_filter.append(bare_site)
     else:
@@ -1518,7 +1536,7 @@ def verify_contact_in_definitive(
                 "DH verification query (%s) failed for %s %s at HOSPITAL_ID=%s: %s",
                 table_key, first_name, last_name, hospital_id_int, exc,
             )
-            return {**_empty, "error": f"query_failed: {exc}"}
+            return {**_empty, "error": "query_failed"}
 
     return {**_empty, "error": ""}   # queried successfully, not found
 
@@ -1660,8 +1678,7 @@ def _research_one_contact(
         # directories, which never list these roles.
         # Fall back to the state-association prompt only when no domain is available.
         if corporate_domain:
-            bare_domain = re.sub(r"^https?://", "", corporate_domain.strip())
-            bare_domain = re.sub(r"^www\.", "", bare_domain).split("/")[0].strip().lower()
+            bare_domain = _extract_bare_domain(corporate_domain)
             prompt = _build_corporate_contact_research_prompt(
                 contact_name=contact_name,
                 title=title,
@@ -1870,7 +1887,11 @@ def _research_one_facility(
         # start its API call immediately rather than waiting out our rate-limit pause.
         time.sleep(W1_RATE_LIMIT_SECONDS)
         print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
-        result["research_findings"] = research_result[:2000]
+        result["research_findings"] = (
+            research_result[:2000] + " [TRUNCATED]"
+            if len(research_result) > 2000
+            else research_result
+        )
 
         found_name, found_title, confidence, found_email, found_phone, reasoning, source_name = parse_found_name(
             research_result
@@ -2038,8 +2059,7 @@ def search_corporation_website_for_executives(
         print("  W2 Sonar discovery: no corporate domain on record — skipping")
         return []
 
-    bare_domain = re.sub(r"^https?://", "", corporate_domain.strip())
-    bare_domain = re.sub(r"^www\.", "", bare_domain).split("/")[0].strip().lower()
+    bare_domain = _extract_bare_domain(corporate_domain)
     if not bare_domain:
         print("  W2 Sonar discovery: could not derive bare domain — skipping")
         return []
