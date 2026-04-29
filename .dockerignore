@@ -1,0 +1,28 @@
+# Python virtualenv – 337 MB, never needed in the image
+.venv/
+
+# Git metadata
+.git/
+
+# IDE / OS
+.cline/
+.claude/
+.DS_Store
+
+# Secrets (never bake into the image)
+.env
+
+# Python bytecode and test caches at any depth
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+
+# Root-level docs not needed at runtime
+README.md
+
+# Source-directory files that are not needed at runtime
+State Association Contact Enrichment/.llm_cache/
+State Association Contact Enrichment/test_*.py
+State Association Contact Enrichment/*.csv
+State Association Contact Enrichment/run_brookdale_workflow1.py

@@ -98,3 +98,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.csv
+
+# LLM cache
+.llm_cache/
+
+# Claude
+.claude/

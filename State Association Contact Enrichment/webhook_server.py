@@ -34,6 +34,7 @@ import traceback
 from contextlib import asynccontextmanager
 from typing import Any
 
+import requests as _http_requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -77,6 +78,58 @@ def _setup_logging() -> None:
 
 _setup_logging()
 logger = logging.getLogger("webhook_server")
+
+# ── OIDC verification for /enrich ─────────────────────────────────────────────
+
+# Reusable transport so Google's public-key cache persists across requests.
+_google_auth_transport = None
+
+def _get_google_auth_transport():
+    global _google_auth_transport
+    if _google_auth_transport is None:
+        from google.auth.transport import requests as _gar
+        _google_auth_transport = _gar.Request(session=_http_requests.Session())
+    return _google_auth_transport
+
+
+def _verify_cloud_tasks_oidc(request: Request) -> bool:
+    """
+    Verify the Google OIDC bearer token that Cloud Tasks attaches to every
+    /enrich delivery.
+
+    The service is --allow-unauthenticated so HubSpot can POST to /webhook,
+    which means /enrich has no Cloud Run IAM layer protecting it. This function
+    provides the equivalent application-level gate.
+
+    Checks:
+      1. Authorization: Bearer <token> header is present.
+      2. Token is a valid Google-signed OIDC JWT.
+      3. Token audience matches CLOUD_RUN_SERVICE_URL.
+      4. Token email matches CLOUD_TASKS_SA_EMAIL.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False
+
+    token = auth_header[7:]
+    audience = os.getenv("CLOUD_RUN_SERVICE_URL", "").rstrip("/")
+    sa_email = os.getenv("CLOUD_TASKS_SA_EMAIL", "")
+
+    if not audience or not sa_email:
+        logger.error(
+            "OIDC verification skipped — CLOUD_RUN_SERVICE_URL or "
+            "CLOUD_TASKS_SA_EMAIL is not configured",
+        )
+        return False
+
+    try:
+        from google.oauth2 import id_token as _id_token
+        info = _id_token.verify_oauth2_token(token, _get_google_auth_transport(), audience=audience)
+        return info.get("email") == sa_email
+    except Exception as exc:
+        logger.warning(f"OIDC token verification failed: {exc}")
+        return False
+
 
 # ── Startup validation ────────────────────────────────────────────────────────
 HUBSPOT_WEBHOOK_SECRET: str = ""
@@ -355,9 +408,17 @@ async def handle_enrich(request: Request) -> JSONResponse:
     Tasks knows the job succeeded. On failure, _run_enrichment_safe handles
     cleanup (resetting request_to_enrich) and logs the error.
 
-    Cloud Run's --no-allow-unauthenticated + OIDC token on the task ensures
-    only Cloud Tasks (via the configured service account) can call this endpoint.
+    The service is --allow-unauthenticated (so HubSpot can reach /webhook), so
+    /enrich is guarded at the application layer by verifying the Google OIDC
+    bearer token that Cloud Tasks attaches to every delivery.
     """
+    if not _verify_cloud_tasks_oidc(request):
+        logger.warning(
+            "/enrich rejected: missing or invalid Cloud Tasks OIDC token",
+            extra={"json_fields": {"alert": "enrich_unauthorized"}},
+        )
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     try:
         body = await request.json()
     except Exception:

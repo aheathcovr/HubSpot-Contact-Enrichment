@@ -445,10 +445,10 @@ class TestBuildFacilityResearchPrompt:
             "Sunrise of Dallas", "Dallas", "TX", "SNF", "Sunrise Senior Living"
         )
         assert isinstance(result, tuple)
-        assert len(result) == 2
+        assert len(result) == 3
 
     def test_prompt_is_string(self):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Sunrise of Dallas", "Dallas", "TX", "SNF", "Sunrise Senior Living"
         )
         assert isinstance(prompt, str)
@@ -456,43 +456,43 @@ class TestBuildFacilityResearchPrompt:
 
     def test_tier_is_valid_value(self):
         for state, ftype in [("WA", "SNF"), ("TX", "SNF"), ("FL", "SNF")]:
-            _, tier = m._build_facility_research_prompt(
+            _, tier, _domain = m._build_facility_research_prompt(
                 "Test Facility", "Test City", state, ftype, "Test Corp"
             )
             assert tier in ("1", "2", "3")
 
     def test_wa_snf_yields_tier_1(self):
-        _, tier = m._build_facility_research_prompt(
+        _, tier, _domain = m._build_facility_research_prompt(
             "Brookdale Silver Lake", "Everett", "WA", "SNF", "Brookdale"
         )
         assert tier == "1"
 
     def test_wa_snf_prompt_contains_whca_url(self):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Brookdale Silver Lake", "Everett", "WA", "SNF", "Brookdale"
         )
         assert "whca.org" in prompt
 
     def test_wa_snf_prompt_contains_url_pattern(self):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Brookdale Silver Lake", "Everett", "WA", "SNF", "Brookdale"
         )
         assert "{slug}" in prompt
 
     def test_tx_snf_yields_tier_3(self):
-        _, tier = m._build_facility_research_prompt(
+        _, tier, _domain = m._build_facility_research_prompt(
             "Sunrise of Dallas", "Dallas", "TX", "SNF", "Sunrise Senior Living"
         )
         assert tier == "3"
 
     def test_fl_snf_yields_tier_2(self):
-        _, tier = m._build_facility_research_prompt(
+        _, tier, _domain = m._build_facility_research_prompt(
             "Sunrise of Naples", "Naples", "FL", "SNF", "Sunrise Senior Living"
         )
         assert tier == "2"
 
     def test_prompt_preserves_facility_details(self):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Brookdale Silver Lake", "Everett", "WA", "SNF", "Brookdale"
         )
         assert "Brookdale Silver Lake" in prompt
@@ -500,7 +500,7 @@ class TestBuildFacilityResearchPrompt:
         assert "Brookdale" in prompt
 
     def test_prompt_contains_json_output_block(self):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Test Facility", "Test City", "TX", "SNF", "Test Corp"
         )
         assert "found_name" in prompt
@@ -508,10 +508,10 @@ class TestBuildFacilityResearchPrompt:
         assert "confidence" in prompt
 
     def test_prompt_contains_report_back_section(self):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Test Facility", "Test City", "TX", "SNF", "Test Corp"
         )
-        assert "Report back:" in prompt
+        assert "For each source you check" in prompt
 
     @pytest.mark.parametrize("ftype,expected_desc", [
         ("SNF",  "skilled nursing facility"),
@@ -520,7 +520,7 @@ class TestBuildFacilityResearchPrompt:
         ("CCRC", "continuing care retirement community"),
     ])
     def test_facility_type_description(self, ftype, expected_desc):
-        prompt, _ = m._build_facility_research_prompt(
+        prompt, _, _domain = m._build_facility_research_prompt(
             "Test Facility", "City", "TX", ftype, "Corp"
         )
         assert expected_desc in prompt
@@ -560,7 +560,7 @@ class TestBuildContactResearchPrompt:
         prompt = m._build_contact_research_prompt(
             "Jane Smith", "Administrator", "Brookdale", "TX", "SNF"
         )
-        assert "Report back:" in prompt
+        assert "For each source you check" in prompt
 
     def test_prompt_contains_cms_fallback(self):
         prompt = m._build_contact_research_prompt(

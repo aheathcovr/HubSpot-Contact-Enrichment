@@ -68,6 +68,7 @@ from state_association.llm_client import (
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
     OPENROUTER_MODEL_TIER23,
+    RATE_LIMIT_SECONDS,
     W1_RATE_LIMIT_SECONDS,
     W2_RATE_LIMIT_SECONDS,
     W2_TIMEOUT,
@@ -90,9 +91,9 @@ from state_association.llm_client import (
 try:
     import yaml
 except ImportError:
-    print("✗ ERROR: PyYAML not available.")
-    print("   Install with: pip install pyyaml")
-    sys.exit(1)
+    raise ImportError(
+        "PyYAML is required. Install with: pip install pyyaml"
+    )
 
 # ─── Optional .env loading ────────────────────────────────────────────────────
 try:
@@ -108,9 +109,11 @@ try:
     BIGQUERY_AVAILABLE = True
 except ImportError:
     BIGQUERY_AVAILABLE = False
-    print("✗ ERROR: BigQuery dependencies not available.")
-    print("   Install with: pip install google-cloud-bigquery")
-    sys.exit(1)
+    raise ImportError(
+        "google-cloud-bigquery is required. Install with: pip install google-cloud-bigquery"
+    )
+
+logger = logging.getLogger(__name__)
 
 # ─── URL helpers ──────────────────────────────────────────────────────────────
 
@@ -321,7 +324,7 @@ def lookup_hubspot_contact_enhanced(
             if all_matches:
                 return all_matches, "email_exact"
         except Exception as e:
-            print(f"    ⚠ HubSpot email lookup failed: {e}")
+            logger.warning(f"HubSpot email lookup failed: {e}")
 
     # ── Strategy 2: Phone lookup ────────────────────────────────────────────────
     if normalized_phone and len(normalized_phone) >= 10:
@@ -358,7 +361,7 @@ def lookup_hubspot_contact_enhanced(
             if phone_matches:
                 return phone_matches, "phone_exact"
         except Exception as e:
-            print(f"    ⚠ HubSpot phone lookup failed: {e}")
+            logger.warning(f"HubSpot phone lookup failed: {e}")
 
     # ── Strategy 3-5: Name lookup with association priority ranked in SQL ───────
     if first_name and last_name:
@@ -419,7 +422,7 @@ def lookup_hubspot_contact_enhanced(
             return matches, strategy_map[best]
 
         except Exception as e:
-            print(f"    ⚠ HubSpot name lookup failed for '{full_name}': {e}")
+            logger.warning(f"HubSpot name lookup failed for '{full_name}': {e}")
             return [], "name_query_error"
 
     return [], "no_criteria_matched"
@@ -548,12 +551,12 @@ def _load_association_guide(guide_path: str = _GUIDE_PATH) -> tuple[list[dict], 
                 elif "fallback_sources" in data:
                     fallback_sources = data["fallback_sources"] or []
             except yaml.YAMLError as e:
-                print(f"  ⚠ Guide YAML parse warning (block skipped): {e}")
+                logger.warning(f"Guide YAML parse warning (block skipped): {e}")
 
     except FileNotFoundError:
-        print(f"  ⚠ State association guide not found at {guide_path} — prompts will use generic sources")
+        logger.warning(f"State association guide not found at {guide_path} — prompts will use generic sources")
     except Exception as e:
-        print(f"  ⚠ Failed to load state association guide: {e} — prompts will use generic sources")
+        logger.warning(f"Failed to load state association guide: {e} — prompts will use generic sources")
 
     _GUIDE_CACHE = (state_entries, fallback_sources)
     return _GUIDE_CACHE
@@ -1077,9 +1080,9 @@ def get_facility_ids_for_network(client: bigquery.Client, network_id: int) -> li
             rows = client.query(query, job_config=_network_cfg).result()
             ids = {row.hospital_id for row in rows}
             facility_ids.update(ids)
-            print(f"  ✓ {key} Overview: {len(ids)} child facilities")
+            logger.info(f"{key} Overview: {len(ids)} child facilities")
         except Exception as e:
-            print(f"  ⚠ {key} Overview query failed: {e}")
+            logger.warning(f"{key} Overview query failed: {e}")
 
     return sorted(facility_ids)
 
@@ -1095,7 +1098,7 @@ def load_corporate_level_contacts(
 
     Returns a DataFrame of contacts suitable for research.
     """
-    print(f"\n  Querying corporate-level contacts for NETWORK_ID={network_id}...")
+    logger.info(f"Querying corporate-level contacts for NETWORK_ID={network_id}...")
 
     all_rows: list[dict] = []
 
@@ -1135,9 +1138,9 @@ def load_corporate_level_contacts(
     try:
         rows = [dict(r) for r in client.query(exec_query, job_config=_net_cfg).result()]
         all_rows.extend(rows)
-        print(f"    Executives table (network level): {len(rows)} rows")
+        logger.info(f"Executives table (network level): {len(rows)} rows")
     except Exception as e:
-        print(f"    ⚠ Executives table query failed: {e}")
+        logger.warning(f"Executives table query failed: {e}")
 
     # ── Source 2: Corporate Executives table (HOSPITAL_ID = network_id) ──
     corp_query = f"""
@@ -1164,9 +1167,9 @@ def load_corporate_level_contacts(
     try:
         rows = [dict(r) for r in client.query(corp_query, job_config=_net_cfg).result()]
         all_rows.extend(rows)
-        print(f"    Corporate Executives table (network level): {len(rows)} rows")
+        logger.info(f"Corporate Executives table (network level): {len(rows)} rows")
     except Exception as e:
-        print(f"    ⚠ Corporate Executives table query failed: {e}")
+        logger.warning(f"Corporate Executives table query failed: {e}")
 
     # ── Source 3: December Full Feed (contacts at network_id HOSPITAL_ID) ──
     feed_query = f"""
@@ -1193,12 +1196,12 @@ def load_corporate_level_contacts(
     try:
         rows = [dict(r) for r in client.query(feed_query, job_config=_net_cfg).result()]
         all_rows.extend(rows)
-        print(f"    December Full Feed (network level): {len(rows)} rows")
+        logger.info(f"December Full Feed (network level): {len(rows)} rows")
     except Exception as e:
-        print(f"    ⚠ December Full Feed query failed: {e}")
+        logger.warning(f"December Full Feed query failed: {e}")
 
     if not all_rows:
-        print("  ℹ No corporate-level executive contacts found in Definitive Healthcare.")
+        logger.info("No corporate-level executive contacts found in Definitive Healthcare.")
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
@@ -1223,9 +1226,9 @@ def load_corporate_level_contacts(
     df = df.drop(columns=["_norm_name"])
     dupes_removed = before - len(df)
     if dupes_removed:
-        print(f"    Removed {dupes_removed} cross-table name duplicate(s)")
+        logger.info(f"Removed {dupes_removed} cross-table name duplicate(s)")
 
-    print(f"  ✓ {len(df)} corporate executive contacts ready for research")
+    logger.info(f"{len(df)} corporate executive contacts ready for research")
     return df.reset_index(drop=True)
 
 
@@ -1237,7 +1240,7 @@ def load_hubspot_child_facilities(
     Return all active child facilities in HubSpot whose hs_parent_company_id
     matches the given corporation HubSpot ID.
     """
-    print(f"\n  Querying HubSpot child facilities for parent ID={hubspot_corp_id}...")
+    logger.info(f"Querying HubSpot child facilities for parent ID={hubspot_corp_id}...")
 
     query = f"""
     SELECT
@@ -1266,10 +1269,10 @@ def load_hubspot_child_facilities(
     try:
         df = client.query(query, job_config=job_config).to_dataframe()
         df = df.replace(["nan", "None", "<NA>"], "")
-        print(f"  ✓ Found {len(df)} child facilities in HubSpot")
+        logger.info(f"Found {len(df)} child facilities in HubSpot")
         return df
     except Exception as e:
-        print(f"  ✗ Error loading child facilities: {e}")
+        logger.error(f"Error loading child facilities: {e}")
         return pd.DataFrame()
 
 
@@ -1292,7 +1295,7 @@ def find_facilities_missing_leadership(
     if not facility_ids:
         return pd.DataFrame()
 
-    print(f"\n  Checking {len(facility_ids)} facilities for existing ED/Administrator contacts...")
+    logger.info(f"Checking {len(facility_ids)} facilities for existing ED/Administrator contacts...")
 
     # Query HubSpot contacts associated with these facilities that hold target titles
     contact_query = f"""
@@ -1320,16 +1323,16 @@ def find_facilities_missing_leadership(
     try:
         contacts_df = client.query(contact_query, job_config=contact_job_config).to_dataframe()
         contacts_df = contacts_df.replace(["nan", "None", "<NA>"], "")
-        print(f"  ✓ Found {len(contacts_df)} existing ED/Administrator contacts across facilities")
+        logger.info(f"Found {len(contacts_df)} existing ED/Administrator contacts across facilities")
     except Exception as e:
-        print(f"  ⚠ HubSpot contacts query failed: {e}")
+        logger.warning(f"HubSpot contacts query failed: {e}")
         contacts_df = pd.DataFrame(columns=["associated_company_id"])
 
     # Facilities that already have at least one matching contact
     covered_ids = set(contacts_df["associated_company_id"].unique()) if not contacts_df.empty else set()
 
     missing = child_facilities[~child_facilities["hubspot_id"].isin(covered_ids)].copy()
-    print(f"  ✓ {len(missing)} facilities missing an ED/Administrator contact")
+    logger.info(f"{len(missing)} facilities missing an ED/Administrator contact")
     return missing.reset_index(drop=True)
 
 
@@ -1627,7 +1630,7 @@ def _research_one_contact(
 
     if is_csuite:
         reason = "C-suite title — DH is authoritative; state associations do not list corporate executives"
-        print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
+        logger.info(f"{contact_name} ({title}): DH fast-track — {reason}")
         result["research_findings"] = json.dumps({
             "found_name":  contact_name,
             "found_title": title,
@@ -1648,7 +1651,7 @@ def _research_one_contact(
 
     if is_fresh:
         reason = f"DH record updated within {_DH_FRESHNESS_MONTHS} months ({last_update})"
-        print(f"    ⚡ {contact_name} ({title}): DH fast-track ({reason})")
+        logger.info(f"{contact_name} ({title}): DH fast-track — {reason}")
         result["research_findings"] = json.dumps({
             "found_name":  contact_name,
             "found_title": title,
@@ -1719,7 +1722,7 @@ def _research_one_contact(
         # benefit from the deeper reasoning model.
         structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
 
-        print(f"    → {contact_name} ({title}): querying Sonar Reasoning Pro [{stale_label}, {prompt_label}]...")
+        logger.info(f"{contact_name} ({title}): querying Sonar Reasoning Pro [{stale_label}, {prompt_label}]...")
         with _W2_SEMAPHORE:
             research_result = call_openrouter(
                 W2_VERIFY_SYSTEM_PROMPT,
@@ -1732,7 +1735,7 @@ def _research_one_contact(
         # Sleep AFTER releasing the semaphore so the next waiting thread can
         # start its API call immediately rather than waiting out our rate-limit pause.
         time.sleep(W2_RATE_LIMIT_SECONDS)
-        print(f"    ✓ {contact_name}: complete ({len(research_result)} chars)")
+        logger.info(f"{contact_name}: research complete ({len(research_result)} chars)")
         result["research_findings"] = research_result
         result["source_path"] = "sonar_pro"
 
@@ -1765,7 +1768,7 @@ def _research_one_contact(
             })
     except RuntimeError as e:
         result["research_error"] = str(e)
-        print(f"    ✗ {contact_name}: failed — {e}")
+        logger.error(f"{contact_name}: research failed — {e}")
 
     return result
 
@@ -1817,7 +1820,7 @@ def _research_one_facility(
     # ── State association BigQuery table check (cheapest source — run first) ───
     sa_contact = query_state_association_bq_table(client, facility_name, city, state)
     if sa_contact:
-        print(f"    ✓ {facility_name}: found in state association BQ table — {sa_contact['found_name']}")
+        logger.info(f"{facility_name}: found in state association BQ table — {sa_contact['found_name']}")
         result.update(sa_contact)
         matches, match_strategy = lookup_hubspot_contact_enhanced(
             client=client,
@@ -1875,7 +1878,7 @@ def _research_one_facility(
         # ── Structured JSON output (Rec #1) ──────────────────────────────────────────
         structured_format = {"type": "json_schema", "json_schema": _CONTACT_JSON_SCHEMA}
 
-        print(f"    → {facility_name}: querying {model_label} (tier {source_tier})...")
+        logger.info(f"{facility_name}: querying {model_label} (tier {source_tier})...")
         with _W1_SEMAPHORE:
             research_result = call_openrouter(
                 RESEARCH_SYSTEM_PROMPT,
@@ -1887,7 +1890,7 @@ def _research_one_facility(
         # Sleep AFTER releasing the semaphore so the next waiting thread can
         # start its API call immediately rather than waiting out our rate-limit pause.
         time.sleep(W1_RATE_LIMIT_SECONDS)
-        print(f"    ✓ {facility_name}: complete ({len(research_result)} chars)")
+        logger.info(f"{facility_name}: research complete ({len(research_result)} chars)")
         result["research_findings"] = (
             research_result[:2000] + " [TRUNCATED]"
             if len(research_result) > 2000
@@ -1908,7 +1911,7 @@ def _research_one_facility(
         })
 
         if found_name and confidence != "not_found":
-            print(f"    🔎 {facility_name}: found {found_name} ({found_title}, {confidence})")
+            logger.info(f"{facility_name}: found {found_name} ({found_title}, confidence={confidence})")
             matches, match_strategy = lookup_hubspot_contact_enhanced(
                 client=client,
                 full_name=found_name,
@@ -1926,11 +1929,11 @@ def _research_one_facility(
                 "hubspot_match_summary": summary,
             })
         else:
-            print(f"    ℹ {facility_name}: no contact found (confidence={confidence})")
+            logger.info(f"{facility_name}: no contact found (confidence={confidence})")
 
     except RuntimeError as e:
         result["research_error"] = str(e)
-        print(f"    ✗ {facility_name}: failed — {e}")
+        logger.error(f"{facility_name}: research failed — {e}")
 
     return result
 
@@ -2057,12 +2060,12 @@ def search_corporation_website_for_executives(
     from config import W2_CORPORATE_TITLES, DH_W2_TITLE_PATTERN
 
     if not corporate_domain:
-        print("  W2 Sonar discovery: no corporate domain on record — skipping")
+        logger.info("W2 Sonar discovery: no corporate domain on record — skipping")
         return []
 
     bare_domain = _extract_bare_domain(corporate_domain)
     if not bare_domain:
-        print("  W2 Sonar discovery: could not derive bare domain — skipping")
+        logger.info("W2 Sonar discovery: could not derive bare domain — skipping")
         return []
 
     title_re = re.compile(DH_W2_TITLE_PATTERN, re.IGNORECASE)
@@ -2082,7 +2085,7 @@ def search_corporation_website_for_executives(
     }
     structured_format = {"type": "json_schema", "json_schema": _CONTACT_LIST_JSON_SCHEMA}
 
-    print(f"  W2 Sonar discovery: querying Sonar Reasoning Pro for executives at {bare_domain}...")
+    logger.info(f"W2 Sonar discovery: querying Sonar Reasoning Pro for executives at {bare_domain}...")
     try:
         with _W2_SEMAPHORE:
             raw = call_openrouter(
@@ -2097,7 +2100,7 @@ def search_corporation_website_for_executives(
         data = json.loads(raw)
         contacts = data.get("contacts", [])
     except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
-        print(f"  W2 Sonar discovery: API/parse error ({exc}) — skipping")
+        logger.warning(f"W2 Sonar discovery: API/parse error ({exc}) — skipping")
         return []
 
     results = []
@@ -2110,7 +2113,7 @@ def search_corporation_website_for_executives(
 
         # Reject titles outside the target cohort
         if not title_re.search(title):
-            print(f"  W2 Sonar discovery: dropping '{full_name}' — title '{title}' not in target list")
+            logger.info(f"W2 Sonar discovery: dropping '{full_name}' — title '{title}' not in target list")
             continue
 
         # Deduplicate against names already found by DH (and previously accepted discoveries)
@@ -2142,7 +2145,7 @@ def search_corporation_website_for_executives(
         })
         known_names.add(name_key)
 
-    print(f"  W2 Sonar discovery: {len(results)} new contact(s) accepted after title filter")
+    logger.info(f"W2 Sonar discovery: {len(results)} new contact(s) accepted after title filter")
     return results
 
 
@@ -2163,18 +2166,16 @@ def workflow_2_research_contacts(
     so that stale VP / Regional Director records can be verified against the
     corporation's own website rather than state association directories.
     """
-    print("\n" + "=" * 70)
-    print("  WORKFLOW 2 — Researching Unassociated Definitive Contacts")
-    print("=" * 70)
+    logger.info("WORKFLOW 2 — Researching Unassociated Definitive Contacts")
 
     contacts_df = load_corporate_level_contacts(client, network_id)
     if contacts_df.empty:
-        print("  ℹ No contacts to research for Workflow 2.")
+        logger.info("No contacts to research for Workflow 2.")
         return []
 
     rows  = contacts_df.to_dict("records")
     total = len(rows)
-    print(f"\n  🔍 Researching {total} contact(s) ({_W2_MAX_WORKERS} concurrent)...")
+    logger.info(f"Researching {total} contact(s) ({_W2_MAX_WORKERS} concurrent)...")
 
     ordered: list[dict] = [{}] * total
     with ThreadPoolExecutor(max_workers=_W2_MAX_WORKERS) as executor:
@@ -2189,7 +2190,7 @@ def workflow_2_research_contacts(
         for future in as_completed(futures):
             ordered[futures[future]] = future.result()
             done += 1
-            print(f"  [{done}/{total}] contacts researched")
+            logger.info(f"[{done}/{total}] contacts researched")
 
     return ordered
 
@@ -2204,23 +2205,21 @@ def workflow_1_research_facilities(
     research each on state association sites, then check if the found person
     already exists as a HubSpot contact (returning their record ID if so).
     """
-    print("\n" + "=" * 70)
-    print("  WORKFLOW 1 — Researching Facilities Missing Leadership Contacts")
-    print("=" * 70)
+    logger.info("WORKFLOW 1 — Researching Facilities Missing Leadership Contacts")
 
     child_facilities = load_hubspot_child_facilities(client, hubspot_corp_id)
     if child_facilities.empty:
-        print("  ℹ No child facilities found in HubSpot for Workflow 1.")
+        logger.info("No child facilities found in HubSpot for Workflow 1.")
         return []
 
     missing = find_facilities_missing_leadership(client, child_facilities)
     if missing.empty:
-        print("  ✅ All child facilities already have an ED/Administrator contact in HubSpot!")
+        logger.info("All child facilities already have an ED/Administrator contact in HubSpot.")
         return []
 
     rows  = missing.to_dict("records")
     total = len(rows)
-    print(f"\n  🔍 Researching {total} facilit(y/ies) ({_W1_MAX_WORKERS} concurrent)...")
+    logger.info(f"Researching {total} facilit(y/ies) ({_W1_MAX_WORKERS} concurrent)...")
 
     ordered: list[dict] = [{}] * total
     with ThreadPoolExecutor(max_workers=_W1_MAX_WORKERS) as executor:
@@ -2234,7 +2233,7 @@ def workflow_1_research_facilities(
         for future in as_completed(futures):
             ordered[futures[future]] = future.result()
             done += 1
-            print(f"  [{done}/{total}] facilities researched")
+            logger.info(f"[{done}/{total}] facilities researched")
 
     return ordered
 
@@ -2242,7 +2241,7 @@ def workflow_1_research_facilities(
 def save_csv(rows: list[dict], filename: str) -> None:
     """Write a list of dicts to a CSV file."""
     if not rows:
-        print(f"  ℹ No rows to save for {filename}")
+        logger.info(f"No rows to save for {filename}")
         return
 
     fieldnames = list(rows[0].keys())
@@ -2250,7 +2249,7 @@ def save_csv(rows: list[dict], filename: str) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"\n💾 Saved {len(rows)} row(s) → {filename}")
+    logger.info(f"Saved {len(rows)} row(s) → {filename}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -2299,7 +2298,7 @@ def _lookup_corporation_name(client: bigquery.Client, hubspot_corp_id: str) -> t
         if rows:
             return str(rows[0].company_name or "Unknown Corporation"), str(rows[0].facility_type or "")
     except Exception as e:
-        print(f"  ⚠ Could not look up corporation name: {e}")
+        logger.warning(f"Could not look up corporation name: {e}")
     return "Unknown Corporation", ""
 
 
