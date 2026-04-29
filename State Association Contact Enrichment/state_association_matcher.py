@@ -73,6 +73,7 @@ from state_association.llm_client import (
     W2_RATE_LIMIT_SECONDS,
     W2_TIMEOUT,
     RESEARCH_SYSTEM_PROMPT,
+    W1_DISCOVERY_SYSTEM_PROMPT,
     W2_DISCOVERY_SYSTEM_PROMPT,
     W2_VERIFY_SYSTEM_PROMPT,
     _CONTACT_JSON_SCHEMA,
@@ -2037,6 +2038,127 @@ If no verified contacts are found at all, return {{"contacts": []}}.
 Do NOT include anyone whose current title is outside the target role list above."""
 
 
+def search_facility_website_for_leadership(
+    facility_name: str,
+    domain: str,
+    city: str,
+    state: str,
+    facility_type: str,
+    corporation_name: str = "",
+    titles: list[str] | None = None,
+) -> list[dict]:
+    """
+    Sonar Reasoning Pro sweep of a facility's own website + LinkedIn to discover
+    current leadership contacts (Administrator, Executive Director, Director of Nursing).
+
+    Analogous to search_corporation_website_for_executives for W2.
+    Uses _CONTACT_LIST_JSON_SCHEMA so up to 5 contacts can be returned per call.
+    search_domain_filter pins the crawl to the facility domain + linkedin.com.
+
+    Returns a list of result dicts compatible with the W1 pipeline format, with
+    found_linkedin populated so FullEnrich Bulk Enrich can use it downstream.
+    Returns [] when no domain is available or no verified contacts are found.
+    Never raises.
+
+    *titles* overrides the default FACILITY_LEADERSHIP_TITLES from config.py,
+    enabling ICP-driven customisation without changing shared config.
+    """
+    from config import FACILITY_LEADERSHIP_TITLES
+
+    if not domain:
+        logger.info("W1 Sonar facility sweep: no domain on record — skipping")
+        return []
+
+    bare_domain = _extract_bare_domain(domain)
+    if not bare_domain:
+        logger.info("W1 Sonar facility sweep: could not derive bare domain — skipping")
+        return []
+
+    target_titles = titles if titles is not None else FACILITY_LEADERSHIP_TITLES
+    title_list = "\n".join(f"  - {t}" for t in target_titles)
+    location = f"{city}, {state}" if city and state else (state or "")
+
+    prompt = (
+        f"Find up to 5 current leadership staff at {facility_name}"
+        + (f", {location}" if location else "")
+        + f".\n\n"
+        f"Only return contacts whose titles match one of these roles — reject any other titles:\n"
+        f"{title_list}\n\n"
+        f"Search these sources in order:\n"
+        f"1. {bare_domain} — check pages titled 'About Us', 'Our Team', 'Staff', "
+        f"'Leadership', or 'Contact Us'.\n"
+        f"2. LinkedIn — search for people currently at \"{facility_name}\" in the target roles. "
+        f"Example: site:linkedin.com/in \"{facility_name}\" administrator\n\n"
+        f"If no verified contacts are found, return {{\"contacts\": []}}.\n"
+        f"Do NOT include anyone whose current title is outside the target role list above."
+    )
+
+    # Title filter applied to Sonar results — accept only healthcare leadership roles.
+    _FACILITY_TITLE_RE = re.compile(
+        r"\b(administrator|executive director|director of nursing)\b", re.IGNORECASE
+    )
+
+    extra_params: dict = {
+        "reasoning_effort":      "medium",
+        "search_domain_filter":  [bare_domain, "linkedin.com"],
+        "search_recency_filter": "year",
+    }
+    structured_format = {"type": "json_schema", "json_schema": _CONTACT_LIST_JSON_SCHEMA}
+
+    logger.info(
+        f"W1 Sonar facility sweep: querying Sonar Reasoning Pro for {facility_name} ({bare_domain})..."
+    )
+    try:
+        with _W1_SEMAPHORE:
+            raw = call_openrouter(
+                W1_DISCOVERY_SYSTEM_PROMPT,
+                prompt,
+                model=OPENROUTER_MODEL_TIER23,
+                response_format=structured_format,
+                extra_params=extra_params,
+                timeout=W2_TIMEOUT,
+            )
+        time.sleep(W1_RATE_LIMIT_SECONDS)
+        data = json.loads(raw)
+        contacts = data.get("contacts", [])
+    except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+        logger.warning(f"W1 Sonar facility sweep: API/parse error ({exc}) — skipping")
+        return []
+
+    results = []
+    for c in contacts[:5]:
+        full_name = (c.get("full_name") or "").strip()
+        title     = (c.get("title") or "").strip()
+        if not full_name or not title:
+            continue
+        if not _FACILITY_TITLE_RE.search(title):
+            logger.info(
+                f"W1 Sonar facility sweep: dropping '{full_name}' — title '{title}' not in target list"
+            )
+            continue
+        results.append({
+            "workflow":             "1 - Facility Missing Contact",
+            "found_name":           full_name,
+            "found_title":          title,
+            "found_email":          c.get("email", ""),
+            "found_phone":          c.get("phone", ""),
+            "found_linkedin":       c.get("linkedin_url", ""),
+            "research_confidence":  c.get("confidence", "low"),
+            "research_reasoning":   c.get("reasoning", ""),
+            "research_source_name": c.get("source_name", ""),
+            "research_findings":    c.get("source_url", ""),
+            "source_path":          "sonar_pro_facility_sweep",
+            "source_tier":          "",
+            "hubspot_contact_ids":  "",
+            "research_error":       "",
+        })
+
+    logger.info(
+        f"W1 Sonar facility sweep: {len(results)} contact(s) accepted at {facility_name}"
+    )
+    return results
+
+
 def search_corporation_website_for_executives(
     corporation_name: str,
     corporate_domain: str,
@@ -2128,12 +2250,12 @@ def search_corporation_website_for_executives(
             "title":                title,
             "email":                c.get("email", ""),
             "phone":                c.get("phone", ""),
-            "linkedin":             "",
+            "linkedin":             c.get("linkedin_url", ""),
             "found_name":           full_name,
             "found_title":          title,
             "found_email":          c.get("email", ""),
             "found_phone":          c.get("phone", ""),
-            "found_linkedin":       "",
+            "found_linkedin":       c.get("linkedin_url", ""),
             "research_findings":    c.get("source_url", ""),
             "research_confidence":  confidence,
             "research_reasoning":   c.get("reasoning", ""),

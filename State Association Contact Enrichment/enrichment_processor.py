@@ -48,6 +48,7 @@ from state_association_matcher import (
     parse_found_name,
     query_state_association_bq_table,
     search_corporation_website_for_executives,
+    search_facility_website_for_leadership,
     verify_contact_in_definitive,
     workflow_2_research_contacts,
     OPENROUTER_MODEL,
@@ -1381,6 +1382,36 @@ def _run_workflow1_single_facility(
     except RuntimeError as exc:
         result["research_error"] = str(exc)
         logger.error(f"  Research failed: {exc}")
+
+    # ── W1 Sonar facility sweep ────────────────────────────────────────────────
+    # When the primary single-contact Sonar search found nothing, sweep the
+    # facility's own website + LinkedIn using _CONTACT_LIST_JSON_SCHEMA, which
+    # can surface multiple leadership contacts and captures LinkedIn URLs so
+    # FullEnrich Bulk Enrich has an anchor for email/phone lookup.
+    if not result.get("found_name") and website:
+        sweep_results = search_facility_website_for_leadership(
+            facility_name=facility_name,
+            domain=website,
+            city=city,
+            state=state,
+            facility_type=facility_type,
+            corporation_name=parent_corp_name,
+        )
+        if sweep_results:
+            for r in sweep_results:
+                r.update({
+                    "hubspot_facility_id": company_id,
+                    "facility_name":       facility_name,
+                    "city":                city,
+                    "state":               state,
+                    "facility_type":       facility_type,
+                    "definitive_id":       definitive_id,
+                    "corporation_name":    parent_corp_name,
+                    "hubspot_corp_id":     props.get("hs_parent_company_id", ""),
+                    "researched_at":       result.get("researched_at", ""),
+                })
+            logger.info(f"  W1 facility sweep found {len(sweep_results)} contact(s) — returning")
+            return sweep_results
 
     # ── FullEnrich fallback ────────────────────────────────────────────────────
     # If Sonar Pro + DH found nothing, try FullEnrich People Search as a last resort.

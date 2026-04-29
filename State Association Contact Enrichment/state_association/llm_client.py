@@ -70,20 +70,21 @@ _CONTACT_LIST_JSON_SCHEMA: dict = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "full_name":   {"type": "string"},
-                        "title":       {"type": "string"},
-                        "email":       {"type": "string"},
-                        "phone":       {"type": "string"},
-                        "source_url":  {"type": "string"},
-                        "source_name": {"type": "string"},
-                        "confidence":  {
+                        "full_name":    {"type": "string"},
+                        "title":        {"type": "string"},
+                        "email":        {"type": "string"},
+                        "phone":        {"type": "string"},
+                        "linkedin_url": {"type": "string"},
+                        "source_url":   {"type": "string"},
+                        "source_name":  {"type": "string"},
+                        "confidence":   {
                             "type": "string",
                             "enum": ["high", "medium", "low"],
                         },
-                        "reasoning":   {"type": "string"},
+                        "reasoning":    {"type": "string"},
                     },
                     "required": [
-                        "full_name", "title", "email", "phone",
+                        "full_name", "title", "email", "phone", "linkedin_url",
                         "source_url", "source_name", "confidence", "reasoning",
                     ],
                     "additionalProperties": False,
@@ -176,6 +177,9 @@ Accuracy rules (strictly enforced):
 
 In the "source_name" field write the human-readable name of the page or profile \
 (e.g. "Acme Health leadership page", "LinkedIn profile — Acme Health"). Do not write a URL here.
+In the "linkedin_url" field include the person's LinkedIn profile URL \
+(e.g. https://www.linkedin.com/in/jane-doe) when you found them on LinkedIn or their profile \
+appeared in search results. Leave blank if not found.
 In the "reasoning" field write 1–3 sentences: which source confirmed the name and title, \
 the recency of that source, and why you believe this is the current person in the role.
 Your response MUST be a single valid JSON object with a "contacts" array — no extra text.\
@@ -217,6 +221,44 @@ In the "source_name" field write the human-readable name of the page or profile 
 In the "reasoning" field write 1–3 sentences: which source confirmed the name and title, \
 the recency of that source, and why you believe this is the current person in the role.
 Your response MUST be a single valid JSON object matching the required schema — no extra text.\
+"""
+
+# System prompt for Workflow 1 facility-website discovery calls.
+# Used with _CONTACT_LIST_JSON_SCHEMA — sweeps the facility's own website and
+# LinkedIn for up to 5 current leadership contacts (Administrator, Executive
+# Director, Director of Nursing) when the primary state-association Sonar search
+# returns not_found.
+W1_DISCOVERY_SYSTEM_PROMPT: str = """\
+You are a healthcare industry research specialist finding current leadership \
+contacts at individual long-term care and senior housing facilities.
+
+Your task is to find up to 5 currently-employed leaders at the named facility, \
+restricted strictly to these roles: Administrator, Executive Director, \
+Director of Nursing.
+
+Search methodology — follow this order:
+1. The facility's own website — look for pages titled 'About Us', 'Our Team', \
+'Staff', 'Leadership', or 'Contact Us'. \
+Common URL patterns: /about, /our-team, /staff, /about-us, /contact.
+2. LinkedIn — search for people with a current position at this facility. \
+Use searches like: site:linkedin.com/in "{facility name}" administrator
+
+Accuracy rules (strictly enforced):
+- Return ONLY people with a verified CURRENT role at this specific facility — not former employees
+- confidence="high"   → name found on the official facility website
+- confidence="medium" → name found on LinkedIn showing a current role at this facility
+- confidence="low"    → name found in a press release, news article, or indirect source
+- Never fabricate names, titles, emails, or phone numbers
+- Return an empty contacts array if no verified contacts are found
+
+In the "source_name" field write the plain-English name of the page or profile \
+(e.g. "Valley View Care Center staff page", "LinkedIn profile"). Do not write a URL here.
+In the "linkedin_url" field include the person's LinkedIn profile URL \
+(e.g. https://www.linkedin.com/in/jane-doe) when you found them on LinkedIn or their profile \
+appeared in search results. Leave blank if not found.
+In the "reasoning" field write 1–3 sentences: which source confirmed the name and title, \
+the recency of that source, and why you believe this is the current person in the role.
+Your response MUST be a single valid JSON object with a "contacts" array — no extra text.\
 """
 
 # ── HTTP session ───────────────────────────────────────────────────────────────
