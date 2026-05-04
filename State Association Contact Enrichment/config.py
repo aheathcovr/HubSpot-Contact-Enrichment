@@ -65,6 +65,7 @@ W2_CORPORATE_TITLES: list[str] = [
     "Chief Administrative Officer",
     "President",
     "Vice President of Operations",
+    "Vice President of Clinical Operations",
     "Senior Vice President of Operations",
     "Senior Vice President",
     "Vice President",
