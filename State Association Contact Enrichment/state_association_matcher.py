@@ -58,7 +58,10 @@ import pandas as pd
 
 from config import (
     DH_W2_TITLE_PATTERN,
+    DH_W1_TITLE_PATTERN,
+    DH_W1_TECH_EXCLUDE,
     TARGET_TITLES,
+    FACILITY_LEADERSHIP_TITLES,
     DH_CSUITE_KEYWORDS as _DH_CSUITE_KEYWORDS,
     DH_CSUITE_PATTERN as _DH_CSUITE_PATTERN,
     DH_FRESHNESS_MONTHS as _DH_FRESHNESS_MONTHS,
@@ -1233,6 +1236,90 @@ def load_corporate_level_contacts(
     return df.reset_index(drop=True)
 
 
+def query_dh_facility_contacts(
+    client: bigquery.Client,
+    dh_hospital_id: int | str,
+) -> list[dict]:
+    """
+    Query Definitive Healthcare for facility-level contacts at a specific HOSPITAL_ID.
+
+    Checks both the Executives table and the December Full Feed, filtering to
+    Administrator, Executive Director, Director of Nursing, and related titles.
+    Tech/IT roles (Database Administrator, Systems Admin, etc.) are excluded.
+
+    Returns a list of contact dicts ordered by title priority
+    (Administrator/Executive Director first, Director of Nursing second), each with:
+        full_name, first_name, last_name, title, email,
+        direct_phone, location_phone, linkedin_url, last_update, source_table
+    Returns [] if dh_hospital_id is empty/non-numeric or no contacts are found.
+    """
+    if not dh_hospital_id or not str(dh_hospital_id).strip().isdigit():
+        return []
+
+    hospital_id_int = int(str(dh_hospital_id).strip())
+    all_rows: list[dict] = []
+
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("hospital_id", "INT64", hospital_id_int),
+    ])
+
+    for table_key, table in [("executives", DH_TABLES["executives"]), ("full_feed", DH_TABLES["full_feed"])]:
+        query = f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(CAST(EXECUTIVE_ID AS STRING)), ''), '') AS executive_id,
+            COALESCE(NULLIF(TRIM(FIRST_NAME),   ''), '') AS first_name,
+            COALESCE(NULLIF(TRIM(LAST_NAME),    ''), '') AS last_name,
+            COALESCE(
+                NULLIF(TRIM(EXECUTIVE_NAME), ''),
+                CONCAT(TRIM(FIRST_NAME), ' ', TRIM(LAST_NAME))
+            ) AS full_name,
+            LOWER(TRIM(TITLE))          AS title,
+            TRIM(EMAIL)                 AS email,
+            TRIM(DIRECT_PHONE)          AS direct_phone,
+            TRIM(LOCATION_PHONE)        AS location_phone,
+            TRIM(LINKEDIN_PROFILE)      AS linkedin_url,
+            CAST(LAST_UPDATE AS STRING) AS last_update,
+            '{table_key}'               AS source_table
+        FROM `{table}`
+        WHERE CAST(HOSPITAL_ID AS INT64) = @hospital_id
+          AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W1_TITLE_PATTERN}')
+          AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W1_TECH_EXCLUDE}')
+        """
+        try:
+            rows = [dict(r) for r in client.query(query, job_config=job_config).result()]
+            all_rows.extend(rows)
+            if rows:
+                logger.info(
+                    "DH facility lookup (%s, HOSPITAL_ID=%s): %d contact(s)",
+                    table_key, hospital_id_int, len(rows),
+                )
+        except Exception as exc:
+            logger.warning(
+                "DH facility contact query failed (%s, HOSPITAL_ID=%s): %s",
+                table_key, hospital_id_int, exc,
+            )
+
+    if not all_rows:
+        return []
+
+    # Deduplicate by normalised full name, preferring executives table
+    _priority = {"executives": 0, "full_feed": 1}
+    all_rows.sort(key=lambda r: _priority.get(r.get("source_table", ""), 9))
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for r in all_rows:
+        name_key = f"{r.get('first_name','').lower().strip()} {r.get('last_name','').lower().strip()}".strip()
+        if name_key and name_key not in seen:
+            seen.add(name_key)
+            deduped.append(r)
+
+    # Sort: Administrator / Executive Director before Director of Nursing
+    _DON_RE = re.compile(r"director of nursing|don\b", re.IGNORECASE)
+    deduped.sort(key=lambda r: (1 if _DON_RE.search(r.get("title", "")) else 0))
+
+    return deduped
+
+
 def load_hubspot_child_facilities(
     client: bigquery.Client,
     hubspot_corp_id: str,
@@ -1785,14 +1872,15 @@ def _research_one_facility(
 
     Same rate-limiting pattern as _research_one_contact.
     """
-    facility_name = str(row.get("facility_name", "Unknown Facility"))
-    city          = str(row.get("city", ""))
-    state         = str(row.get("state", ""))
-    facility_type = str(row.get("facility_type", ""))
-    hubspot_id    = str(row.get("hubspot_id", ""))
-    definitive_id = str(row.get("definitive_id", ""))
-    address       = str(row.get("address", "") or "")
-    website       = str(row.get("website", "") or "")
+    facility_name  = str(row.get("facility_name", "Unknown Facility"))
+    city           = str(row.get("city", ""))
+    state          = str(row.get("state", ""))
+    facility_type  = str(row.get("facility_type", ""))
+    hubspot_id     = str(row.get("hubspot_id", ""))
+    definitive_id  = str(row.get("definitive_id", ""))
+    dh_hospital_id = str(row.get("dh_hospital_id", "") or "")
+    address        = str(row.get("address", "") or "")
+    website        = str(row.get("website", "") or "")
 
     result: dict = {
         "workflow":              "1 - Facility Missing Contact",
@@ -1840,6 +1928,125 @@ def _research_one_facility(
             "hubspot_match_summary": summary,
         })
         return result
+
+    # ── Definitive Healthcare facility executives table ───────────────────────
+    # Query by the facility's DH HOSPITAL_ID for Admin / ED / DON contacts.
+    if dh_hospital_id:
+        dh_contacts = query_dh_facility_contacts(client, dh_hospital_id)
+        if dh_contacts:
+            dh = dh_contacts[0]  # best match: Admin/ED prioritised over DON
+            full_name  = str(dh.get("full_name", "")).strip()
+            title      = str(dh.get("title", "")).strip()
+            email      = str(dh.get("email", "") or "").strip()
+            phone      = (str(dh.get("direct_phone", "") or "") or
+                          str(dh.get("location_phone", "") or "")).strip()
+            linkedin   = str(dh.get("linkedin_url", "") or "").strip()
+            last_update = str(dh.get("last_update", "") or "")[:10]
+            if full_name:
+                logger.info(
+                    "%s: found in DH executives table — %s (%s, updated %s)",
+                    facility_name, full_name, title, last_update or "unknown",
+                )
+                result.update({
+                    "found_name":          full_name,
+                    "found_title":         title,
+                    "found_email":         email,
+                    "found_phone":         normalize_phone(phone) if phone else "",
+                    "research_confidence": "high",
+                    "source_tier":         "dh",
+                    "source_path":         f"definitive_healthcare:{dh.get('source_table','')}",
+                    "research_findings":   (
+                        f"DH last_update={last_update}"
+                        + (f"; linkedin={linkedin}" if linkedin else "")
+                    ),
+                })
+                matches, match_strategy = lookup_hubspot_contact_enhanced(
+                    client=client,
+                    full_name=full_name,
+                    email=email,
+                    phone=result["found_phone"],
+                    facility_hubspot_id=hubspot_id,
+                    parent_hubspot_id=hubspot_corp_id,
+                )
+                ids, detail, summary = _format_hubspot_matches_enhanced(
+                    matches, match_strategy=match_strategy, facility_name=facility_name
+                )
+                result.update({
+                    "hubspot_contact_ids":   ids,
+                    "hubspot_match_detail":  detail,
+                    "hubspot_match_summary": summary,
+                })
+                return result
+
+    # ── FullEnrich facility search ────────────────────────────────────────────
+    # Search FullEnrich by facility domain (or name) for Admin / ED / DON.
+    # Runs before expensive Sonar web research; returns early if a contact is found.
+    try:
+        from fullenrich_client import (
+            search_facility_contacts as _fe_search,
+            enrich_contact_info as _fe_enrich,
+        )
+        fe_results = _fe_search(
+            company_name=facility_name,
+            city=city,
+            state=state,
+            titles=FACILITY_LEADERSHIP_TITLES,
+            domain=website,
+        )
+        if fe_results:
+            fe = fe_results[0]
+            fe_name    = str(fe.get("full_name", "")).strip()
+            fe_title   = str(fe.get("title", "")).strip()
+            fe_linkedin = str(fe.get("linkedin_url", "") or "").strip()
+            if fe_name:
+                logger.info(
+                    "%s: found via FullEnrich — %s (%s)", facility_name, fe_name, fe_title
+                )
+                parts  = fe_name.split(None, 1)
+                fname  = parts[0] if parts else fe_name
+                lname  = parts[1] if len(parts) > 1 else ""
+                enriched = _fe_enrich(
+                    firstname=fname,
+                    lastname=lname,
+                    company_name=facility_name,
+                    domain=website,
+                    linkedin_url=fe_linkedin,
+                )
+                fe_email = str(enriched.get("email", "") or "").strip()
+                fe_phone = str(enriched.get("phone", "") or "").strip()
+                result.update({
+                    "found_name":          fe_name,
+                    "found_title":         fe_title,
+                    "found_email":         fe_email,
+                    "found_phone":         fe_phone,
+                    "research_confidence": "medium",
+                    "source_tier":         "fe",
+                    "source_path":         "fullenrich",
+                    "research_findings":   (
+                        f"FullEnrich; linkedin={fe_linkedin}" if fe_linkedin else "FullEnrich"
+                    ),
+                })
+                matches, match_strategy = lookup_hubspot_contact_enhanced(
+                    client=client,
+                    full_name=fe_name,
+                    email=fe_email,
+                    phone=fe_phone,
+                    facility_hubspot_id=hubspot_id,
+                    parent_hubspot_id=hubspot_corp_id,
+                )
+                ids, detail, summary = _format_hubspot_matches_enhanced(
+                    matches, match_strategy=match_strategy, facility_name=facility_name
+                )
+                result.update({
+                    "hubspot_contact_ids":   ids,
+                    "hubspot_match_detail":  detail,
+                    "hubspot_match_summary": summary,
+                })
+                return result
+    except ImportError:
+        logger.debug("fullenrich_client not available — skipping FullEnrich facility search")
+    except Exception as _fe_exc:
+        logger.warning("%s: FullEnrich facility search failed — %s", facility_name, _fe_exc)
 
     try:
         prompt, source_tier, domain_filter = _build_facility_research_prompt(
