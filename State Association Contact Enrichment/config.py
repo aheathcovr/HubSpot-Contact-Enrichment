@@ -91,6 +91,26 @@ DH_W2_TITLE_PATTERN: str = (
     r"|\bowner\b"
 )
 
+# Matches facility-level leadership roles used in Workflow 1 DH table queries.
+# Complements FACILITY_LEADERSHIP_TITLES (FullEnrich) and TARGET_TITLES (HubSpot checks).
+DH_W1_TITLE_PATTERN: str = (
+    r"\badministrator\b"
+    r"|executive director"
+    r"|director of nursing"
+    r"|nursing home administrator"
+    r"|\blnha\b"
+    r"|director of care"
+    r"|assistant administrator"
+)
+
+# RE2-compatible exclusion pattern for tech/IT titles that would otherwise match
+# \badministrator\b (e.g. "Database Administrator", "Systems Administrator").
+DH_W1_TECH_EXCLUDE: str = (
+    r"database|systems?\s+admin|sysadmin|\bnetwork\b|software"
+    r"|information\s+technology|\bi\.?t\.\s+admin"
+    r"|cloud|devops|security\s+admin|cybersecurity"
+)
+
 # ── DH fast-track: C-suite bypass ─────────────────────────────────────────────
 
 # Compiled regex for C-suite fast-track detection.

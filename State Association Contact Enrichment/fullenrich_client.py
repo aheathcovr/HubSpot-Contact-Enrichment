@@ -351,7 +351,7 @@ def _best_candidate(
         "FullEnrich found: %r (%r) at %r via title=%r [location match: %s]",
         contact["full_name"], contact["title"], identifier, title_filter, score_label,
     )
-    if best_score == 0 and len(eligible) > 1:
+    if best_score == 0 and len(eligible) > 1 and (city or state):
         logger.warning(
             "FullEnrich name search for %r matched %d candidate(s) but none had "
             "location data — returning first result; verify this is the correct facility",

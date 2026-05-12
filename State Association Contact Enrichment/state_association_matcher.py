@@ -1263,7 +1263,17 @@ def query_dh_facility_contacts(
         bigquery.ScalarQueryParameter("hospital_id", "INT64", hospital_id_int),
     ])
 
+    # The executives and full_feed tables have slightly different schemas:
+    #   executives: has DIRECT_PHONE, LOCATION_PHONE
+    #   full_feed:  has PHONE (no DIRECT_PHONE), LOCATION_PHONE
+    # Build table-specific SELECT expressions for the phone column.
+    _phone_cols = {
+        "executives": "TRIM(DIRECT_PHONE)          AS direct_phone",
+        "full_feed":  "TRIM(PHONE)                 AS direct_phone",
+    }
+
     for table_key, table in [("executives", DH_TABLES["executives"]), ("full_feed", DH_TABLES["full_feed"])]:
+        phone_col = _phone_cols[table_key]
         query = f"""
         SELECT
             COALESCE(NULLIF(TRIM(CAST(EXECUTIVE_ID AS STRING)), ''), '') AS executive_id,
@@ -1275,7 +1285,7 @@ def query_dh_facility_contacts(
             ) AS full_name,
             LOWER(TRIM(TITLE))          AS title,
             TRIM(EMAIL)                 AS email,
-            TRIM(DIRECT_PHONE)          AS direct_phone,
+            {phone_col},
             TRIM(LOCATION_PHONE)        AS location_phone,
             TRIM(LINKEDIN_PROFILE)      AS linkedin_url,
             CAST(LAST_UPDATE AS STRING) AS last_update,
