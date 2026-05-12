@@ -153,6 +153,18 @@ _CSUITE_SENIORITY   = ["C-Level"]
 _VP_SENIORITY       = ["C-Level", "VP"]
 _DIRECTOR_SENIORITY = ["C-Level", "VP", "Director"]
 
+# Industry values covering SNFs, ALFs, senior living, and adjacent post-acute care.
+# Applied to company-name searches only (not domain searches, which are already
+# scoped to the right company). Broad enough to catch operators who self-classify
+# under any of the common healthcare/senior care buckets on LinkedIn.
+_SNF_INDUSTRIES: list[str] = [
+    "Hospitals and Health Care",
+    "Nursing Homes and Residential Care Facilities",
+    "Services for the Elderly and Disabled",
+    "Individual and Family Services",
+    "Home Health Care Services",
+]
+
 # Map title keywords → seniority filter list for corporate searches.
 # Checked in order; first match wins.
 _TITLE_SENIORITY_MAP: list[tuple[re.Pattern, list[str]]] = [
@@ -177,6 +189,7 @@ def _search_one_title(
     domain: str = "",
     limit: int = 1,
     seniority_levels: list[str] | None = None,
+    industry_values: list[str] | None = None,
 ) -> list[dict]:
     """
     Call the FullEnrich People Search API for a single title filter.
@@ -187,6 +200,11 @@ def _search_one_title(
     When *seniority_levels* is provided (corporate mode), the
     ``current_position_seniority_level`` filter is added to the payload to
     narrow results to senior leadership and reduce false positives.
+
+    When *industry_values* is provided, ``current_company_industries`` is added
+    to the payload to reduce false positives from similarly-named companies in
+    unrelated industries. Should only be passed on name-based searches — domain
+    searches are already scoped to the right company.
     """
     payload: dict = {
         "current_position_titles": [{"value": title, "exact_match": False}],
@@ -196,6 +214,11 @@ def _search_one_title(
     if seniority_levels:
         payload["current_position_seniority_level"] = [
             {"value": lvl, "exact_match": False} for lvl in seniority_levels
+        ]
+
+    if industry_values:
+        payload["current_company_industries"] = [
+            {"value": ind, "exact_match": False} for ind in industry_values
         ]
 
     if domain:
@@ -474,6 +497,7 @@ def search_facility_contacts(
                 raw_people = _search_one_title(
                     api_key=api_key, title=title_filter,
                     company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
+                    industry_values=_SNF_INDUSTRIES,
                 )
                 contact = _best_candidate(
                     raw_people, city, state, identifier, title_filter, min_score=min_score,
@@ -486,6 +510,7 @@ def search_facility_contacts(
                 raw_people = _search_one_title(
                     api_key=api_key, title=title_filter,
                     company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
+                    industry_values=_SNF_INDUSTRIES,
                 )
                 contact = _best_candidate(
                     raw_people, city, state, identifier, title_filter, min_score=min_score,
@@ -495,6 +520,7 @@ def search_facility_contacts(
             raw_people = _search_one_title(
                 api_key=api_key, title=title_filter,
                 company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
+                industry_values=_SNF_INDUSTRIES,
             )
             contact = _best_candidate(
                 raw_people, city, state, identifier, title_filter, min_score=min_score,
@@ -513,14 +539,17 @@ def _parse_enrich_response(data: dict) -> dict:
 
     v2 response shape:
         data[0].contact_info.most_probable_work_email.{email, status}
+        data[0].contact_info.most_probable_personal_email.{email, status}
         data[0].contact_info.most_probable_phone.{number, region}
         data[0].contact_info.work_emails[].{email, status}
+        data[0].contact_info.personal_emails[].{email, status}
         data[0].contact_info.phones[].{number, region}
         data[0].social_profiles.linkedin.url
 
     Returned dict keys:
         email           str   — most probable work email (or "")
         email_status    str   — FullEnrich deliverability: "DELIVERABLE" | "NOT_DELIVERABLE" | ""
+        personal_email  str   — most probable personal email (or "")
         phone           str   — most probable phone number (or "")
         phone_region    str   — ISO country code of most probable phone, e.g. "US"
         all_emails      list  — [{"email": str, "status": str}, ...]
@@ -528,7 +557,7 @@ def _parse_enrich_response(data: dict) -> dict:
         linkedin_url    str   — LinkedIn profile URL (or "")
     """
     _empty: dict = {
-        "email": "", "email_status": "", "phone": "",
+        "email": "", "email_status": "", "personal_email": "", "phone": "",
         "phone_region": "", "all_emails": [], "all_phones": [],
         "linkedin_url": "",
     }
@@ -541,6 +570,9 @@ def _parse_enrich_response(data: dict) -> dict:
     email_obj = contact_info.get("most_probable_work_email") or {}
     email = str(email_obj.get("email") or "").strip()
     email_status = str(email_obj.get("status") or "").strip().upper()
+
+    personal_email_obj = contact_info.get("most_probable_personal_email") or {}
+    personal_email = str(personal_email_obj.get("email") or "").strip()
 
     phone_obj = contact_info.get("most_probable_phone") or {}
     phone = str(phone_obj.get("number") or "").strip()
@@ -561,13 +593,14 @@ def _parse_enrich_response(data: dict) -> dict:
     linkedin_url = str((social.get("linkedin") or {}).get("url") or "").strip()
 
     return {
-        "email":        email,
-        "email_status": email_status,
-        "phone":        phone,
-        "phone_region": phone_region,
-        "all_emails":   all_emails,
-        "all_phones":   all_phones,
-        "linkedin_url": linkedin_url,
+        "email":          email,
+        "email_status":   email_status,
+        "personal_email": personal_email,
+        "phone":          phone,
+        "phone_region":   phone_region,
+        "all_emails":     all_emails,
+        "all_phones":     all_phones,
+        "linkedin_url":   linkedin_url,
     }
 
 
@@ -592,7 +625,7 @@ def enrich_contact_info(
                 "last_name":  str,
                 "domain":     str,   # OR "company_name" if no domain
                 "linkedin_url": str, # optional, improves hit rate
-                "enrich_fields": ["contact.emails", "contact.phones"]
+                "enrich_fields": ["contact.work_emails", "contact.personal_emails", "contact.phones"]
             }]
         }
 
@@ -604,10 +637,11 @@ def enrich_contact_info(
         2. company_name — fallback when no domain available
 
     Returns:
-        {"email": str, "email_status": str, "phone": str}
+        {"email": str, "email_status": str, "personal_email": str, "phone": str}
+    Work email is preferred; personal_email is populated when work email is absent.
     All values are "" on error, timeout, or missing data. Never raises.
     """
-    _empty: dict = {"email": "", "email_status": "", "phone": ""}
+    _empty: dict = {"email": "", "email_status": "", "personal_email": "", "phone": ""}
 
     api_key = os.getenv("FULLENRICH_API_KEY", "").strip()
     if not api_key:
@@ -623,7 +657,7 @@ def enrich_contact_info(
     contact_record: dict = {
         "first_name":    firstname,
         "last_name":     lastname,
-        "enrich_fields": ["contact.emails", "contact.phones"],
+        "enrich_fields": ["contact.work_emails", "contact.personal_emails", "contact.phones"],
     }
     if bare_domain:
         contact_record["domain"] = bare_domain

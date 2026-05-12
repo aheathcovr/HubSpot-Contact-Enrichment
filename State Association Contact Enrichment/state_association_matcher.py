@@ -2022,7 +2022,7 @@ def _research_one_facility(
                     domain=website,
                     linkedin_url=fe_linkedin,
                 )
-                fe_email = str(enriched.get("email", "") or "").strip()
+                fe_email = str(enriched.get("email") or enriched.get("personal_email") or "").strip()
                 fe_phone = str(enriched.get("phone", "") or "").strip()
                 result.update({
                     "found_name":          fe_name,
