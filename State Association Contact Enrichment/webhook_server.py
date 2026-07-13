@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -37,6 +38,7 @@ from typing import Any
 import requests as _http_requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 
 # ── Structured JSON logging (Cloud Logging compatible) ────────────────────────
@@ -82,13 +84,18 @@ logger = logging.getLogger("webhook_server")
 # ── OIDC verification for /enrich ─────────────────────────────────────────────
 
 # Reusable transport so Google's public-key cache persists across requests.
+# Lock-guarded: with Cloud Run --concurrency > 1, two /enrich deliveries can
+# now genuinely race on first use within the same warm instance.
 _google_auth_transport = None
+_google_auth_transport_lock = threading.Lock()
 
 def _get_google_auth_transport():
     global _google_auth_transport
     if _google_auth_transport is None:
-        from google.auth.transport import requests as _gar
-        _google_auth_transport = _gar.Request(session=_http_requests.Session())
+        with _google_auth_transport_lock:
+            if _google_auth_transport is None:
+                from google.auth.transport import requests as _gar
+                _google_auth_transport = _gar.Request(session=_http_requests.Session())
     return _google_auth_transport
 
 
@@ -240,11 +247,14 @@ def _run_enrichment_safe(company_id: str) -> None:
                 }
             },
         )
-        # Last-resort: reset the trigger flag so the record isn't permanently stuck
+        # Last-resort: reset the trigger flag so the record isn't permanently stuck.
+        # Reuses the same shared client run_enrichment() uses (see
+        # enrichment_processor._get_hubspot_client) instead of building a second
+        # fresh Session just for this one call.
         try:
-            from hubspot_client import HubSpotClient
+            from enrichment_processor import _get_hubspot_client
 
-            HubSpotClient().update_company(company_id, {"request_to_enrich": "false"})
+            _get_hubspot_client().update_company(company_id, {"request_to_enrich": "false"})
             logger.info(
                 "Last-resort: reset request_to_enrich after enrichment failure",
                 extra={"json_fields": {"company_id": company_id}},
@@ -408,6 +418,12 @@ async def handle_enrich(request: Request) -> JSONResponse:
     Tasks knows the job succeeded. On failure, _run_enrichment_safe handles
     cleanup (resetting request_to_enrich) and logs the error.
 
+    Enrichment itself is synchronous/blocking (requests, time.sleep polling,
+    BigQuery). It runs via run_in_threadpool so it doesn't block this process's
+    single asyncio event loop — without that, a single long-running enrichment
+    would stall /health and every other concurrent request on the same
+    instance, regardless of Cloud Run's --concurrency setting.
+
     The service is --allow-unauthenticated (so HubSpot can reach /webhook), so
     /enrich is guarded at the application layer by verifying the Google OIDC
     bearer token that Cloud Tasks attaches to every delivery.
@@ -430,5 +446,5 @@ async def handle_enrich(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Invalid company_id"}, status_code=400)
 
     logger.info(f"Running enrichment for company_id={company_id}")
-    _run_enrichment_safe(company_id)
+    await run_in_threadpool(_run_enrichment_safe, company_id)
     return JSONResponse({"status": "done", "company_id": company_id})

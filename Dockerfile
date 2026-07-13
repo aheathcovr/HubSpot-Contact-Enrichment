@@ -37,5 +37,12 @@ ENV PYTHONPATH=/app
 
 EXPOSE 8080
 
-# Single worker required — FastAPI BackgroundTasks are per-process
+# Single worker required: several module-level globals are shared per-process
+# by design — the BigQuery client cache (enrichment_processor._get_bigquery_client),
+# the OpenRouter rate-limit semaphores (state_association/llm_client.py), and the
+# pooled HTTP sessions (hubspot_client, fullenrich_client, email_verifier). Multiple
+# workers would each get their own copies, defeating the semaphores' whole purpose
+# of capping concurrent calls process-wide. Concurrent requests within this one
+# worker are handled via asyncio + run_in_threadpool (see webhook_server.handle_enrich),
+# not via extra worker processes.
 CMD ["uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips=*"]

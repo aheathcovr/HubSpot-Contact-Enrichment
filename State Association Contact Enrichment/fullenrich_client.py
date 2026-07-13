@@ -49,6 +49,8 @@ import time
 import uuid
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,31 @@ _ENRICH_URL  = "https://app.fullenrich.com/api/v2/contact/enrich/bulk"
 _TIMEOUT     = 15
 _POLL_INTERVAL = 5   # seconds between polling attempts
 _POLL_MAX      = 18  # max polls → 18 × 5s = 90s total wait
+
+
+def _build_session() -> requests.Session:
+    """
+    Shared session with retry-on-transient-error and a connection pool sized
+    for concurrent enrichment (multiple contacts/companies can call this
+    module at once — see _CONTACT_MAX_WORKERS in enrichment_processor.py and
+    Cloud Run --concurrency). Without this, every call opened a fresh
+    TCP+TLS connection to app.fullenrich.com.
+    """
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_session = _build_session()
 
 # US state name → abbreviation map for normalising FullEnrich region strings
 _STATE_ABBR: dict[str, str] = {
@@ -229,7 +256,7 @@ def _search_one_title(
         identifier = company_name
 
     try:
-        resp = requests.post(
+        resp = _session.post(
             _SEARCH_URL,
             json=payload,
             headers={"Authorization": f"Bearer {api_key}"},
@@ -670,7 +697,7 @@ def enrich_contact_info(
     job_name = f"revops-{firstname.lower()}-{lastname.lower()}-{uuid.uuid4().hex[:8]}"
 
     try:
-        resp = requests.post(
+        resp = _session.post(
             _ENRICH_URL,
             json={"name": job_name, "data": [contact_record]},
             headers={"Authorization": f"Bearer {api_key}"},
@@ -696,7 +723,7 @@ def enrich_contact_info(
     for attempt in range(1, _POLL_MAX + 1):
         time.sleep(_POLL_INTERVAL)
         try:
-            poll_resp = requests.get(
+            poll_resp = _session.get(
                 poll_url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=_TIMEOUT,

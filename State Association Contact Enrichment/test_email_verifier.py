@@ -44,7 +44,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 1: valid email ────────────────────────────────────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_valid_email_returns_verified(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
         mock_get.return_value = _mock_response("valid", "good")
@@ -61,7 +61,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 2: invalid email ──────────────────────────────────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_invalid_email_returns_invalid(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
         mock_get.return_value = _mock_response("invalid", "bad")
@@ -74,7 +74,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 3: catchall → RISKY ───────────────────────────────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_catchall_returns_risky(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
         mock_get.return_value = _mock_response("catchall", "ok")
@@ -85,7 +85,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 4: missing API key → UNVERIFIED, no HTTP call ────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_missing_api_key_returns_unverified_without_http_call(self, mock_get):
         result = verify_email_millionverifier("someone@company.com")
 
@@ -94,7 +94,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 5: network error → ERROR ──────────────────────────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_network_error_returns_error_status(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
         mock_get.side_effect = ConnectionError("Network unreachable")
@@ -105,7 +105,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 6: empty/malformed email → UNVERIFIED, no HTTP call ──────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_empty_email_no_http_call(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
 
@@ -114,7 +114,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
         self.assertEqual(result["status"], "UNVERIFIED")
         mock_get.assert_not_called()
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_no_at_sign_no_http_call(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
 
@@ -125,7 +125,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 7: free/role fields surfaced ──────────────────────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_free_and_role_fields_returned(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
         mock_get.return_value = _mock_response("valid", "good", free=True, role=True)
@@ -137,7 +137,7 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
 
     # ── 8: typo suggestion surfaced ───────────────────────────────────────────
 
-    @patch("email_verifier.requests.get")
+    @patch("email_verifier._session.get")
     def test_didyoumean_returned(self, mock_get):
         os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
         mock_get.return_value = _mock_response(

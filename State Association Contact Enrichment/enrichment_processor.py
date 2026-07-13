@@ -24,8 +24,9 @@ Flow:
 import logging
 import os
 import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -67,6 +68,50 @@ BQ_LOCATION = os.getenv("BQ_LOCATION", "US")
 
 CHILD_HIERARCHY_TYPE = "Individual Facility / Child"
 CORP_HIERARCHY_TYPE = "Corporation / Operator"
+
+# Number of contacts processed concurrently per company (Step 5 below). Each
+# contact may trigger a FullEnrich Bulk Enrich call that polls for up to 90s,
+# plus several HubSpot API round-trips — running them serially turned every
+# extra contact found for a company into a linear multiplier on request time.
+_CONTACT_MAX_WORKERS = 3
+
+# BigQuery client is process-global and lazily created once per container,
+# not per enrichment. Building a fresh client re-runs ADC credential discovery
+# on every request; caching it lets every enrichment on a warm instance reuse
+# the same client (and, with Cloud Run --concurrency > 1, share it safely —
+# bigquery.Client is thread-safe for concurrent queries).
+_bq_client = None
+_bq_client_lock = threading.Lock()
+
+
+def _get_bigquery_client():
+    """Return the shared BigQuery client, creating it on first use."""
+    global _bq_client
+    if _bq_client is None:
+        with _bq_client_lock:
+            if _bq_client is None:
+                client, auth_method = init_bigquery_client(BQ_PROJECT_ID, BQ_LOCATION)
+                logger.info(f"BigQuery connected via {auth_method}")
+                _bq_client = client
+    return _bq_client
+
+
+# HubSpotClient wraps a requests.Session, which is safe to share across
+# threads (concurrent enrichments) and across requests on a warm instance —
+# reusing it keeps the TCP/TLS connection pool to api.hubapi.com warm instead
+# of rebuilding it (and losing keep-alive) on every enrichment.
+_hubspot_client: "HubSpotClient | None" = None
+_hubspot_client_lock = threading.Lock()
+
+
+def _get_hubspot_client() -> HubSpotClient:
+    """Return the shared HubSpotClient, creating it on first use."""
+    global _hubspot_client
+    if _hubspot_client is None:
+        with _hubspot_client_lock:
+            if _hubspot_client is None:
+                _hubspot_client = HubSpotClient()
+    return _hubspot_client
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -387,10 +432,17 @@ def _build_contact_enrichment_note(
     fe_info: dict,
     research_reasoning: str = "",
 ) -> str:
-    """HTML enrichment note written directly on a contact record."""
+    """
+    HTML enrichment note written directly on a contact record.
+
+    Leads with what changed (email/phone/LinkedIn added or verified) so a rep
+    scanning the activity feed sees the outcome immediately. Research
+    reasoning and verification methodology follow below for anyone who wants
+    the "why" and "how".
+    """
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     has_changes = any("✚" in line or "✗" in line for line in note_lines)
-    section = "Email Check &amp; Changes Made" if has_changes else "Email Deliverability Check"
+    section = "Changes Made" if has_changes else "Email Deliverability Check"
 
     h = (
         f"<b>RevOps Enrichment &middot; {contact_name}</b><br>"
@@ -398,11 +450,12 @@ def _build_contact_enrichment_note(
         f"<b>Title:</b> {contact_title} &nbsp;&middot;&nbsp; "
         f"<b>Facility:</b> {facility_name}<br><br>"
     )
-    if research_reasoning:
-        h += f"<b>Why This Contact</b><br>{research_reasoning}<br><br>"
     h += f"<b>{section}</b><br>"
     for entry in note_lines:
         h += entry  # each helper already returns HTML
+
+    if research_reasoning:
+        h += f"<br><b>Why This Contact</b><br>{research_reasoning}<br>"
 
     h += (
         "<br><b>About These Results</b><br>"
@@ -580,29 +633,25 @@ def _enrich_and_associate_existing_contact(
 
         existing_linkedin = existing_props.get("hs_linkedin_url", "")
 
-        # ── Write data freshness property ─────────────────────────────────────
-        if data_freshness_value:
-            try:
-                hs.update_contact(
-                    matched_contact_id,
-                    {"data_freshness_according_to_definitive": data_freshness_value},
-                )
-            except HubSpotError as exc:
-                logger.warning(
-                    "Could not write data_freshness_according_to_definitive on contact %s: %s",
-                    matched_contact_id, exc,
-                )
+        # ── Accumulate every remaining property write into one batched PATCH ──
+        # (data freshness, DH/FullEnrich email+phone, LinkedIn, enrichment date)
+        # instead of a separate call per field — HubSpot's PATCH endpoint takes
+        # all properties in one body, and none of these decisions depend on a
+        # previous write having already landed (they all read local state).
+        pending_updates: dict = {}
 
-        # ── Write DH-sourced email/phone if contact has none ─────────────────
-        hs_updates: dict = {}
+        if data_freshness_value:
+            pending_updates["data_freshness_according_to_definitive"] = data_freshness_value
+
+        # ── DH-sourced email/phone if contact has none ────────────────────────
         if not existing_email and enriched_email and email_validation.get("status") != "INVALID":
-            hs_updates["email"] = enriched_email
+            pending_updates["email"] = enriched_email
             logger.info(
                 "Writing DH-sourced email %r to contact %s (no existing email)",
                 enriched_email, matched_contact_id,
             )
         if not existing_phone and enriched_phone:
-            hs_updates["phone"] = enriched_phone
+            pending_updates["phone"] = enriched_phone
             note_lines.append(_phone_dh_line(enriched_phone))
             _base["found_phone_source"] = "Definitive Healthcare (direct line)"
             logger.info(
@@ -611,9 +660,6 @@ def _enrich_and_associate_existing_contact(
             )
         elif existing_phone:
             _base["found_phone_source"] = "existing HubSpot record"
-        if hs_updates:
-            hs.update_contact(matched_contact_id, hs_updates)
-            hs_updates = {}
 
         # ── FullEnrich: fill fields still missing after DH data applied ───────
         email_still_missing = not (existing_email or enriched_email)
@@ -635,7 +681,7 @@ def _enrich_and_associate_existing_contact(
                 enriched_email_status = ev.get("status", "")
                 enriched_email_quality = ev.get("quality", "")
                 if ev.get("status") != "INVALID":
-                    hs_updates["email"] = new_email
+                    pending_updates["email"] = new_email
                     enriched_email = new_email
                     note_lines.append(_email_added_line(new_email, fe_info, ev))
                 else:
@@ -649,47 +695,36 @@ def _enrich_and_associate_existing_contact(
                     )
 
             if phone_still_missing and fe_info.get("phone"):
-                hs_updates["phone"] = fe_info["phone"]
+                pending_updates["phone"] = fe_info["phone"]
                 enriched_phone = fe_info["phone"]
                 _base["found_phone_source"] = "FullEnrich"
                 note_lines.append(_phone_added_line(fe_info))
 
-            primary_for_extras = hs_updates.get("email") or existing_email or enriched_email
+            primary_for_extras = pending_updates.get("email") or existing_email or enriched_email
             alt_emails = _collect_additional_emails(fe_info, primary_for_extras)
             if alt_emails:
-                hs_updates["hs_additional_emails"] = alt_emails
+                pending_updates["hs_additional_emails"] = alt_emails
 
-            if hs_updates:
-                hs.update_contact(matched_contact_id, hs_updates)
-
-        # ── Write LinkedIn URL if we have it and the contact doesn't ─────────
+        # ── LinkedIn URL if we have it and the contact doesn't ────────────────
         linkedin_to_write = found_linkedin or fe_info.get("linkedin_url", "")
         if linkedin_to_write and not existing_linkedin:
-            try:
-                hs.update_contact(matched_contact_id, {"hs_linkedin_url": linkedin_to_write})
-                source = "Definitive Healthcare" if source_path == "definitive_healthcare" and found_linkedin else (
-                    "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
-                )
-                note_lines.append(
-                    f"<b>✚ LinkedIn added:</b> <a href=\"{linkedin_to_write}\">{linkedin_to_write}</a><br>"
-                    f"<b>Source:</b> {source}<br>"
-                )
-            except HubSpotError as exc:
-                logger.warning(
-                    "Could not write hs_linkedin_url for contact %s: %s",
-                    matched_contact_id, exc,
-                )
-
-        # ── Stamp most_recent_enrichment_date ─────────────────────────────────
-        try:
-            hs.update_contact(
-                matched_contact_id,
-                {"most_recent_enrichment_date": str(HubSpotClient.epoch_ms_today_utc())},
+            pending_updates["hs_linkedin_url"] = linkedin_to_write
+            source = "Definitive Healthcare" if source_path == "definitive_healthcare" and found_linkedin else (
+                "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
             )
+            note_lines.append(
+                f"<b>✚ LinkedIn added:</b> <a href=\"{linkedin_to_write}\">{linkedin_to_write}</a><br>"
+                f"<b>Source:</b> {source}<br>"
+            )
+
+        # ── Stamp most_recent_enrichment_date (always) and send the batch ────
+        pending_updates["most_recent_enrichment_date"] = str(HubSpotClient.epoch_ms_today_utc())
+        try:
+            hs.update_contact(matched_contact_id, pending_updates)
         except HubSpotError as exc:
             logger.warning(
-                "Could not set most_recent_enrichment_date on contact %s: %s",
-                matched_contact_id, exc,
+                "Could not apply batched update on contact %s (%s): %s",
+                matched_contact_id, list(pending_updates.keys()), exc,
             )
 
         # ── Write enrichment note (always — even if no new data was added) ────
@@ -789,6 +824,10 @@ def _create_and_enrich_new_contact(
     # ── FullEnrich bulk enrich (fill missing email/phone) ─────────────────────
     new_note_lines: list[str] = []
     new_fe_info: dict = {}
+    # Accumulate every post-creation property write into one batched PATCH
+    # (FullEnrich email/phone/LinkedIn, data freshness, enrichment date)
+    # instead of a separate call per field.
+    pending_updates: dict = {}
 
     # Document DH phone written at creation
     if found_phone:
@@ -803,13 +842,12 @@ def _create_and_enrich_new_contact(
             domain=facility_domain,
             linkedin_url=found_linkedin,
         )
-        new_updates: dict = {}
 
         if not email_to_use and new_fe_info.get("email"):
             new_email = new_fe_info["email"]
             ev = verify_email_millionverifier(new_email)
             if ev.get("status") != "INVALID":
-                new_updates["email"] = new_email
+                pending_updates["email"] = new_email
                 _base["found_email"] = new_email
                 _base["email_validation_status"] = ev.get("status", "")
                 _base["email_validation_quality"] = ev.get("quality", "")
@@ -822,46 +860,35 @@ def _create_and_enrich_new_contact(
                 )
 
         if not found_phone and new_fe_info.get("phone"):
-            new_updates["phone"] = new_fe_info["phone"]
+            pending_updates["phone"] = new_fe_info["phone"]
             _base["found_phone"] = new_fe_info["phone"]
             _base["found_phone_source"] = "FullEnrich"
             new_note_lines.append(_phone_added_line(new_fe_info))
 
-        primary_for_extras = new_updates.get("email") or email_to_use
+        primary_for_extras = pending_updates.get("email") or email_to_use
         alt_emails = _collect_additional_emails(new_fe_info, primary_for_extras)
         if alt_emails:
-            new_updates["hs_additional_emails"] = alt_emails
+            pending_updates["hs_additional_emails"] = alt_emails
 
         if not found_linkedin and new_fe_info.get("linkedin_url"):
-            new_updates["hs_linkedin_url"] = new_fe_info["linkedin_url"]
+            pending_updates["hs_linkedin_url"] = new_fe_info["linkedin_url"]
             new_note_lines.append(
                 f"<b>✚ LinkedIn added:</b> <a href=\"{new_fe_info['linkedin_url']}\">{new_fe_info['linkedin_url']}</a><br>"
                 f"<b>Source:</b> FullEnrich Bulk Enrich<br>"
             )
 
-        if data_freshness_value:
-            new_updates["data_freshness_according_to_definitive"] = data_freshness_value
+    if data_freshness_value:
+        pending_updates["data_freshness_according_to_definitive"] = data_freshness_value
 
-        if new_updates:
-            try:
-                hs.update_contact(new_id, new_updates)
-            except HubSpotError as exc:
-                logger.warning(f"Post-creation FullEnrich update failed for {new_id}: {exc}")
-
-    elif data_freshness_value:
-        try:
-            hs.update_contact(new_id, {"data_freshness_according_to_definitive": data_freshness_value})
-        except HubSpotError as exc:
-            logger.warning(f"Could not write data_freshness_according_to_definitive on new contact {new_id}: {exc}")
-
-    # ── Stamp most_recent_enrichment_date ─────────────────────────────────────
+    # ── Stamp most_recent_enrichment_date (always) and send the batch ────────
+    pending_updates["most_recent_enrichment_date"] = str(HubSpotClient.epoch_ms_today_utc())
     try:
-        hs.update_contact(
-            new_id,
-            {"most_recent_enrichment_date": str(HubSpotClient.epoch_ms_today_utc())},
-        )
+        hs.update_contact(new_id, pending_updates)
     except HubSpotError as exc:
-        logger.warning(f"Could not set most_recent_enrichment_date on new contact {new_id}: {exc}")
+        logger.warning(
+            "Could not apply batched update on new contact %s (%s): %s",
+            new_id, list(pending_updates.keys()), exc,
+        )
 
     # Always write enrichment note — even when FullEnrich found nothing,
     # so the record shows the run date and why this contact was created.
@@ -1490,6 +1517,12 @@ def _build_note(
 
     HubSpot renders the note body as HTML, so we use semantic tags for clean
     display in both the collapsed activity-feed preview and the expanded view.
+
+    Section order is deliberate: Summary → Changes Made to HubSpot (what
+    actually happened — contacts created/linked, email/phone/LinkedIn added)
+    → Research Process (how those contacts were found) → How to Verify →
+    Errors. A rep should see the outcome without scrolling; the process is
+    there for anyone who wants to check the work.
     """
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -1529,7 +1562,10 @@ def _build_note(
     fe_people_search          = bool(fe_ps_actions)   # used later for How to Verify
     fe_bulk_enrich_actions    = [a for a in actions if a.fe_email_found]
 
-    h += "<b>Research Process</b><br><ol>"
+    # Built into its own buffer and appended after the per-contact results
+    # below (see reassembly before "How to Verify") — the "what happened" of
+    # each contact's changes should read before the "how we found them".
+    process_html = "<b>Research Process</b><br><ol>"
 
     if sa_bq_actions:
         # Fast path: facility contact found directly in state association BigQuery table
@@ -1540,57 +1576,57 @@ def _build_note(
                 f"{a.contact_name} ({a.contact_title})"
                 for a in found_actions if a.contact_name
             )
-            h += (
+            process_html += (
                 f"<li><b>State association database</b> &mdash; ✓ Found in BigQuery "
                 f"state_association_snf_al_il_information table: {names}</li>"
             )
         if missed_actions:
-            h += "<li><b>State association database</b> &mdash; ✗ Not found in state association BigQuery table</li>"
+            process_html += "<li><b>State association database</b> &mdash; ✗ Not found in state association BigQuery table</li>"
     elif existing_contact_actions:
         # Fast path: facility already had an Admin/ED in HubSpot
         names = ", ".join(
             f"{a.contact_name} ({a.contact_title})"
             for a in existing_contact_actions if a.contact_name
         )
-        h += f"<li><b>HubSpot existing contact check</b> &mdash; ✓ Found on file: {names}</li>"
+        process_html += f"<li><b>HubSpot existing contact check</b> &mdash; ✓ Found on file: {names}</li>"
 
         # DH verification summary across all existing contacts
         confirmed  = [a for a in existing_contact_actions if a.dh_verified]
         unconfirmed = [a for a in existing_contact_actions if not a.dh_verified and a.dh_verification_detail]
         if confirmed and not unconfirmed:
             detail = confirmed[0].dh_verification_detail  # all same outcome — show once
-            h += f"<li><b>Definitive Healthcare verification</b> &mdash; {detail}</li>"
+            process_html += f"<li><b>Definitive Healthcare verification</b> &mdash; {detail}</li>"
         elif unconfirmed and not confirmed:
             detail = unconfirmed[0].dh_verification_detail
-            h += f"<li><b>Definitive Healthcare verification</b> &mdash; {detail}</li>"
+            process_html += f"<li><b>Definitive Healthcare verification</b> &mdash; {detail}</li>"
         elif confirmed or unconfirmed:
             # Mixed — summarise per contact
             parts = "; ".join(
                 f"{a.contact_name}: {a.dh_verification_detail}"
                 for a in existing_contact_actions if a.dh_verification_detail
             )
-            h += f"<li><b>Definitive Healthcare verification</b> &mdash; {parts}</li>"
+            process_html += f"<li><b>Definitive Healthcare verification</b> &mdash; {parts}</li>"
     elif dh_fasttrack_actions and not sonar_pro_actions and not sonar_discovery_actions and not fe_ps_actions and not fe_ps_ran_not_found:
         # Workflow 2 pure fast-track: all contacts C-suite from DH, no Sonar Pro needed
         names = ", ".join(
             f"{a.contact_name} ({a.contact_title})"
             for a in dh_fasttrack_actions if a.contact_name
         )
-        h += (
+        process_html += (
             f"<li><b>Definitive Healthcare data</b> &mdash; ⚡ Fast-tracked: "
             f"{len(dh_fasttrack_actions)} corporate executive(s) sourced directly from DH "
             f"(C-suite or fresh record — Sonar Pro bypassed): {names}</li>"
         )
-        h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No additional executives found on corporate site or LinkedIn</li>"
+        process_html += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No additional executives found on corporate site or LinkedIn</li>"
     elif dh_fasttrack_actions or sonar_pro_actions or sonar_discovery_actions or fe_ps_actions or fe_ps_ran_not_found:
         # Workflow 2 mixed path: some contacts fast-tracked, others needed Sonar Pro
-        h += "<li><b>Definitive Healthcare data</b> &mdash; queried BigQuery corporate executives table</li>"
+        process_html += "<li><b>Definitive Healthcare data</b> &mdash; queried BigQuery corporate executives table</li>"
         if dh_fasttrack_actions:
             ft_names = ", ".join(
                 f"{a.contact_name} ({a.contact_title})"
                 for a in dh_fasttrack_actions if a.contact_name
             )
-            h += (
+            process_html += (
                 f"<li><b>C-suite fast-track</b> &mdash; ⚡ {len(dh_fasttrack_actions)} executive(s) "
                 f"sourced directly (DH authoritative, Sonar Pro bypassed): {ft_names}</li>"
             )
@@ -1600,12 +1636,12 @@ def _build_note(
             disc_names = ", ".join(
                 f"{a.contact_name} ({a.contact_title})" for a in disc_found if a.contact_name
             )
-            h += (
+            process_html += (
                 f"<li><b>Sonar Pro website discovery</b> &mdash; ✓ Found {len(disc_found)} executive(s) "
                 f"on corporate site / LinkedIn: {disc_names}</li>"
             )
         else:
-            h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No additional executives found on corporate site or LinkedIn</li>"
+            process_html += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No additional executives found on corporate site or LinkedIn</li>"
         # Sonar Pro outcome for non-C-suite DH contacts (stale VP / Regional verification)
         sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
         sonar_missed = (
@@ -1616,26 +1652,26 @@ def _build_note(
         if sonar_found:
             a = sonar_found[0]
             conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
-            h += f"<li><b>Sonar Pro DH verification</b> &mdash; ✓ Verified {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+            process_html += f"<li><b>Sonar Pro DH verification</b> &mdash; ✓ Verified {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
         elif sonar_missed:
-            h += "<li><b>Sonar Pro DH verification</b> &mdash; ✗ Could not verify remaining DH executives on live sources</li>"
+            process_html += "<li><b>Sonar Pro DH verification</b> &mdash; ✗ Could not verify remaining DH executives on live sources</li>"
         if fe_ps_actions:
             fe_names = ", ".join(
                 f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
             )
-            h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
+            process_html += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
         elif fe_ps_ran_not_found:
-            h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
+            process_html += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
     elif "Workflow 2" in workflow_label:
         # Workflow 2 zero-results: DH, Sonar discovery, and FullEnrich all found nothing
-        h += "<li><b>Definitive Healthcare data</b> &mdash; no corporate executives found in BigQuery</li>"
-        h += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No executives found on corporate site or LinkedIn</li>"
-        h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
+        process_html += "<li><b>Definitive Healthcare data</b> &mdash; no corporate executives found in BigQuery</li>"
+        process_html += "<li><b>Sonar Pro website discovery</b> &mdash; ✗ No executives found on corporate site or LinkedIn</li>"
+        process_html += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
     else:
         # Workflow-aware fallback when no specific research actions were captured.
         if "Workflow 2" in workflow_label:
             # Corporation / Workflow 2: BHQ corporate executives table + Sonar Pro
-            h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
+            process_html += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
 
             # Sonar Pro outcome
             sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
@@ -1647,28 +1683,28 @@ def _build_note(
             if sonar_found:
                 a = sonar_found[0]
                 conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
-                h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+                process_html += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
             elif sonar_missed:
-                h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No corporate contacts identified via web search</li>"
+                process_html += "<li><b>Sonar Pro web search</b> &mdash; ✗ No corporate contacts identified via web search</li>"
             else:
-                h += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
+                process_html += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
 
             # FullEnrich People Search — always runs for W2
             if fe_ps_actions:
                 fe_names = ", ".join(
                     f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
                 )
-                h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
+                process_html += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
             else:
-                h += "<li><b>FullEnrich People Search</b> &mdash; no additional corporate contacts found</li>"
+                process_html += "<li><b>FullEnrich People Search</b> &mdash; no additional corporate contacts found</li>"
         else:
             # Facility / Workflow 1: state association directories + Sonar Pro
-            h += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
+            process_html += "<li><b>Definitive Healthcare data</b> &mdash; checked BigQuery for executives on file</li>"
             if tier_str:
                 tier_label = _TIER_LABELS.get(tier_str, f"Tier {tier_str}")
-                h += f"<li><b>State association directory</b> &mdash; {tier_label}</li>"
+                process_html += f"<li><b>State association directory</b> &mdash; {tier_label}</li>"
             else:
-                h += "<li><b>State association directory</b> &mdash; no state directory available; web search used</li>"
+                process_html += "<li><b>State association directory</b> &mdash; no state directory available; web search used</li>"
 
             # Sonar Pro outcome
             sonar_found = [a for a in sonar_pro_actions if a.action in ("created_new", "associated_existing")]
@@ -1680,20 +1716,20 @@ def _build_note(
             if sonar_found:
                 a = sonar_found[0]
                 conf_short = {"high": "HIGH", "medium": "MED", "low": "LOW"}.get(a.confidence, a.confidence.upper())
-                h += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
+                process_html += f"<li><b>Sonar Pro web search</b> &mdash; ✓ Found {a.contact_name}, {a.contact_title} ({conf_short} confidence)</li>"
             elif sonar_missed:
-                h += "<li><b>Sonar Pro web search</b> &mdash; ✗ No contact identified</li>"
+                process_html += "<li><b>Sonar Pro web search</b> &mdash; ✗ No contact identified</li>"
             else:
-                h += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
+                process_html += "<li><b>Sonar Pro web search</b> &mdash; Perplexity live web search</li>"
 
             # FullEnrich People Search outcome
             if fe_ps_actions:
                 fe_names = ", ".join(
                     f"{a.contact_name} ({a.contact_title})" for a in fe_ps_actions if a.contact_name
                 )
-                h += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
+                process_html += f"<li><b>FullEnrich People Search</b> &mdash; ✓ Found {len(fe_ps_actions)} contact(s): {fe_names}</li>"
             elif fe_ps_ran_not_found:
-                h += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
+                process_html += "<li><b>FullEnrich People Search</b> &mdash; ✗ No contacts found</li>"
 
     # MillionVerifier outcome (runs when any email is present)
     emails_checked = [a for a in actions if a.email_validation_status and a.action != "error"]
@@ -1709,23 +1745,26 @@ def _build_note(
         if len(emails_checked) == 1:
             a = emails_checked[0]
             mv_text = mv_labels.get(a.email_validation_status, a.email_validation_status)
-            h += f"<li><b>MillionVerifier</b> &mdash; {mv_text}</li>"
+            process_html += f"<li><b>MillionVerifier</b> &mdash; {mv_text}</li>"
         else:
             parts = "; ".join(
                 f"{a.contact_name}: {mv_labels.get(a.email_validation_status, a.email_validation_status)}"
                 for a in emails_checked
             )
-            h += f"<li><b>MillionVerifier</b> &mdash; {parts}</li>"
+            process_html += f"<li><b>MillionVerifier</b> &mdash; {parts}</li>"
 
     # FullEnrich Bulk Enrich outcome (email enrichment for a found contact)
     if fe_bulk_enrich_actions:
         fe_emails = ", ".join(a.found_email for a in fe_bulk_enrich_actions if a.found_email)
-        h += f"<li><b>FullEnrich Bulk Enrich</b> &mdash; ✓ Email found: {fe_emails}</li>"
+        process_html += f"<li><b>FullEnrich Bulk Enrich</b> &mdash; ✓ Email found: {fe_emails}</li>"
 
-    h += "</ol><br>"
+    process_html += "</ol><br>"
 
-    # ── Per-contact results ───────────────────────────────────────────────────
-    h += "<b>Results</b><br>"
+    # ── Per-contact results — what actually changed in HubSpot ───────────────
+    # Rendered first (see reassembly below) so the concrete outcome for each
+    # contact — email/phone/LinkedIn added, created vs. linked — reads before
+    # the research process that produced it.
+    results_html = "<b>Changes Made to HubSpot</b><br>"
     for action in actions:
         # Bullet label: prefer "Name (Title)" when a contact was identified;
         # fall back to facility name for no-contact-found rows (W1 multi-facility).
@@ -1735,12 +1774,12 @@ def _build_note(
             label = action.contact_name
         else:
             label = action.facility_name or "Unknown"
-        h += f"<b>&bull; {label}</b><br>"
+        results_html += f"<b>&bull; {label}</b><br>"
 
         if action.action in ("created_new", "associated_existing"):
             conf_label = _CONFIDENCE_LABELS.get(action.confidence, action.confidence)
-            h += f"<b>Contact:</b> {action.contact_name}, {action.contact_title}<br>"
-            h += f"<b>Confidence:</b> {conf_label}<br>"
+            results_html += f"<b>Contact:</b> {action.contact_name}, {action.contact_title}<br>"
+            results_html += f"<b>Confidence:</b> {conf_label}<br>"
 
             # Data completeness summary
             email_check   = "✓" if action.found_email else "✗"
@@ -1750,15 +1789,10 @@ def _build_note(
                 phone_check = f"✓{phone_src}"
             else:
                 phone_check = "✗"
-            h += f"<b>Data:</b> Email {email_check} &nbsp;|&nbsp; Phone {phone_check} &nbsp;|&nbsp; LinkedIn {linkedin_check}<br>"
+            results_html += f"<b>Data:</b> Email {email_check} &nbsp;|&nbsp; Phone {phone_check} &nbsp;|&nbsp; LinkedIn {linkedin_check}<br>"
 
             if action.dh_verification_detail:
-                h += f"<b>DH Status:</b> {action.dh_verification_detail}<br>"
-            if action.research_reasoning:
-                h += f"<b>Why:</b> {action.research_reasoning}<br>"
-                stale, stale_label = _is_source_stale(action.research_reasoning)
-                if stale:
-                    h += f"<em>&#9888; Source may be outdated &mdash; most recent date cited: {stale_label}</em><br>"
+                results_html += f"<b>DH Status:</b> {action.dh_verification_detail}<br>"
 
             if action.found_email:
                 vstatus  = action.email_validation_status
@@ -1777,11 +1811,11 @@ def _build_note(
                     v_suffix = " <em>(validation error &mdash; treat as unconfirmed)</em>"
                 else:
                     v_suffix = ""
-                h += f"<b>Email:</b> {action.found_email}{v_suffix}<br>"
+                results_html += f"<b>Email:</b> {action.found_email}{v_suffix}<br>"
             if action.found_phone:
-                h += f"<b>Phone:</b> {action.found_phone}<br>"
+                results_html += f"<b>Phone:</b> {action.found_phone}<br>"
             if action.found_linkedin:
-                h += f"<b>LinkedIn:</b> <a href=\"{action.found_linkedin}\">{action.found_linkedin}</a><br>"
+                results_html += f"<b>LinkedIn:</b> <a href=\"{action.found_linkedin}\">{action.found_linkedin}</a><br>"
 
             act_label = _ACTION_LABELS.get(action.action, action.action)
             if action.contact_id and portal_id:
@@ -1798,7 +1832,7 @@ def _build_note(
                     match_info = (
                         f" (matched by {action.match_method})" if action.match_method else ""
                     )
-                    h += (
+                    results_html += (
                         f"<b>HubSpot:</b> {act_label}{contact_ref}{match_info} &mdash; "
                         f"<em>enriched {action.days_since_enriched} day(s) ago — data refresh skipped</em><br>"
                     )
@@ -1806,19 +1840,31 @@ def _build_note(
                     match_info = (
                         f" (matched by {action.match_method})" if action.match_method else ""
                     )
-                    h += f"<b>HubSpot:</b> {act_label}{contact_ref}{match_info}<br>"
+                    results_html += f"<b>HubSpot:</b> {act_label}{contact_ref}{match_info}<br>"
             else:
-                h += f"<b>HubSpot:</b> {act_label}{contact_ref}<br>"
+                results_html += f"<b>HubSpot:</b> {act_label}{contact_ref}<br>"
+
+            # Reasoning last — the concrete changes above are the headline,
+            # this is supporting detail for reps who want the "why".
+            if action.research_reasoning:
+                results_html += f"<b>Why:</b> {action.research_reasoning}<br>"
+                stale, stale_label = _is_source_stale(action.research_reasoning)
+                if stale:
+                    results_html += f"<em>&#9888; Source may be outdated &mdash; most recent date cited: {stale_label}</em><br>"
 
         elif action.action == "no_contact_found":
-            h += "<b>Result:</b> No administrator or Executive Director identified<br>"
+            results_html += "<b>Result:</b> No administrator or Executive Director identified<br>"
             if action.detail and action.detail != "No contact identified by research":
-                h += f"<b>Detail:</b> {action.detail}<br>"
+                results_html += f"<b>Detail:</b> {action.detail}<br>"
 
         else:  # error
-            h += f"<b>Result:</b> Error &mdash; {action.detail}<br>"
+            results_html += f"<b>Result:</b> Error &mdash; {action.detail}<br>"
 
-        h += "<br>"
+        results_html += "<br>"
+
+    # Reassemble in rep-facing order: what changed, then how it was found.
+    h += results_html
+    h += process_html
 
     # ── How to Verify ─────────────────────────────────────────────────────────
     all_urls: list[str] = []
@@ -1869,7 +1915,7 @@ def run_enrichment(company_id: str) -> None:
     based on the record's hierarchy_type property.
     """
     logger.info(f"Starting enrichment for company_id={company_id}")
-    hs = HubSpotClient()
+    hs = _get_hubspot_client()
     errors: list[str] = []
 
     portal_id = 0
@@ -1917,11 +1963,10 @@ def run_enrichment(company_id: str) -> None:
         except (ValueError, TypeError) as exc:
             logger.warning(f"Could not parse revops_enrichment_date={last_enriched_raw!r}: {exc}")
 
-    # ── Step 3: BigQuery client ───────────────────────────────────────────────
+    # ── Step 3: BigQuery client (shared across requests on this instance) ────
     bq_client = None
     try:
-        bq_client, auth_method = init_bigquery_client(BQ_PROJECT_ID, BQ_LOCATION)
-        logger.info(f"BigQuery connected via {auth_method}")
+        bq_client = _get_bigquery_client()
     except RuntimeError as exc:
         logger.error(f"BigQuery connection failed: {exc}")
         errors.append(f"BigQuery unavailable: {exc}")
@@ -2091,9 +2136,13 @@ def run_enrichment(company_id: str) -> None:
         workflow_label = f"Unknown hierarchy type: {hierarchy_type}"
 
     # ── Step 5: Process results → create/associate contacts in HubSpot ───────
-    actions: list[ContactAction] = []
+    # Each result's HubSpot writes + FullEnrich/MillionVerifier calls are
+    # independent, so they run concurrently (bounded by _CONTACT_MAX_WORKERS)
+    # instead of serially. _build_note() below reads `actions` by attribute
+    # (source_path, action, contact_name, …), never by position against
+    # `results`, so completion order here doesn't affect the note.
 
-    for result in results:
+    def _process_one_result(result: dict) -> ContactAction:
         found_name = result.get("found_name", "") or result.get("contact_name", "")
         found_title = result.get("found_title", "") or result.get("title", "")
         confidence = result.get("research_confidence", "not_found")
@@ -2105,7 +2154,7 @@ def run_enrichment(company_id: str) -> None:
         else:
             target_id = company_id
 
-        action = _process_found_contact(
+        return _process_found_contact(
             hs=hs,
             found_name=found_name,
             found_title=found_title,
@@ -2129,9 +2178,23 @@ def run_enrichment(company_id: str) -> None:
             research_source_name=result.get("research_source_name", ""),
             dh_executive_id=str(result.get("executive_id", "") or ""),
         )
-        actions.append(action)
-        if action.action == "error":
-            errors.append(f"Contact error ({found_name}): {action.detail}")
+
+    actions: list[ContactAction] = []
+    if results:
+        with ThreadPoolExecutor(max_workers=min(_CONTACT_MAX_WORKERS, len(results))) as executor:
+            future_to_result = {executor.submit(_process_one_result, result): result for result in results}
+            for future in as_completed(future_to_result):
+                result = future_to_result[future]
+                try:
+                    action = future.result()
+                except Exception as exc:
+                    found_name = result.get("found_name", "") or result.get("contact_name", "")
+                    logger.exception(f"Contact processing raised for '{found_name}': {exc}")
+                    errors.append(f"Contact error ({found_name}): {exc}")
+                    continue
+                actions.append(action)
+                if action.action == "error":
+                    errors.append(f"Contact error ({action.contact_name}): {action.detail}")
 
     # ── Step 6: Write summary note ────────────────────────────────────────────
     try:

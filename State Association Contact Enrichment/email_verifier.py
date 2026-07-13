@@ -27,11 +27,32 @@ import logging
 import os
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
 _API_URL = "https://api.millionverifier.com/api/v3/"
 _TIMEOUT = 10  # MV API's own internal timeout (seconds); requests timeout = _TIMEOUT + 2
+
+
+def _build_session() -> requests.Session:
+    """Shared, retrying, connection-pooled session — see fullenrich_client.py."""
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_session = _build_session()
 
 _RESULT_TO_STATUS: dict[str, str] = {
     "valid":    "VERIFIED",
@@ -75,7 +96,7 @@ def verify_email_millionverifier(email: str) -> dict:
         return dict(_UNVERIFIED)
 
     try:
-        resp = requests.get(
+        resp = _session.get(
             _API_URL,
             params={"api": api_key, "email": email.strip(), "timeout": _TIMEOUT},
             timeout=_TIMEOUT + 2,  # requests-level timeout slightly longer than MV's internal one
