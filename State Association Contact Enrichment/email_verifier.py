@@ -4,20 +4,25 @@ MillionVerifier email validation helper.
 Single public function: verify_email_millionverifier(email) -> dict
 
 Returned dict always contains these keys:
-    result    : "valid" | "invalid" | "unknown" | "catchall" | "skipped" | "error"
-    quality   : "good" | "ok" | "bad" | ""
+    result    : "ok" | "catch_all" | "unknown" | "invalid" | "disposable" | "skipped" | "error"
+                (the API's own words, passed through unchanged; "" if it sent none)
+    quality   : "good" | "risky" | "bad" | ""
     status    : "VERIFIED" | "INVALID" | "UNKNOWN" | "RISKY" | "UNVERIFIED" | "ERROR"
-    free      : bool  (True = free/disposable email provider)
+    free      : bool  (True = free email provider, e.g. gmail.com)
     role      : bool  (True = role-based address, e.g. admin@, info@)
     didyoumean: str   (typo suggestion from API, or "")
 
 The caller uses `status` for gating logic:
-    VERIFIED  → email confirmed deliverable; write to HubSpot
-    INVALID   → definitively bad; suppress email from HubSpot writes
-    RISKY     → catchall domain (domain accepts all addresses); write but flag
-    UNKNOWN   → could not determine; write but flag
+    VERIFIED  → email confirmed deliverable (API: ok); write to HubSpot
+    INVALID   → definitively bad (API: invalid, or disposable); suppress email
+                from HubSpot writes
+    RISKY     → catch-all domain (accepts any address, so the check proves
+                nothing; API: catch_all); write but flag
+    UNKNOWN   → the mail server would not answer (API: unknown); write but flag
     UNVERIFIED→ API key not configured; write but flag
-    ERROR     → network/API failure; write but flag
+    ERROR     → network failure, or the API refused the request (no credits,
+                bad key, blocked IP — HTTP 200 with the reason in `error`);
+                write but flag
 
 If MILLIONVERIFIER_API_KEY is unset, returns status="UNVERIFIED" immediately
 (no HTTP call made). All exceptions are caught; errors return status="ERROR".
@@ -54,11 +59,15 @@ def _build_session() -> requests.Session:
 
 _session = _build_session()
 
+# Keys are the words the v3 single API actually returns. This table once held
+# "valid" and "catchall", which the API never sends, so every deliverable and
+# catch-all address fell through to UNKNOWN.
 _RESULT_TO_STATUS: dict[str, str] = {
-    "valid":    "VERIFIED",
-    "invalid":  "INVALID",
-    "unknown":  "UNKNOWN",
-    "catchall": "RISKY",
+    "ok":         "VERIFIED",
+    "catch_all":  "RISKY",
+    "invalid":    "INVALID",
+    "disposable": "INVALID",
+    "unknown":    "UNKNOWN",
 }
 
 _UNVERIFIED: dict = {
@@ -107,8 +116,19 @@ def verify_email_millionverifier(email: str) -> dict:
         logger.warning("MillionVerifier request failed for %r: %s", email, exc)
         return dict(_ERROR)
 
+    # An account-level refusal arrives as HTTP 200 with an empty result.
+    if data.get("error"):
+        logger.warning("MillionVerifier refused %r: %s", email, data["error"])
+        return dict(_ERROR)
+
     mv_result  = str(data.get("result",  "")).lower()
     mv_quality = str(data.get("quality", "")).lower()
+
+    if mv_result not in _RESULT_TO_STATUS:
+        logger.warning(
+            "MillionVerifier returned unrecognised result %r for %r — treating as UNKNOWN",
+            mv_result, email,
+        )
 
     return {
         "result":     mv_result,
