@@ -136,7 +136,7 @@ class ContactAction:
     found_phone: str = ""
     found_linkedin: str = ""
     email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
-    email_validation_quality: str = ""  # good | ok | bad | ""
+    email_validation_quality: str = ""  # good | risky | bad | ""
     fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
     research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
     research_source_name: str = ""      # Human-readable name of the source (e.g. "WA HCAP directory")
@@ -148,7 +148,7 @@ class ContactAction:
     fe_updated_at: str = ""             # FullEnrich profile last-updated date (ISO string)
     match_method: str = ""              # "pre-populated ID" | "email search" | "name search" | ""
     days_since_enriched: int = -1       # Days since last enrichment; -1 = unknown (used for 30-day skip path)
-    found_phone_source: str = ""        # "Definitive Healthcare (direct line)" | "FullEnrich" | "existing HubSpot record" | ""
+    found_phone_source: str = ""        # "Definitive Healthcare (direct line)" | "existing HubSpot record" | ""
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -405,25 +405,6 @@ def _collect_additional_emails(fe_info: dict, primary_email: str) -> str:
     return ";".join(extras)
 
 
-def _phone_added_line(fe_info: dict) -> str:
-    """HTML block for a phone number discovered by FullEnrich and added to HubSpot."""
-    phone = fe_info.get("phone", "")
-    region = fe_info.get("phone_region", "")
-    display = f"{phone} ({region})" if region else phone
-    h = (
-        f"<b>✚ Phone added:</b> {display}<br>"
-        f"<b>Source:</b> FullEnrich professional phone data<br>"
-    )
-    others = [p for p in (fe_info.get("all_phones") or []) if p.get("number") and p["number"] != phone]
-    if others:
-        alt_list = ", ".join(
-            f"{p['number']} ({p['region']})" if p.get("region") else p["number"]
-            for p in others[:4]
-        )
-        h += f"<b>Additional numbers found:</b> {alt_list}<br>"
-    return h
-
-
 def _build_contact_enrichment_note(
     contact_name: str,
     contact_title: str,
@@ -514,7 +495,7 @@ def _enrich_and_associate_existing_contact(
     - 30-day re-enrichment guard
     - MillionVerifier email check (existing + found)
     - Definitive Healthcare email/phone write (avoids burning a FullEnrich credit)
-    - FullEnrich Bulk Enrich for any remaining missing fields
+    - FullEnrich Bulk Enrich for a work email, only when none is on file
     - LinkedIn URL population
     - data_freshness + most_recent_enrichment_date stamps
     - Enrichment note written to the contact record
@@ -661,11 +642,13 @@ def _enrich_and_associate_existing_contact(
         elif existing_phone:
             _base["found_phone_source"] = "existing HubSpot record"
 
-        # ── FullEnrich: fill fields still missing after DH data applied ───────
+        # ── FullEnrich: find a work email if DH, research and HubSpot have none ─
+        # FullEnrich is only asked for a work email (1 credit when found), so a
+        # contact that already has one never triggers a lookup, whatever else
+        # it lacks. Phones come from Definitive or the existing record.
         email_still_missing = not (existing_email or enriched_email)
-        phone_still_missing = not (existing_phone or enriched_phone)
 
-        if email_still_missing or phone_still_missing:
+        if email_still_missing:
             fe_first, fe_last = _split_name(found_name)
             fe_info = enrich_contact_info(
                 firstname=fe_first,
@@ -675,7 +658,7 @@ def _enrich_and_associate_existing_contact(
                 linkedin_url=found_linkedin,
             )
 
-            if email_still_missing and fe_info.get("email"):
+            if fe_info.get("email"):
                 new_email = fe_info["email"]
                 ev = verify_email_millionverifier(new_email)
                 enriched_email_status = ev.get("status", "")
@@ -693,12 +676,6 @@ def _enrich_and_associate_existing_contact(
                         f"<b>✗ Email suppressed:</b> {new_email}<br>"
                         f"<b>Reason:</b> FullEnrich found this address but MillionVerifier flagged it as INVALID<br>"
                     )
-
-            if phone_still_missing and fe_info.get("phone"):
-                pending_updates["phone"] = fe_info["phone"]
-                enriched_phone = fe_info["phone"]
-                _base["found_phone_source"] = "FullEnrich"
-                note_lines.append(_phone_added_line(fe_info))
 
             primary_for_extras = pending_updates.get("email") or existing_email or enriched_email
             alt_emails = _collect_additional_emails(fe_info, primary_for_extras)
@@ -785,9 +762,10 @@ def _create_and_enrich_new_contact(
 ) -> "ContactAction":
     """
     Create a new HubSpot contact with the found details, associate it with the
-    target company, then attempt FullEnrich Bulk Enrich for any missing fields.
+    target company, then attempt FullEnrich Bulk Enrich for a work email when
+    none was found.
 
-    Mutates *_base* in-place to reflect any email/phone obtained via FullEnrich.
+    Mutates *_base* in-place to reflect any email obtained via FullEnrich.
 
     Returns a ContactAction with action="created_new" or action="error".
     """
@@ -821,7 +799,7 @@ def _create_and_enrich_new_contact(
             **_base,
         )
 
-    # ── FullEnrich bulk enrich (fill missing email/phone) ─────────────────────
+    # ── FullEnrich bulk enrich (work email only; see the existing-contact path) ─
     new_note_lines: list[str] = []
     new_fe_info: dict = {}
     # Accumulate every post-creation property write into one batched PATCH
@@ -834,7 +812,7 @@ def _create_and_enrich_new_contact(
         _base["found_phone_source"] = "Definitive Healthcare (direct line)"
         new_note_lines.append(_phone_dh_line(found_phone))
 
-    if not email_to_use or not found_phone:
+    if not email_to_use:
         new_fe_info = enrich_contact_info(
             firstname=first,
             lastname=last,
@@ -843,7 +821,7 @@ def _create_and_enrich_new_contact(
             linkedin_url=found_linkedin,
         )
 
-        if not email_to_use and new_fe_info.get("email"):
+        if new_fe_info.get("email"):
             new_email = new_fe_info["email"]
             ev = verify_email_millionverifier(new_email)
             if ev.get("status") != "INVALID":
@@ -858,12 +836,6 @@ def _create_and_enrich_new_contact(
                     f"<b>✗ Email suppressed:</b> {new_email}<br>"
                     f"<b>Reason:</b> FullEnrich found this address but MillionVerifier flagged it as INVALID<br>"
                 )
-
-        if not found_phone and new_fe_info.get("phone"):
-            pending_updates["phone"] = new_fe_info["phone"]
-            _base["found_phone"] = new_fe_info["phone"]
-            _base["found_phone_source"] = "FullEnrich"
-            new_note_lines.append(_phone_added_line(new_fe_info))
 
         primary_for_extras = pending_updates.get("email") or email_to_use
         alt_emails = _collect_additional_emails(new_fe_info, primary_for_extras)

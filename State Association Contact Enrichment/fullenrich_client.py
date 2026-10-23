@@ -68,12 +68,19 @@ def _build_session() -> requests.Session:
     module at once — see _CONTACT_MAX_WORKERS in enrichment_processor.py and
     Cloud Run --concurrency). Without this, every call opened a fresh
     TCP+TLS connection to app.fullenrich.com.
+
+    Only GETs (the free status polls) are retried. Every POST here spends
+    credits, and a read timeout or 5xx on one does not mean it was not
+    processed: FullEnrich says simultaneous requests defeat its de-duplication,
+    so repeating the POST can bill the same contact twice. urllib3 still
+    repeats a POST that failed before it was sent (a refused connection),
+    which cannot have had any effect.
     """
     retry = Retry(
         total=3,
         backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        allowed_methods=["GET"],
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
@@ -639,7 +646,7 @@ def enrich_contact_info(
     linkedin_url: str = "",
 ) -> dict:
     """
-    Enrich a single contact via the FullEnrich v2 Bulk Enrich API to find email / phone.
+    Enrich a single contact via the FullEnrich v2 Bulk Enrich API to find a work email.
 
     API: POST https://app.fullenrich.com/api/v2/contact/enrich/bulk
     Auth: Authorization: Bearer <FULLENRICH_API_KEY>
@@ -652,12 +659,18 @@ def enrich_contact_info(
                 "last_name":  str,
                 "domain":     str,   # OR "company_name" if no domain
                 "linkedin_url": str, # optional, improves hit rate
-                "enrich_fields": ["contact.work_emails", "contact.personal_emails", "contact.phones"]
+                "enrich_fields": ["contact.work_emails"]
             }]
         }
 
+    Only work emails are requested (1 credit when found). Personal emails cost
+    3 and phones 10, and the outreach motion uses neither: phones come from
+    Definitive Healthcare or the existing HubSpot record. The returned dict
+    keeps its personal_email and phone keys so callers need not change; they
+    are always "".
+
     Submits one contact, polls GET /api/v2/contact/enrich/bulk/{id} until
-    status == "FINISHED" (up to 90 s), then extracts email and phone.
+    status == "FINISHED" (up to 90 s), then extracts the email.
 
     Priority for company identifier:
         1. domain (bare hostname, e.g. "edenhc.com") — most precise
@@ -665,7 +678,7 @@ def enrich_contact_info(
 
     Returns:
         {"email": str, "email_status": str, "personal_email": str, "phone": str}
-    Work email is preferred; personal_email is populated when work email is absent.
+    personal_email and phone are not requested, so they are always "".
     All values are "" on error, timeout, or missing data. Never raises.
     """
     _empty: dict = {"email": "", "email_status": "", "personal_email": "", "phone": ""}
@@ -684,7 +697,7 @@ def enrich_contact_info(
     contact_record: dict = {
         "first_name":    firstname,
         "last_name":     lastname,
-        "enrich_fields": ["contact.work_emails", "contact.personal_emails", "contact.phones"],
+        "enrich_fields": ["contact.work_emails"],
     }
     if bare_domain:
         contact_record["domain"] = bare_domain
