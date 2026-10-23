@@ -1,0 +1,12 @@
+# Test tooling. Not installed in the Docker image (the Dockerfile reads
+# requirements.txt only).
+#
+#   pip install -r requirements-dev.txt
+#   cd "State Association Contact Enrichment" && python -m pytest
+#
+# Check the production pins for known vulnerabilities with:
+#   pip-audit -r requirements.txt
+-r requirements.txt
+pytest==9.1.1
+# fastapi.testclient (test_webhook_server.py) needs httpx
+httpx==0.28.1

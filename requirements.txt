@@ -1,21 +1,30 @@
 # Web server
-fastapi==0.115.6
+fastapi==0.162.0
+# starlette is fastapi's own dependency. It is pinned here so a fastapi release
+# can't quietly resolve an older one: every starlette before 1.3.1 has published
+# advisories (pip-audit, 2026-10-23).
+starlette==1.9.0
 uvicorn[standard]==0.32.1
 
 # HTTP (used by state_association_matcher + hubspot_client)
-requests==2.32.3
+requests==2.34.2
 
 # Google Cloud
 google-cloud-bigquery==3.27.0
 google-cloud-storage==2.19.0
-google-cloud-tasks==2.16.3
+# google-cloud-tasks 2.16.3 caps protobuf below 5, which is where the fix for the
+# protobuf advisory lives, so it moves together with the protobuf pin below.
+google-cloud-tasks==2.23.0
 google-auth==2.37.0
 pandas==2.2.3
-pyarrow==18.1.0
+pyarrow==26.0.0
 db-dtypes==1.4.1
+# Transitive (google-cloud-*), pinned so the advisory fix can't be undone by a
+# resolver picking an older release.
+protobuf==5.29.6
 
 # YAML parsing (state_association_agent_guide.md)
 pyyaml==6.0.2
 
-# Local dev: load .env files
-python-dotenv==1.0.1
+# python-dotenv (the matcher's optional .env loading) comes with uvicorn[standard];
+# don't pin an older copy here. Test tooling lives in requirements-dev.txt.
