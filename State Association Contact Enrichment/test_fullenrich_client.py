@@ -31,12 +31,19 @@ import fullenrich_client as fe
 class _FakeFullEnrich:
     """Local stand-in for app.fullenrich.com that records every request."""
 
-    def __init__(self, post_status=200, post_delay=0.0, poll_statuses=(200,)):
+    def __init__(self, post_status=200, post_delay=0.0, poll_statuses=(200,), post_statuses=None,
+                 retry_after=None, rate_limit_message="", credits_balance=100, credits_status=200):
         self.post_status = post_status      # HTTP status for POSTs
+        self.post_statuses = list(post_statuses) if post_statuses else []   # one per POST, in order, then post_status
         self.post_delay = post_delay        # seconds to sit on a POST before replying
         self.poll_statuses = list(poll_statuses)   # one HTTP status per GET poll, in order
+        self.retry_after = retry_after      # Retry-After header on a 429
+        self.rate_limit_message = rate_limit_message   # body text on a 429, e.g. "Try again in 1m"
+        self.credits_balance = credits_balance
+        self.credits_status = credits_status
         self.posts: list[dict] = []         # JSON body of every POST received
-        self.gets: list[str] = []           # path of every GET received
+        self.gets: list[str] = []           # path of every status poll received
+        self.credit_gets = 0                # balance checks received
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -44,10 +51,14 @@ class _FakeFullEnrich:
                 pass
 
             def _reply(self, status, payload):
+                if status == 429 and outer.rate_limit_message:
+                    payload = {"error": outer.rate_limit_message}
                 body = json.dumps(payload).encode()
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
+                    if status == 429 and outer.retry_after is not None:
+                        self.send_header("Retry-After", str(outer.retry_after))
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
@@ -59,9 +70,13 @@ class _FakeFullEnrich:
                 outer.posts.append(json.loads(self.rfile.read(length) or b"{}"))
                 if outer.post_delay:
                     time.sleep(outer.post_delay)
-                self._reply(outer.post_status, {"enrichment_id": "enr-1", "people": []})
+                status = outer.post_statuses.pop(0) if outer.post_statuses else outer.post_status
+                self._reply(status, {"enrichment_id": "enr-1", "people": []})
 
             def do_GET(self):
+                if self.path.endswith("/credits"):
+                    outer.credit_gets += 1
+                    return self._reply(outer.credits_status, {"balance": outer.credits_balance})
                 outer.gets.append(self.path)
                 status = outer.poll_statuses.pop(0) if outer.poll_statuses else 200
                 if status != 200:
@@ -97,11 +112,14 @@ def fake(monkeypatch):
         started.append(server)
         monkeypatch.setattr(fe, "_ENRICH_URL", f"{server.base}/bulk")
         monkeypatch.setattr(fe, "_SEARCH_URL", f"{server.base}/search")
+        monkeypatch.setattr(fe, "_CREDITS_URL", f"{server.base}/credits")
         return server
 
     monkeypatch.setenv("FULLENRICH_API_KEY", "test-key")
     monkeypatch.setattr(fe, "_POLL_INTERVAL", 0)
+    fe._credits_cache.clear()
     yield start
+    fe._credits_cache.clear()
     for server in started:
         server.close()
 
@@ -173,3 +191,127 @@ def test_status_poll_is_still_retried_after_a_transient_error(fake):
     assert len(server.posts) == 1
     assert len(server.gets) == 2
     assert result["email"] == "jane.doe@facility.com"
+
+
+# ── A 429 on a submit was not processed, so it is waited out and repeated ──────
+
+@pytest.fixture
+def waits(monkeypatch):
+    """Record every wait instead of sleeping; keep only the rate-limit waits (poll interval is 0)."""
+    recorded: list[float] = []
+    monkeypatch.setattr(fe, "_sleep", recorded.append)
+    return lambda: [w for w in recorded if w]
+
+
+@pytest.fixture
+def plain_session(monkeypatch):
+    """A session with no urllib3 retries, so a 429 on a GET reaches our own handling at once."""
+    import requests
+    monkeypatch.setattr(fe, "_session", requests.Session())
+
+
+def test_a_rate_limited_submit_waits_out_the_limit_and_is_not_lost(fake, waits):
+    server = fake(post_statuses=[429, 429, 200], retry_after=7)
+
+    result = fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert len(server.posts) == 3
+    assert waits() == [7.0, 7.0]
+    assert result["email"] == "jane.doe@facility.com"
+
+
+def test_a_submit_that_stays_rate_limited_gives_up_after_a_few_tries(fake, waits):
+    server = fake(post_status=429, retry_after=1)
+
+    result = fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert len(server.posts) == fe._RATE_LIMIT_ATTEMPTS
+    assert result["email"] == ""
+
+
+def test_the_wait_follows_a_try_again_message_in_the_body_but_never_beyond_the_cap(fake, waits):
+    fake(post_statuses=[429, 200], rate_limit_message="Rate limit exceeded. Try again in 1m")
+
+    fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert waits() == [fe._RATE_LIMIT_MAX_WAIT_S]       # 1m = 60s, which is the cap
+
+
+def test_people_search_waits_out_a_rate_limit_the_same_way(fake, waits):
+    server = fake(post_statuses=[429, 200], retry_after=3)
+
+    fe._search_one_title(api_key="test-key", title="Administrator", domain="facility.com")
+
+    assert len(server.posts) == 2
+    assert waits() == [3.0]
+
+
+def test_the_wait_is_read_from_the_header_then_the_body_then_a_default():
+    from types import SimpleNamespace as R
+    assert fe._retry_after_seconds(R(headers={"Retry-After": "12"}, text="")) == 12.0
+    assert fe._retry_after_seconds(R(headers={}, text='{"error":"Try again in 30s"}')) == 30.0
+    assert fe._retry_after_seconds(R(headers={}, text="Try again in 2m")) == 120.0
+    assert fe._retry_after_seconds(R(headers={}, text="slow down")) == fe._RATE_LIMIT_DEFAULT_WAIT_S
+    assert fe._retry_after_seconds(R(headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, text="")) == fe._RATE_LIMIT_DEFAULT_WAIT_S
+
+
+# ── A 429 on a poll must not abandon an enrichment that is already paid for ────
+
+def test_a_rate_limited_status_poll_waits_and_still_returns_the_paid_result(fake, waits, plain_session):
+    server = fake(poll_statuses=[429, 429, 200], retry_after=5)
+
+    result = fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert len(server.posts) == 1                       # never resubmitted
+    assert len(server.gets) == 3
+    assert waits() == [5.0, 5.0]
+    assert result["email"] == "jane.doe@facility.com"
+
+
+def test_a_poll_that_stays_rate_limited_gives_up_at_the_cap_rather_than_forever(fake, waits, plain_session):
+    server = fake(poll_statuses=[429] * 100, retry_after=60)
+
+    result = fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert len(server.posts) == 1
+    assert len(server.gets) == 4                        # waits of 60, 60, 60 are within the 180s cap; the 4th is not
+    assert result["email"] == ""
+
+
+# ── The balance is checked before spending ─────────────────────────────────────
+
+def test_no_lookup_is_attempted_when_the_balance_is_zero(fake, caplog):
+    server = fake(credits_balance=0)
+
+    result = fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert server.posts == []
+    assert result["email"] == ""
+    assert "credits exhausted" in caplog.text.lower()
+
+
+def test_people_search_is_not_attempted_when_the_balance_is_zero(fake):
+    server = fake(credits_balance=0)
+
+    people = fe.search_facility_contacts("Valley View", "Bristol", "VA", ["Administrator"], domain="facility.com")
+
+    assert server.posts == []
+    assert people == []
+
+
+def test_a_failing_balance_check_does_not_block_the_lookup(fake, plain_session):
+    server = fake(credits_status=500)
+
+    result = fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+
+    assert len(server.posts) == 1
+    assert result["email"] == "jane.doe@facility.com"
+
+
+def test_the_balance_is_checked_once_per_window_not_once_per_lookup(fake):
+    server = fake()
+
+    fe.enrich_contact_info("Jane", "Doe", domain="facility.com")
+    fe.enrich_contact_info("John", "Roe", domain="facility.com")
+
+    assert server.credit_gets == 1
