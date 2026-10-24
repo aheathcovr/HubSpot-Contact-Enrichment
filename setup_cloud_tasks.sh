@@ -86,6 +86,23 @@ else
   echo "    Created."
 fi
 
+# ── 5b. Cap how many runs Cloud Tasks starts at once ──────────────────────────
+# Cloud Tasks' defaults are 1,000 concurrent dispatches and 500 a second, so a burst
+# of webhooks starts every run at the same moment. The 12 companies of 2026-09-24
+# started four cold Cloud Run instances and polled FullEnrich faster than its 60 calls
+# a minute. Four concurrent runs fill one instance (--concurrency=4); two a second is
+# plenty for a human-triggered flow. Run again with different numbers to change them:
+#   MAX_CONCURRENT_DISPATCHES=6 MAX_DISPATCHES_PER_SECOND=3 ./setup_cloud_tasks.sh
+MAX_CONCURRENT_DISPATCHES="${MAX_CONCURRENT_DISPATCHES:-4}"
+MAX_DISPATCHES_PER_SECOND="${MAX_DISPATCHES_PER_SECOND:-2}"
+echo "--- Setting dispatch limits (${MAX_CONCURRENT_DISPATCHES} concurrent, ${MAX_DISPATCHES_PER_SECOND}/s)..."
+gcloud tasks queues update "${QUEUE_NAME}" \
+  --location="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --max-concurrent-dispatches="${MAX_CONCURRENT_DISPATCHES}" \
+  --max-dispatches-per-second="${MAX_DISPATCHES_PER_SECOND}"
+echo "    Done."
+
 # ── 6. Get the Cloud Run service URL ──────────────────────────────────────────
 echo "--- Fetching Cloud Run service URL..."
 SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
