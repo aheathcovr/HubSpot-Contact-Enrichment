@@ -43,7 +43,9 @@ from hubspot_client import HubSpotClient, HubSpotError
 from state_association_matcher import (
     _build_facility_research_prompt,
     _format_hubspot_matches_enhanced,
+    HUBSPOT_MIRROR_MAX_AGE_HOURS,
     call_openrouter,
+    check_hubspot_mirror_freshness,
     find_facilities_missing_leadership,
     lookup_hubspot_contact_enhanced,
     parse_found_name,
@@ -1151,7 +1153,7 @@ def _enrich_existing_leadership(
             elif dh["confirmed"]:
                 dh_verified = True
                 dh_last_update_val = dh.get("dh_last_update", "")
-                table_label = {"executives": "Executives table", "full_feed": "Full Feed"}.get(
+                table_label = {"executives": "Executives table"}.get(
                     dh["source_table"], dh["source_table"]
                 )
                 update_str = f", updated {dh_last_update_val}" if dh_last_update_val else ""
@@ -1942,6 +1944,16 @@ def run_enrichment(company_id: str) -> None:
     except RuntimeError as exc:
         logger.error(f"BigQuery connection failed: {exc}")
         errors.append(f"BigQuery unavailable: {exc}")
+
+    # Contact matching reads a BigQuery copy of HubSpot. If that sync has frozen,
+    # say so on the company note too, so a rep reading it knows duplicates are possible.
+    if bq_client:
+        mirror_hours = check_hubspot_mirror_freshness(bq_client)
+        if mirror_hours is not None and mirror_hours > HUBSPOT_MIRROR_MAX_AGE_HOURS:
+            errors.append(
+                f"HubSpot data mirror is {mirror_hours:.0f} hours old: contacts added to HubSpot "
+                f"since then were not matched, so a duplicate is possible"
+            )
 
     # ── Step 4: Route by hierarchy type ──────────────────────────────────────
     results: list[dict] = []

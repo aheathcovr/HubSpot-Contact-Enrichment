@@ -8,7 +8,7 @@ Tests three specific Brookdale child facilities:
   44533717539 — Brookdale Bristol          (Bristol, VA)
 
 For each facility this script reports:
-  1. BigQuery Definitive Healthcare data available (Executives + Full Feed tables)
+  1. BigQuery Definitive Healthcare data available (Executives table)
   2. OpenRouter / Sonar Pro web research result
   3. Parse outcome (name, title, confidence, email, phone)
   4. Whether a HubSpot contact match was found in BQ
@@ -102,33 +102,6 @@ def bq_dh_executives(client, definitive_id: str) -> list[dict]:
         LOCATION_PHONE,
         STANDARDIZED_TITLE
     FROM `{DH_TABLES["executives"]}`
-    WHERE CAST(HOSPITAL_ID AS STRING) = '{definitive_id}'
-    ORDER BY TITLE
-    LIMIT 20
-    """
-    try:
-        rows = list(client.query(query).result())
-        return [dict(r) for r in rows]
-    except Exception as exc:
-        return [{"error": str(exc)}]
-
-
-def bq_dh_full_feed(client, definitive_id: str) -> list[dict]:
-    """
-    Pull contact records from the December Full Feed table for a given HOSPITAL_ID.
-
-    Actual schema: FIRST_NAME, LAST_NAME, TITLE, EMAIL, PHONE, LOCATION_PHONE
-    """
-    query = f"""
-    SELECT
-        FIRST_NAME,
-        LAST_NAME,
-        TITLE,
-        EMAIL,
-        PHONE,
-        LOCATION_PHONE,
-        HOSPITAL_NAME
-    FROM `{DH_TABLES["full_feed"]}`
     WHERE CAST(HOSPITAL_ID AS STRING) = '{definitive_id}'
     ORDER BY TITLE
     LIMIT 20
@@ -286,21 +259,6 @@ def run_diagnostic():
             else:
                 print(f"     ○ No rows in Executives table for HOSPITAL_ID={def_id}")
 
-        # ── 3. BigQuery: Definitive Healthcare Full Feed ──────────────────
-        print(f"\n  ③ BigQuery — Definitive Healthcare Full Feed (HOSPITAL_ID={def_id}):")
-        dh_feed = bq_dh_full_feed(client, def_id)
-        if dh_feed and "error" not in dh_feed[0]:
-            for e in dh_feed:
-                name = e.get('EXECUTIVE_NAME') or f"{e.get('FIRST_NAME','')} {e.get('LAST_NAME','')}".strip()
-                phone = e.get('PHONE') or e.get('LOCATION_PHONE') or ""
-                print(f"     • {name} | {e.get('TITLE','')} | {e.get('EMAIL','') or '(no email)'} | {phone or '(no phone)'}")
-        else:
-            error = dh_feed[0].get("error") if dh_feed else None
-            if error:
-                print(f"     ✗ Query error: {error}")
-            else:
-                print(f"     ○ No rows in Full Feed for HOSPITAL_ID={def_id}")
-
         # ── 4. BigQuery: ALF Overview (exec director fields) ──────────────
         print(f"\n  ④ BigQuery — ALF Overview (HOSPITAL_ID={def_id}):")
         alf = bq_alf_overview(client, def_id)
@@ -413,7 +371,6 @@ def run_diagnostic():
             "state": state,
             "definitive_id": def_id,
             "dh_executives_count": len([r for r in dh_execs if "error" not in r]),
-            "dh_feed_count": len([r for r in dh_feed if "error" not in r]),
             "alf_exec_name": "",  # ALF Overview has no embedded exec director fields
             "source_tier": source_tier,
             "found_name": found_name,
@@ -429,24 +386,22 @@ def run_diagnostic():
     print(f"\n\n{'=' * 72}")
     print("  DIAGNOSTIC SUMMARY")
     print(f"{'=' * 72}")
-    print(f"\n  {'Facility':<30} {'DH Execs':>8} {'DH Feed':>7} {'Tier':>4}  {'Found Name':<25} {'Conf':<12} {'Email?'}")
-    print(f"  {'-'*30} {'-'*8} {'-'*7} {'-'*4}  {'-'*25} {'-'*12} {'-'*6}")
+    print(f"\n  {'Facility':<30} {'DH Execs':>8} {'Tier':>4}  {'Found Name':<25} {'Conf':<12} {'Email?'}")
+    print(f"  {'-'*30} {'-'*8} {'-'*4}  {'-'*25} {'-'*12} {'-'*6}")
 
     for r in all_results:
         has_email = "✓" if r["found_email"] else "✗"
         found = r["found_name"][:24] if r["found_name"] else "(not found)"
         print(
             f"  {r['facility_name']:<30} {r['dh_executives_count']:>8} "
-            f"{r['dh_feed_count']:>7} {r['source_tier']:>4}  "
+            f"{r['source_tier']:>4}  "
             f"{found:<25} {r['confidence']:<12} {has_email}"
         )
 
     print(f"\n  ── BigQuery Definitive Healthcare assessment:")
     total_dh_execs = sum(r["dh_executives_count"] for r in all_results)
-    total_dh_feed  = sum(r["dh_feed_count"] for r in all_results)
     alf_names      = [r["alf_exec_name"] for r in all_results if r["alf_exec_name"]]
     print(f"     Exec rows found (Executives table): {total_dh_execs}")
-    print(f"     Exec rows found (Full Feed table):  {total_dh_feed}")
     print(f"     ALF Overview exec director names:   {alf_names or '(none)'}")
 
     found_count = sum(1 for r in all_results if r["found_name"] and r["confidence"] != "not_found")
