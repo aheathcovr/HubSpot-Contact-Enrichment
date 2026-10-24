@@ -46,6 +46,13 @@ RUNTIME_SA="${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 TASKS_SA="hubspot-enrichment-tasks@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA="hubspot-enrichment-build@${PROJECT_ID}.iam.gserviceaccount.com"
 
+# Secrets the service reads when they exist. A missing one is skipped, not an error:
+# BOUNCEBAN_API_KEY turns on the BounceBan second opinion behind MillionVerifier, and
+# the service runs the same without it. Creating one is a separate step (see the PR).
+OPTIONAL_SECRETS=(
+  BOUNCEBAN_API_KEY
+)
+
 # Must match the --set-secrets list in cloudbuild.yaml.
 SECRETS=(
   HUBSPOT_API_KEY
@@ -53,13 +60,6 @@ SECRETS=(
   MILLIONVERIFIER_API_KEY
   FULLENRICH_API_KEY
   HUBSPOT_WEBHOOK_SECRET
-)
-
-# Secrets the service reads when they exist. A missing one is skipped, not an error:
-# BOUNCEBAN_API_KEY turns on the BounceBan second opinion behind MillionVerifier, and
-# the service runs the same without it. Creating one is a separate step (see the PR).
-OPTIONAL_SECRETS=(
-  BOUNCEBAN_API_KEY
 )
 
 # Datasets the matcher reads: HubSpot_Airbyte (companies, contacts),
