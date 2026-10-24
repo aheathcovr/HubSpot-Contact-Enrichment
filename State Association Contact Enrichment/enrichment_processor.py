@@ -345,6 +345,8 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
         f"<b>Source:</b> {src}<br>"
         f"<b>MillionVerifier:</b> {mv_text}<br>"
     )
+    if mv_status == "INVALID" and ev.get("subresult"):
+        h += f"<em>Reason: {ev['subresult']}</em><br>"
     if mv_status == "UNKNOWN":
         h += "<em>Unknown means the check was inconclusive, not that the address is good or bad. Do not assume it will deliver.</em><br>"
     if ev.get("second_opinion") == "bounceban":

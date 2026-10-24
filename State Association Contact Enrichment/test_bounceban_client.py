@@ -216,6 +216,34 @@ def test_an_unknown_answer_is_asked_again_next_time(server):
     assert len(fake.requests) == 2
 
 
+def test_a_low_balance_is_reported_from_the_answer_with_no_extra_call(server, caplog):
+    fake = server()
+    fake_answer = {"email": "x@y.com", "result": "deliverable", "score": 100, "status": "success",
+                   "id": "chk-1", "credits_consumed": 1, "credits_remaining": 40}
+    with patch.object(bb._session, "get") as get:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = fake_answer
+        with caplog.at_level(logging.WARNING):
+            answer = bb.second_opinion("jane@facility.com")
+
+    assert answer["result"] == "ok"
+    flagged = [r for r in caplog.records if getattr(r, "json_fields", {}).get("alert") == "bounceban_credits_low"]
+    assert len(flagged) == 1
+    assert get.call_count == 1                              # the balance came with the answer
+    assert fake.requests == []
+
+
+def test_a_healthy_balance_is_not_reported(server, caplog):
+    answer = {"email": "x@y.com", "result": "deliverable", "score": 100, "status": "success", "credits_remaining": 6257}
+    with patch.object(bb._session, "get") as get:
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = answer
+        with caplog.at_level(logging.WARNING):
+            bb.second_opinion("jane@facility.com")
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 # ── Behind MillionVerifier ────────────────────────────────────────────────────
 
 def _mv_says(result, quality="risky"):
@@ -324,3 +352,10 @@ def test_unknown_no_longer_claims_microsoft_365_blocks_verification():
     for text in (line, added):
         assert "Microsoft 365" not in text and "M365" not in text
         assert "likely valid" not in text
+
+
+def test_the_note_shows_why_an_address_is_invalid():
+    import enrichment_processor as ep
+    line = ep._email_verification_line("ghost@facility.com", {"status": "INVALID", "result": "invalid", "subresult": "no_mailbox"})
+
+    assert "no_mailbox" in line

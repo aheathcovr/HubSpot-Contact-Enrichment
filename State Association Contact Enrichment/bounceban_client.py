@@ -56,6 +56,8 @@ _GUARANTEED_SCORE = 99
 _STOP_STATUSES = {401: "bad or missing API key", 403: "out of credits", 405: "account blocked"}
 _STOP_FOR_S = 600
 _ANSWER_TTL_S = 6 * 3600
+_LOW_CREDITS = 200            # every answer carries `credits_remaining`; warn before it runs out
+_WARNING_INTERVAL_S = 600
 
 # No automatic retries: what is repeated is decided here, because billing differs by call.
 _session = requests.Session()
@@ -64,14 +66,16 @@ _sleep = time.sleep          # replaced in tests so waits are recorded, not slep
 _lock = threading.Lock()
 _answers: dict = {}          # address -> (monotonic time, answer)
 _stopped_until = 0.0         # monotonic time before which nothing is asked
+_last_low_credits_warning = None
 
 
 def reset_state() -> None:
     """Forget remembered answers and any stop. For tests."""
-    global _stopped_until
+    global _stopped_until, _last_low_credits_warning
     with _lock:
         _answers.clear()
         _stopped_until = 0.0
+        _last_low_credits_warning = None
 
 
 def _score(row: dict) -> int:
@@ -137,6 +141,27 @@ def _ask(address: str, key: str):
     return None
 
 
+def _report_credits(row: dict) -> None:
+    """Warn, at most every ten minutes, when the balance that came with the answer is low.
+    -1 means unlimited, so only 0 up to the threshold counts."""
+    global _last_low_credits_warning
+    remaining = row.get("credits_remaining")
+    if not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+        return
+    if not 0 <= remaining < _LOW_CREDITS:
+        return
+    now = time.monotonic()
+    with _lock:
+        last = _last_low_credits_warning
+        if last is not None and now - last < _WARNING_INTERVAL_S:
+            return
+        _last_low_credits_warning = now
+    logger.warning(
+        "BounceBan has %s credits left", remaining,
+        extra={"json_fields": {"alert": "bounceban_credits_low", "credits": remaining}},
+    )
+
+
 def second_opinion(email: str):
     """
     BounceBan's answer for *email* in MillionVerifier's words, or None when there is no
@@ -158,6 +183,7 @@ def second_opinion(email: str):
     row = _ask(address, key)
     if row is None:
         return None
+    _report_credits(row)
     answer = {
         "result": translate(row),
         "score": _score(row),
