@@ -41,6 +41,7 @@ from email_verifier import verify_email_millionverifier
 from fullenrich_client import enrich_contact_info, search_facility_contacts
 from hubspot_client import HubSpotClient, HubSpotError
 from identity_gate import same_org_or_affiliate
+from seamless_client import lookup_person as seamless_lookup
 from state_association_matcher import (
     _build_facility_research_prompt,
     _format_hubspot_matches_enhanced,
@@ -150,7 +151,7 @@ class ContactAction:
     fe_updated_at: str = ""             # FullEnrich profile last-updated date (ISO string)
     match_method: str = ""              # "pre-populated ID" | "email search" | "name search" | ""
     days_since_enriched: int = -1       # Days since last enrichment; -1 = unknown (used for 30-day skip path)
-    found_phone_source: str = ""        # "Definitive Healthcare (direct line)" | "existing HubSpot record" | ""
+    found_phone_source: str = ""        # "Definitive Healthcare (direct line)" | "existing HubSpot record" | "Seamless" | ""
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -404,6 +405,89 @@ def _email_held_line(email: str) -> str:
         f"company's address (the person may have moved), so it was not verified or written. "
         f"Check it by hand before using it.<br>"
     )
+
+
+@dataclass
+class _SeamlessOutcome:
+    """What a Seamless lookup produced for one contact, already screened."""
+    phone: str = ""
+    phone_line: str = ""
+    email: str = ""
+    ev: dict = field(default_factory=dict)
+    email_line: str = ""
+    linkedin: str = ""
+    note_lines: list = field(default_factory=list)
+
+
+def _seamless_phone_line(sl: dict) -> str:
+    kind = sl.get("phone_type") or "phone"
+    confidence = sl.get("phone_confidence")
+    detail = f"{kind}, {confidence:.0f}% confidence" if confidence is not None else kind
+    return f"<b>✚ Phone added:</b> {sl['phone']}<br><b>Source:</b> Seamless ({detail})<br>"
+
+
+def _seamless_email_added_line(email: str, sl: dict, ev: dict) -> str:
+    mv_text = {
+        "VERIFIED": "✓ Verified", "INVALID": "✗ Invalid", "RISKY": "~ Risky (catch-all)",
+        "UNKNOWN": "? Unknown — inconclusive", "UNVERIFIED": "Not checked", "ERROR": "Error",
+    }.get(ev.get("status", ""), ev.get("status", ""))
+    confidence = sl.get("email_confidence")
+    detail = f" ({confidence:.0f}% confidence)" if confidence is not None else ""
+    return (
+        f"<b>✚ Email added:</b> {email}<br>"
+        f"<b>Source:</b> Seamless{detail}, used only because no other source had one<br>"
+        f"<b>MillionVerifier:</b> {mv_text}<br>"
+    )
+
+
+def _seamless_fill(
+    first: str, last: str, *, need_email: bool, need_phone: bool, found_title: str,
+    facility_domain: str, facility_name: str, operator_name: str,
+) -> _SeamlessOutcome:
+    """
+    Ask Seamless for what is still missing, and screen what comes back.
+
+    One call serves both gaps, and nothing is asked when neither is open. The phone is
+    judged by the client (do-not-call, switchboards, non-US, confidence). The email is a
+    FALLBACK: it must be at the facility or its operator (else held, and not paid to
+    verify) and must verify. A person Seamless shows at a different organisation yields
+    nothing, and the note says where they are.
+    """
+    out = _SeamlessOutcome()
+    if not (need_email or need_phone):
+        return out
+    sl = seamless_lookup(
+        first, last, domain=facility_domain, company=facility_name,
+        operator_name=operator_name, title=found_title,
+    )
+    if not sl:
+        return out
+    out.linkedin = sl.get("linkedin", "")
+    if sl.get("moved"):
+        out.note_lines.append(
+            f"<b>⚠ Seamless:</b> {first} {last} appears to have moved to {sl.get('company') or 'another organisation'}. "
+            f"Their phone and email were not used.<br>"
+        )
+        return out
+    if need_phone:
+        if sl.get("phone"):
+            out.phone, out.phone_line = sl["phone"], _seamless_phone_line(sl)
+        elif sl.get("phone_rejected") and sl["phone_rejected"] != "no phone returned":
+            out.note_lines.append(f"<b>Seamless phone not used:</b> {sl['phone_rejected']}<br>")
+    if need_email and sl.get("email"):
+        email = sl["email"]
+        if not _belongs_to_operator(email, facility_domain, facility_name, operator_name):
+            out.note_lines.append(_email_held_line(email))
+        else:
+            ev = verify_email_millionverifier(email)
+            if ev.get("status") != "INVALID":
+                out.email, out.ev, out.email_line = email, ev, _seamless_email_added_line(email, sl, ev)
+            else:
+                out.note_lines.append(
+                    f"<b>✗ Email suppressed:</b> {email}<br>"
+                    f"<b>Reason:</b> Seamless found this address but MillionVerifier flagged it as INVALID<br>"
+                )
+    return out
 
 
 def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
@@ -746,12 +830,40 @@ def _enrich_and_associate_existing_contact(
             if alt_emails:
                 pending_updates["hs_additional_emails"] = alt_emails
 
+        # ── Seamless: the phone, and an email if nobody else found one ────────
+        # Phones come from Definitive or the existing record, then Seamless (FullEnrich is
+        # asked for email only). An existing value is never overwritten.
+        sl_first, sl_last = _split_name(found_name)
+        seamless = _seamless_fill(
+            sl_first, sl_last,
+            need_email=not (existing_email or enriched_email),
+            need_phone=not (existing_phone or enriched_phone),
+            found_title=found_title, facility_domain=facility_domain,
+            facility_name=facility_name, operator_name=operator_name,
+        )
+        note_lines.extend(seamless.note_lines)
+        if seamless.phone:
+            pending_updates["phone"] = seamless.phone
+            enriched_phone = seamless.phone
+            _base["found_phone_source"] = "Seamless"
+            note_lines.append(seamless.phone_line)
+        if seamless.email:
+            pending_updates["email"] = seamless.email
+            pending_updates.update(_verification_properties(seamless.ev))
+            enriched_email = seamless.email
+            enriched_email_status = seamless.ev.get("status", "")
+            enriched_email_quality = seamless.ev.get("quality", "")
+            enriched_email_result = seamless.ev.get("result", "")
+            note_lines.append(seamless.email_line)
+
         # ── LinkedIn URL if we have it and the contact doesn't ────────────────
-        linkedin_to_write = found_linkedin or fe_info.get("linkedin_url", "")
+        linkedin_to_write = found_linkedin or fe_info.get("linkedin_url", "") or seamless.linkedin
         if linkedin_to_write and not existing_linkedin:
             pending_updates["hs_linkedin_url"] = linkedin_to_write
             source = "Definitive Healthcare" if source_path == "definitive_healthcare" and found_linkedin else (
-                "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
+                "FullEnrich People Search" if found_linkedin else (
+                    "FullEnrich Bulk Enrich" if fe_info.get("linkedin_url") else "Seamless"
+                )
             )
             note_lines.append(
                 f"<b>✚ LinkedIn added:</b> <a href=\"{linkedin_to_write}\">{linkedin_to_write}</a><br>"
@@ -922,6 +1034,35 @@ def _create_and_enrich_new_contact(
                 f"<b>✚ LinkedIn added:</b> <a href=\"{new_fe_info['linkedin_url']}\">{new_fe_info['linkedin_url']}</a><br>"
                 f"<b>Source:</b> FullEnrich Bulk Enrich<br>"
             )
+
+    # ── Seamless: the phone, and an email if nobody else found one ────────────
+    seamless = _seamless_fill(
+        first, last,
+        need_email=not (email_to_use or pending_updates.get("email")),
+        need_phone=not found_phone,
+        found_title=found_title, facility_domain=facility_domain,
+        facility_name=facility_name, operator_name=operator_name,
+    )
+    new_note_lines.extend(seamless.note_lines)
+    if seamless.phone:
+        pending_updates["phone"] = seamless.phone
+        _base["found_phone"] = seamless.phone
+        _base["found_phone_source"] = "Seamless"
+        new_note_lines.append(seamless.phone_line)
+    if seamless.email:
+        pending_updates["email"] = seamless.email
+        pending_updates.update(_verification_properties(seamless.ev))
+        _base["found_email"] = seamless.email
+        _base["email_validation_status"] = seamless.ev.get("status", "")
+        _base["email_validation_quality"] = seamless.ev.get("quality", "")
+        _base["email_validation_result"] = seamless.ev.get("result", "")
+        new_note_lines.append(seamless.email_line)
+    if seamless.linkedin and not found_linkedin and not pending_updates.get("hs_linkedin_url"):
+        pending_updates["hs_linkedin_url"] = seamless.linkedin
+        new_note_lines.append(
+            f"<b>✚ LinkedIn added:</b> <a href=\"{seamless.linkedin}\">{seamless.linkedin}</a><br>"
+            f"<b>Source:</b> Seamless<br>"
+        )
 
     if data_freshness_value:
         pending_updates["data_freshness_according_to_definitive"] = data_freshness_value
