@@ -2335,7 +2335,6 @@ def search_facility_website_for_leadership(
                 extra_params=extra_params,
                 timeout=W2_TIMEOUT,
             )
-        time.sleep(W1_RATE_LIMIT_SECONDS)
         data = json.loads(raw)
         contacts = data.get("contacts", [])
     except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
@@ -2435,7 +2434,6 @@ def search_corporation_website_for_executives(
                 extra_params=extra_params,
                 timeout=W2_TIMEOUT,
             )
-        time.sleep(W2_RATE_LIMIT_SECONDS)
         data = json.loads(raw)
         contacts = data.get("contacts", [])
     except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
