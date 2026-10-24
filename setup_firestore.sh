@@ -103,7 +103,7 @@ echo "--- roles/datastore.user for ${RUNTIME_SA}"
 run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --member="serviceAccount:${RUNTIME_SA}" \
       --role="roles/datastore.user" \
-      --condition=None --quiet
+      --condition=None --quiet --format=none
 
 # ── 4. Finished jobs delete themselves ────────────────────────────────────────
 echo "--- TTL on ${COLLECTION}.${TTL_FIELD}"
