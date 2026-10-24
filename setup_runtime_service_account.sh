@@ -55,10 +55,13 @@ SECRETS=(
   HUBSPOT_WEBHOOK_SECRET
 )
 
-# Datasets the matcher reads: HubSpot_Airbyte (companies, contacts),
+# Datasets the matcher reads: HubSpot_Airbyte_Self_Hosted (the current HubSpot
+# mirror: companies, contacts; HubSpot_Airbyte stopped syncing on 2026-09-29),
 # definitive_healthcare (the DH tables), state_associations (state association table).
+# This script only ever adds access: if the account was granted HubSpot_Airbyte
+# before, that grant is now unused and can be removed by hand.
 DATASETS=(
-  HubSpot_Airbyte
+  HubSpot_Airbyte_Self_Hosted
   definitive_healthcare
   state_associations
 )
@@ -164,7 +167,7 @@ echo "  1. Verify the account can do its job before switching. Impersonating it"
 echo "     needs roles/iam.serviceAccountTokenCreator on it (Owner does not include"
 echo "     that); grant it temporarily and remove it afterwards:"
 echo "       CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=${RUNTIME_SA} \\"
-echo "         bq query --use_legacy_sql=false 'SELECT COUNT(*) FROM \`${PROJECT_ID}.HubSpot_Airbyte.companies\`'"
+echo "         bq query --use_legacy_sql=false 'SELECT COUNT(*) FROM \`${PROJECT_ID}.HubSpot_Airbyte_Self_Hosted.companies\`'"
 echo ""
 echo "  2. Switch the service (creates a new revision):"
 echo "       gcloud run services update ${SERVICE_NAME} --region=${REGION} \\"
