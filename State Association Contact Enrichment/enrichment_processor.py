@@ -334,7 +334,7 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
         "VERIFIED":   "✓ Verified — inbox confirmed deliverable",
         "INVALID":    "✗ Invalid — address does not exist or will bounce",
         "RISKY":      "~ Risky — catch-all domain; deliverability uncertain",
-        "UNKNOWN":    "? Unknown — mail server blocked SMTP probe",
+        "UNKNOWN":    "? Unknown — the mail server would not confirm this address either way",
         "UNVERIFIED": "Not checked (API key not configured)",
         "ERROR":      "Error — validation attempt failed",
     }.get(mv_status, mv_status)
@@ -345,8 +345,15 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
         f"<b>Source:</b> {src}<br>"
         f"<b>MillionVerifier:</b> {mv_text}<br>"
     )
+    if mv_status == "INVALID" and ev.get("subresult"):
+        h += f"<em>Reason: {ev['subresult']}</em><br>"
     if mv_status == "UNKNOWN":
-        h += "<em>Microsoft 365 / Exchange Online blocks SMTP verification probes as anti-spam protection — Unknown does not mean the email is invalid.</em><br>"
+        h += "<em>Unknown means the check was inconclusive, not that the address is good or bad. Do not assume it will deliver.</em><br>"
+    if ev.get("second_opinion") == "bounceban":
+        h += (
+            f"<b>BounceBan:</b> re-checked MillionVerifier's {ev.get('mv_result', '')} answer "
+            f"(score {ev.get('bounceban_score', '')})<br>"
+        )
     if fe_email_status:
         fe_text = {"DELIVERABLE": "✓ Deliverable", "NOT_DELIVERABLE": "✗ Not deliverable"}.get(fe_email_status, fe_email_status)
         h += f"<b>FullEnrich:</b> {fe_text}<br>"
@@ -366,7 +373,7 @@ def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
     mv_status = ev.get("status", "")
     mv_text = {
         "VERIFIED": "✓ Verified", "INVALID": "✗ Invalid", "RISKY": "~ Risky",
-        "UNKNOWN": "? Unknown (M365 blocks SMTP probe — likely valid)",
+        "UNKNOWN": "? Unknown — inconclusive",
         "UNVERIFIED": "Not checked", "ERROR": "Error",
     }.get(mv_status, mv_status)
     return (
@@ -1710,7 +1717,7 @@ def _build_note(
             "VERIFIED":   "✓ Verified — inbox confirmed deliverable",
             "INVALID":    "✗ Invalid — address does not exist",
             "RISKY":      "~ Risky — catch-all domain; deliverability uncertain",
-            "UNKNOWN":    "? Unverifiable (M365 blocks SMTP probe — likely valid)",
+            "UNKNOWN":    "? Unverifiable — inconclusive",
             "UNVERIFIED": "not checked (API key not configured)",
             "ERROR":      "validation error",
         }
@@ -1776,7 +1783,7 @@ def _build_note(
                 elif vstatus == "RISKY":
                     v_suffix = " <em>~ risky/catchall" + (f" &mdash; quality: {vquality}" if vquality else "") + "</em>"
                 elif vstatus == "UNKNOWN":
-                    v_suffix = " <em>? unverifiable (M365 blocks SMTP probe &mdash; likely valid)</em>"
+                    v_suffix = " <em>? unverifiable &mdash; inconclusive</em>"
                 elif vstatus == "UNVERIFIED":
                     v_suffix = " <em>(not validated &mdash; API key not configured)</em>"
                 elif vstatus == "ERROR":

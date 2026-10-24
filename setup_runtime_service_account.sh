@@ -46,6 +46,13 @@ RUNTIME_SA="${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 TASKS_SA="hubspot-enrichment-tasks@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA="hubspot-enrichment-build@${PROJECT_ID}.iam.gserviceaccount.com"
 
+# Secrets the service reads when they exist. A missing one is skipped, not an error:
+# BOUNCEBAN_API_KEY turns on the BounceBan second opinion behind MillionVerifier, and
+# the service runs the same without it. Creating one is a separate step (see the PR).
+OPTIONAL_SECRETS=(
+  BOUNCEBAN_API_KEY
+)
+
 # Must match the --set-secrets list in cloudbuild.yaml.
 SECRETS=(
   HUBSPOT_API_KEY
@@ -87,6 +94,20 @@ for secret in "${SECRETS[@]}"; do
     --project="${PROJECT_ID}" \
     --condition=None --quiet >/dev/null
   echo "    ${secret}"
+done
+
+echo "--- Granting secretAccessor on optional secrets that exist..."
+for secret in "${OPTIONAL_SECRETS[@]}"; do
+  if gcloud secrets describe "${secret}" --project="${PROJECT_ID}" &>/dev/null; then
+    gcloud secrets add-iam-policy-binding "${secret}" \
+      --member="serviceAccount:${RUNTIME_SA}" \
+      --role="roles/secretmanager.secretAccessor" \
+      --project="${PROJECT_ID}" \
+      --condition=None --quiet >/dev/null
+    echo "    ${secret}"
+  else
+    echo "    ${secret}: no such secret yet, skipped"
+  fi
 done
 
 # ── 3. BigQuery: permission to run query jobs ─────────────────────────────────
