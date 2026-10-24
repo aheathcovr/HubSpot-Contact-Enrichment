@@ -26,7 +26,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -440,12 +440,42 @@ def _seamless_email_added_line(email: str, sl: dict, ev: dict) -> str:
     )
 
 
+# Seamless calls started ahead of FullEnrich (see _seamless_start). Sized for every contact
+# of every run one Cloud Run instance can hold at once (concurrency 4 x 3 contacts), so a
+# start never queues behind another.
+_SEAMLESS_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="seamless")
+
+
+def _seamless_start(
+    first: str, last: str, *, found_title: str, facility_domain: str, facility_name: str,
+    operator_name: str,
+) -> Future:
+    """
+    Start the Seamless lookup now, to be handed to _seamless_fill(prefetched=...) later.
+
+    Only for a contact that is missing a phone: that contact is researched at Seamless
+    whatever FullEnrich finds, so starting early costs no extra lookup and the contact
+    waits for the slower vendor instead of both, one after the other. The call is the same
+    one _seamless_fill would have made; what to use from the answer is still decided there,
+    once FullEnrich has answered.
+    """
+    return _SEAMLESS_POOL.submit(
+        seamless_lookup, first, last, domain=facility_domain, company=facility_name,
+        operator_name=operator_name, title=found_title,
+    )
+
+
 def _seamless_fill(
     first: str, last: str, *, need_email: bool, need_phone: bool, found_title: str,
     facility_domain: str, facility_name: str, operator_name: str,
+    prefetched: "Future | None" = None,
 ) -> _SeamlessOutcome:
     """
     Ask Seamless for what is still missing, and screen what comes back.
+
+    *prefetched* is the lookup _seamless_start began earlier; it is waited for here instead
+    of making the call now. It is only ever passed when a phone is missing, so it is a call
+    this function would have made anyway.
 
     One call serves both gaps, and nothing is asked when neither is open. The phone is
     judged by the client (do-not-call, switchboards, non-US, confidence). The email is a
@@ -456,10 +486,13 @@ def _seamless_fill(
     out = _SeamlessOutcome()
     if not (need_email or need_phone):
         return out
-    sl = seamless_lookup(
-        first, last, domain=facility_domain, company=facility_name,
-        operator_name=operator_name, title=found_title,
-    )
+    if prefetched is not None:
+        sl = prefetched.result()
+    else:
+        sl = seamless_lookup(
+            first, last, domain=facility_domain, company=facility_name,
+            operator_name=operator_name, title=found_title,
+        )
     if not sl:
         return out
     out.linkedin = sl.get("linkedin", "")
@@ -790,6 +823,19 @@ def _enrich_and_associate_existing_contact(
         # it lacks. Phones come from Definitive or the existing record.
         email_still_missing = not (existing_email or enriched_email)
 
+        # A contact with no phone is researched at Seamless whatever FullEnrich finds, so when
+        # FullEnrich is about to run, Seamless starts now and the two waits overlap. One with a
+        # phone is asked at Seamless only if FullEnrich finds no email, and after it: asking
+        # early would pay for a lookup a FullEnrich email makes unnecessary. FullEnrich does
+        # not raise (it returns an empty answer), so the early call is never left orphaned.
+        sl_first, sl_last = _split_name(found_name)
+        seamless_early = None
+        if email_still_missing and not (existing_phone or enriched_phone):
+            seamless_early = _seamless_start(
+                sl_first, sl_last, found_title=found_title, facility_domain=facility_domain,
+                facility_name=facility_name, operator_name=operator_name,
+            )
+
         if email_still_missing:
             fe_first, fe_last = _split_name(found_name)
             fe_info = enrich_contact_info(
@@ -833,13 +879,13 @@ def _enrich_and_associate_existing_contact(
         # ── Seamless: the phone, and an email if nobody else found one ────────
         # Phones come from Definitive or the existing record, then Seamless (FullEnrich is
         # asked for email only). An existing value is never overwritten.
-        sl_first, sl_last = _split_name(found_name)
         seamless = _seamless_fill(
             sl_first, sl_last,
             need_email=not (existing_email or enriched_email),
             need_phone=not (existing_phone or enriched_phone),
             found_title=found_title, facility_domain=facility_domain,
             facility_name=facility_name, operator_name=operator_name,
+            prefetched=seamless_early,
         )
         note_lines.extend(seamless.note_lines)
         if seamless.phone:
@@ -992,6 +1038,15 @@ def _create_and_enrich_new_contact(
         _base["found_phone_source"] = "Definitive Healthcare (direct line)"
         new_note_lines.append(_phone_dh_line(found_phone))
 
+    # See the existing-contact path: no phone means Seamless is asked anyway, so it starts
+    # before FullEnrich and the two waits overlap.
+    seamless_early = None
+    if not email_to_use and not found_phone:
+        seamless_early = _seamless_start(
+            first, last, found_title=found_title, facility_domain=facility_domain,
+            facility_name=facility_name, operator_name=operator_name,
+        )
+
     if not email_to_use:
         new_fe_info = enrich_contact_info(
             firstname=first,
@@ -1042,6 +1097,7 @@ def _create_and_enrich_new_contact(
         need_phone=not found_phone,
         found_title=found_title, facility_domain=facility_domain,
         facility_name=facility_name, operator_name=operator_name,
+        prefetched=seamless_early,
     )
     new_note_lines.extend(seamless.note_lines)
     if seamless.phone:
