@@ -26,6 +26,27 @@ def _domain_of(email: object) -> str:
     return text.split("@")[-1].strip().lower() if "@" in text else ""
 
 
+_HOST_RE = re.compile(r"[a-z0-9.-]+")
+
+
+def bare_domain(value: object) -> str:
+    """
+    The host name in a website or domain value, or "" when it is not one.
+
+    HubSpot stores a company's `website` as a URL, and that is what the pipeline passes
+    around as the "domain": "https://www.valleyview.org/about?x=1" is "valleyview.org".
+    Scheme, user info, port, path, query, fragment, `www.` and case are all dropped. A
+    value with no dotted host name in it ("https://", "N/A", "localhost") is "", so a
+    caller can fall back to something else instead of sending garbage on.
+    """
+    text = "" if value is None else str(value).strip().lower()
+    text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+    text = re.split(r"[/?#]", text, maxsplit=1)[0]
+    text = text.rsplit("@", 1)[-1].split(":", 1)[0]
+    text = text.removeprefix("www.").strip(".")
+    return text if "." in text and _HOST_RE.fullmatch(text) else ""
+
+
 def same_org_domain(email: object, domain: object) -> bool:
     """
     Is this address at the organisation's domain (the strict test)?
@@ -37,8 +58,8 @@ def same_org_domain(email: object, domain: object) -> bool:
     address = _domain_of(email)
     if not address:
         return False
-    host = str(domain or "").strip().lower().removeprefix("www.").split("/")[0]
-    if not host or "." not in host:
+    host = bare_domain(domain)
+    if not host:
         return False
     return (address == host
             or address.endswith(f".{host}")

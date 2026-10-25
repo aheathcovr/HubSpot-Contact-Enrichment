@@ -46,6 +46,14 @@ def _contact(**over) -> dict:
     return base
 
 
+def _identifies_a_person(item: dict) -> bool:
+    """Seamless needs a name with a company name or a real host name, or an email or profile URL."""
+    host = str(item.get("domain") or "")
+    host_ok = bool(host) and "." in host and not any(c in host for c in ":/?# ")
+    return bool(item.get("email") or item.get("liProfileUrl")
+                or (item.get("contactName") and (item.get("companyName") or host_ok)))
+
+
 class _FakeSeamless:
     """Local stand-in for api.seamless.ai: submit research, then poll for it."""
 
@@ -83,7 +91,12 @@ class _FakeSeamless:
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
-                outer.submits.append(json.loads(self.rfile.read(length) or b"{}"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                outer.submits.append(body)
+                if not all(_identifies_a_person(item) for item in body.get("contacts") or []):
+                    # What the real API answered when it was sent domain "https:" (2026-10-25).
+                    return self._send(400, {"status": 400, "code": "invalidArguments",
+                                            "msg": "Contacts are missing required properties."})
                 outer.auth.append({"Token": self.headers.get("Token"), "Authorization": self.headers.get("Authorization")})
                 status = outer.submit_statuses.pop(0) if outer.submit_statuses else 200
                 if status == 200:
@@ -380,3 +393,42 @@ def test_the_same_person_is_researched_once_per_window(server):
     _lookup()
 
     assert len(fake.submits) == 1
+
+
+# ── What the pipeline really passes as the "domain" ───────────────────────────
+# HubSpot's `website` property is a URL, and that is what reaches this client as `domain`.
+# Cutting it at the first slash left "https:", which Seamless rejected with a 400 on the
+# first real run (2026-10-25), so no phone was ever looked up.
+
+@pytest.mark.parametrize("website", [
+    "https://www.valleyview.org/about?x=1",
+    "https://valleyview.org/",
+    "HTTP://ValleyView.org",
+    "valleyview.org:8080/contact",
+    "www.valleyview.org",
+    "  valleyview.org  ",
+])
+def test_a_website_url_is_sent_as_its_bare_host_name(server, website):
+    s = server()
+
+    result = sl.lookup_person("Jane", "Doe", domain=website, company="Valley View Care Center")
+
+    assert result is not None
+    assert s.submits[0]["contacts"] == [{"contactName": "Jane Doe", "domain": "valleyview.org"}]
+
+
+@pytest.mark.parametrize("junk", ["https://", "N/A", "none", "http:///x", "localhost", "valley view.org"])
+def test_a_value_that_is_not_a_host_name_falls_back_to_the_company_name(server, junk):
+    s = server()
+
+    result = sl.lookup_person("Jane", "Doe", domain=junk, company="Valley View Care Center")
+
+    assert result is not None
+    assert s.submits[0]["contacts"] == [{"contactName": "Jane Doe", "companyName": "Valley View Care Center"}]
+
+
+def test_with_neither_a_host_name_nor_a_company_nothing_is_sent(server):
+    s = server()
+
+    assert sl.lookup_person("Jane", "Doe", domain="https://", company="") is None
+    assert s.submits == []
