@@ -470,3 +470,81 @@ def test_a_reply_that_is_neither_success_nor_a_known_failure_is_not_taken_as_an_
 
     assert sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center") is None
     assert s.poll_count == 0
+
+
+# ── Say what happened ─────────────────────────────────────────────────────────
+# Every path that ended in "nothing usable" was silent. On 2026-10-25 a research was paid for
+# and polled and produced nothing the service wrote, and the logs could not say why.
+
+def _lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "seamless_client"]
+
+
+def test_a_research_that_ends_with_nothing_to_take_says_the_status_it_ended_with(server, caplog):
+    server(polls=[{"success": True, "data": [{"requestId": "r1", "status": "notfound"}]}])
+
+    with caplog.at_level(logging.INFO):
+        assert sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center") is None
+
+    lines = _lines(caplog)
+    assert any("notfound" in line and "r1" in line for line in lines)
+    assert any("no usable contact" in line and "Jane Doe" in line for line in lines)
+
+
+def test_a_different_person_is_reported_by_both_names(server, caplog):
+    server(polls=[{"success": True, "data": [{"requestId": "r1", "status": "done",
+                                              "contact": _contact(firstName="Mary", lastName="Smith")}]}])
+
+    with caplog.at_level(logging.INFO):
+        assert sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center") is None
+
+    assert any("different person" in line and "Mary Smith" in line and "Jane Doe" in line for line in _lines(caplog))
+
+
+def test_a_usable_answer_says_what_was_accepted(server, caplog):
+    server()
+
+    with caplog.at_level(logging.INFO):
+        assert sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")["phone"]
+
+    assert any("Jane Doe" in line and "phone accepted" in line and "email accepted" in line for line in _lines(caplog))
+
+
+def test_an_answer_with_nothing_usable_says_why_for_the_phone_and_the_email(server, caplog):
+    server(polls=[{"success": True, "data": [{"requestId": "r1", "status": "done", "contact": _contact(
+        contactPhone1="", email1="", contactPhone1TotalAI="", email1TotalAI="")}]}])
+
+    with caplog.at_level(logging.INFO):
+        sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")
+
+    assert any("phone not used" in line and "email not used" in line for line in _lines(caplog))
+
+
+def test_a_person_who_has_moved_is_logged_as_moved_with_nothing_used(server, caplog):
+    server(polls=[{"success": True, "data": [{"requestId": "r1", "status": "done", "contact": _contact(
+        companyName="Elsewhere Inc", companyDomain="elsewhere.com")}]}])
+
+    with caplog.at_level(logging.INFO):
+        sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")
+
+    assert any("no longer at this organisation" in line and "Elsewhere Inc" in line for line in _lines(caplog))
+
+
+def test_the_key_is_never_logged(server, caplog):
+    server()
+
+    with caplog.at_level(logging.DEBUG):
+        sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")
+
+    assert not any("sl-key" in line for line in _lines(caplog))
+
+
+def test_a_phone_that_was_rejected_is_logged_with_the_reason(server, caplog):
+    server(polls=[{"success": True, "data": [{"requestId": "r1", "status": "done",
+                                              "contact": _contact(contactPhone1TotalAI="20%")}]}])
+
+    with caplog.at_level(logging.INFO):
+        answer = sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")
+
+    assert answer["phone_rejected"]                       # the scenario really does reject the phone
+    assert any(answer["phone_rejected"] in line for line in _lines(caplog))
