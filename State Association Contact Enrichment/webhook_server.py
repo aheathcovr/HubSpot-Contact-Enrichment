@@ -22,6 +22,7 @@ Environment variables:
   BQ_LOCATION               BigQuery location (default: US)
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -274,8 +275,55 @@ def _run_enrichment_safe(company_id: str) -> None:
 
 # ── Cloud Tasks enqueue ───────────────────────────────────────────────────────
 
+# A task may run as long as the Cloud Run service may (--timeout=1800s). Cloud Tasks
+# gives an HTTP task 10 minutes unless told otherwise; a corporation run that took
+# longer was cut off and retried, and a retry pays the paid vendors a second time.
+# 30 minutes is the most Cloud Tasks allows for an HTTP target.
+_DISPATCH_DEADLINE_SECONDS = 1800
 
-def _enqueue_enrichment(company_id: str) -> None:
+# One client for the whole process. Building a CloudTasksClient opens a gRPC channel
+# and looks up credentials; doing that on every webhook was most of the 1 to 7 seconds
+# the 2026-09-24 webhooks took, against a 5 second timeout on HubSpot's side.
+# Lock-guarded for the same reason as _google_auth_transport above.
+_tasks_client = None
+_tasks_client_lock = threading.Lock()
+
+
+def _get_tasks_client():
+    global _tasks_client
+    if _tasks_client is None:
+        with _tasks_client_lock:
+            if _tasks_client is None:
+                from google.cloud import tasks_v2
+
+                _tasks_client = tasks_v2.CloudTasksClient()
+    return _tasks_client
+
+
+def _event_key(event: dict) -> str:
+    """Identify one HubSpot event across its redeliveries.
+
+    HubSpot retries a webhook it thinks timed out, up to ten times, with the same
+    occurredAt and a higher attemptNumber. Its docs say eventId alone "is not
+    guaranteed to be unique", so the key is the event time, plus the eventId when
+    there is one. Two separate triggers of one company differ in occurredAt.
+    Empty when the event carries no time: such a task is unnamed and not deduplicated.
+    """
+    occurred = str(event.get("occurredAt", "") or "").strip()
+    if not occurred:
+        return ""
+    event_id = str(event.get("eventId", "") or "").strip()
+    return f"{occurred}-{event_id}" if event_id else occurred
+
+
+def _task_id(company_id: str, event_key: str) -> str:
+    """A Cloud Tasks task id (letters, digits, - and _ only), or "" for an unkeyed event."""
+    if not event_key:
+        return ""
+    return f"enrich-{company_id}-{re.sub(r'[^A-Za-z0-9_-]', '-', event_key)}"[:200]
+
+
+def _enqueue_enrichment(company_id: str, event_key: str = "") -> None:
     """
     Create a Cloud Tasks HTTP task that delivers POST /enrich to this service.
 
@@ -283,10 +331,17 @@ def _enqueue_enrichment(company_id: str) -> None:
     guarantees at-least-once delivery, so enrichment jobs survive instance
     shutdowns.
 
+    When the event has a key the task is named after it, so a second delivery of the
+    same HubSpot event is refused by Cloud Tasks (AlreadyExists) instead of becoming a
+    second enrichment run. That refusal is the success case here: the first task is
+    already queued.
+
     Required env vars: CLOUD_RUN_SERVICE_URL, CLOUD_TASKS_SA_EMAIL
     Optional env vars: GCP_PROJECT_ID, GCP_LOCATION, CLOUD_TASKS_QUEUE
     """
+    from google.api_core import exceptions as gexc
     from google.cloud import tasks_v2
+    from google.protobuf import duration_pb2
 
     project  = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0844868008")
     location = os.getenv("GCP_LOCATION", "us-central1")
@@ -299,7 +354,7 @@ def _enqueue_enrichment(company_id: str) -> None:
     if not sa_email:
         raise RuntimeError("CLOUD_TASKS_SA_EMAIL is required for Cloud Tasks enqueue")
 
-    client = tasks_v2.CloudTasksClient()
+    client = _get_tasks_client()
     parent = client.queue_path(project, location, queue)
 
     task = {
@@ -312,10 +367,21 @@ def _enqueue_enrichment(company_id: str) -> None:
                 "service_account_email": sa_email,
                 "audience": base_url,
             },
-        }
+        },
+        "dispatch_deadline": duration_pb2.Duration(seconds=_DISPATCH_DEADLINE_SECONDS),
     }
+    task_id = _task_id(company_id, event_key)
+    if task_id:
+        task["name"] = client.task_path(project, location, queue, task_id)
 
-    response = client.create_task(request={"parent": parent, "task": task})
+    try:
+        response = client.create_task(request={"parent": parent, "task": task})
+    except gexc.AlreadyExists:
+        logger.info(
+            f"Cloud Task {task_id} already queued for company_id={company_id}; "
+            f"ignoring the duplicate HubSpot delivery"
+        )
+        return
     logger.info(f"Enqueued Cloud Task {response.name} for company_id={company_id}")
 
 
@@ -381,7 +447,7 @@ async def handle_webhook(request: Request) -> JSONResponse:
     # HubSpot sends either a list of events or a single event object
     events: list[dict] = payload if isinstance(payload, list) else [payload]
 
-    queued_ids: set[str] = set()
+    queued_ids: dict[str, str] = {}   # company id -> the key of the event that asked for it
     for event in events:
         prop_name = event.get("propertyName", "")
         prop_value = str(event.get("propertyValue", "")).strip().lower()
@@ -393,14 +459,20 @@ async def handle_webhook(request: Request) -> JSONResponse:
             continue
 
         if prop_name == TRIGGER_PROPERTY and prop_value in TRIGGER_VALUES:
-            queued_ids.add(obj_id)
+            queued_ids.setdefault(obj_id, _event_key(event))
 
-    for company_id in queued_ids:
+    # Cloud Tasks' client is blocking, so each enqueue runs on a worker thread: on the
+    # event loop it stalled every other request on the instance, and HubSpot gives the
+    # whole webhook 5 seconds. The companies are enqueued side by side, and one failing
+    # does not stop the others.
+    async def _enqueue_one(company_id: str, event_key: str) -> None:
         logger.info(f"Enqueuing Cloud Task for company_id={company_id}")
         try:
-            _enqueue_enrichment(company_id)
+            await run_in_threadpool(_enqueue_enrichment, company_id, event_key)
         except Exception as exc:
             logger.exception(f"Failed to enqueue Cloud Task for company {company_id}: {exc}")
+
+    await asyncio.gather(*(_enqueue_one(c, k) for c, k in queued_ids.items()))
 
     logger.info(
         f"Webhook processed: {len(events)} event(s), {len(queued_ids)} enrichment(s) enqueued"

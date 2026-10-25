@@ -26,7 +26,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -40,10 +40,14 @@ from config import (
 from email_verifier import verify_email_millionverifier
 from fullenrich_client import enrich_contact_info, search_facility_contacts
 from hubspot_client import HubSpotClient, HubSpotError
+from identity_gate import same_org_or_affiliate
+from seamless_client import lookup_person as seamless_lookup
 from state_association_matcher import (
     _build_facility_research_prompt,
     _format_hubspot_matches_enhanced,
+    HUBSPOT_MIRROR_MAX_AGE_HOURS,
     call_openrouter,
+    check_hubspot_mirror_freshness,
     find_facilities_missing_leadership,
     lookup_hubspot_contact_enhanced,
     parse_found_name,
@@ -54,7 +58,6 @@ from state_association_matcher import (
     workflow_2_research_contacts,
     OPENROUTER_MODEL,
     OPENROUTER_MODEL_TIER23,
-    W1_RATE_LIMIT_SECONDS,
     RESEARCH_SYSTEM_PROMPT,
     _CONTACT_JSON_SCHEMA,
     _OPENROUTER_SEMAPHORE,
@@ -74,6 +77,11 @@ CORP_HIERARCHY_TYPE = "Corporation / Operator"
 # plus several HubSpot API round-trips — running them serially turned every
 # extra contact found for a company into a linear multiplier on request time.
 _CONTACT_MAX_WORKERS = 3
+
+# Calls that do not depend on one another's answers are started side by side, so a run
+# waits for the slowest of them instead of the sum. Shared by every run in the process;
+# bounded well above Cloud Run's per-instance concurrency so a start never queues.
+_BACKGROUND = ThreadPoolExecutor(max_workers=8, thread_name_prefix="enrich-bg")
 
 # BigQuery client is process-global and lazily created once per container,
 # not per enrichment. Building a fresh client re-runs ADC credential discovery
@@ -137,6 +145,7 @@ class ContactAction:
     found_linkedin: str = ""
     email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
     email_validation_quality: str = ""  # good | risky | bad | ""
+    email_validation_result: str = ""   # MillionVerifier's own word: ok | catch_all | unknown | invalid | disposable | ""
     fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
     research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
     research_source_name: str = ""      # Human-readable name of the source (e.g. "WA HCAP directory")
@@ -148,7 +157,7 @@ class ContactAction:
     fe_updated_at: str = ""             # FullEnrich profile last-updated date (ISO string)
     match_method: str = ""              # "pre-populated ID" | "email search" | "name search" | ""
     days_since_enriched: int = -1       # Days since last enrichment; -1 = unknown (used for 30-day skip path)
-    found_phone_source: str = ""        # "Definitive Healthcare (direct line)" | "existing HubSpot record" | ""
+    found_phone_source: str = ""        # "Definitive Healthcare (direct line)" | "existing HubSpot record" | "Seamless" | ""
 
 
 # ── Title routing ─────────────────────────────────────────────────────────────
@@ -334,7 +343,7 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
         "VERIFIED":   "✓ Verified — inbox confirmed deliverable",
         "INVALID":    "✗ Invalid — address does not exist or will bounce",
         "RISKY":      "~ Risky — catch-all domain; deliverability uncertain",
-        "UNKNOWN":    "? Unknown — mail server blocked SMTP probe",
+        "UNKNOWN":    "? Unknown — the mail server would not confirm this address either way",
         "UNVERIFIED": "Not checked (API key not configured)",
         "ERROR":      "Error — validation attempt failed",
     }.get(mv_status, mv_status)
@@ -345,8 +354,15 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
         f"<b>Source:</b> {src}<br>"
         f"<b>MillionVerifier:</b> {mv_text}<br>"
     )
+    if mv_status == "INVALID" and ev.get("subresult"):
+        h += f"<em>Reason: {ev['subresult']}</em><br>"
     if mv_status == "UNKNOWN":
-        h += "<em>Microsoft 365 / Exchange Online blocks SMTP verification probes as anti-spam protection — Unknown does not mean the email is invalid.</em><br>"
+        h += "<em>Unknown means the check was inconclusive, not that the address is good or bad. Do not assume it will deliver.</em><br>"
+    if ev.get("second_opinion") == "bounceban":
+        h += (
+            f"<b>BounceBan:</b> re-checked MillionVerifier's {ev.get('mv_result', '')} answer "
+            f"(score {ev.get('bounceban_score', '')})<br>"
+        )
     if fe_email_status:
         fe_text = {"DELIVERABLE": "✓ Deliverable", "NOT_DELIVERABLE": "✗ Not deliverable"}.get(fe_email_status, fe_email_status)
         h += f"<b>FullEnrich:</b> {fe_text}<br>"
@@ -359,6 +375,167 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
     return h
 
 
+# What MillionVerifier can say about an address. Anything else ("skipped", "error",
+# "") means verification did not run, and there is nothing to record.
+_MV_RESULT_WORDS = frozenset({"ok", "catch_all", "unknown", "invalid", "disposable"})
+
+# source_path values for an address a paid vendor found (as opposed to Definitive,
+# the state association, or the operator's own site).
+_VENDOR_SOURCE_PATHS = frozenset({"fullenrich", "fullenrich_people_search"})
+
+
+def _verification_properties(ev: dict) -> dict:
+    """
+    The two contact properties that record a MillionVerifier answer.
+
+    `email_verification_result` and `email_verification_date` already exist in the
+    portal and are what the outbound lead loaders read to decide whether an address
+    is sendable and from which mailbox, so the result is written in MillionVerifier's
+    own words. Returns {} when verification did not actually run.
+    """
+    result = (ev or {}).get("result", "")
+    if result not in _MV_RESULT_WORDS:
+        return {}
+    return {
+        "email_verification_result": result,
+        "email_verification_date": str(HubSpotClient.epoch_ms_today_utc()),
+    }
+
+
+def _belongs_to_operator(email: str, facility_domain: str, facility_name: str, operator_name: str = "") -> bool:
+    """Is a vendor-found address at the facility, or at the operator that runs it?"""
+    return (
+        same_org_or_affiliate(email, facility_domain, facility_name)
+        or (bool(operator_name) and same_org_or_affiliate(email, "", operator_name))
+    )
+
+
+def _email_held_line(email: str) -> str:
+    """Note line for a vendor-found address that is not at the facility or its operator."""
+    return (
+        f"<b>⚠ Email held:</b> {email}<br>"
+        f"<b>Reason:</b> not at the facility's or operator's domain. It is probably another "
+        f"company's address (the person may have moved), so it was not verified or written. "
+        f"Check it by hand before using it.<br>"
+    )
+
+
+@dataclass
+class _SeamlessOutcome:
+    """What a Seamless lookup produced for one contact, already screened."""
+    phone: str = ""
+    phone_line: str = ""
+    email: str = ""
+    ev: dict = field(default_factory=dict)
+    email_line: str = ""
+    linkedin: str = ""
+    note_lines: list = field(default_factory=list)
+
+
+def _seamless_phone_line(sl: dict) -> str:
+    kind = sl.get("phone_type") or "phone"
+    confidence = sl.get("phone_confidence")
+    detail = f"{kind}, {confidence:.0f}% confidence" if confidence is not None else kind
+    return f"<b>✚ Phone added:</b> {sl['phone']}<br><b>Source:</b> Seamless ({detail})<br>"
+
+
+def _seamless_email_added_line(email: str, sl: dict, ev: dict) -> str:
+    mv_text = {
+        "VERIFIED": "✓ Verified", "INVALID": "✗ Invalid", "RISKY": "~ Risky (catch-all)",
+        "UNKNOWN": "? Unknown — inconclusive", "UNVERIFIED": "Not checked", "ERROR": "Error",
+    }.get(ev.get("status", ""), ev.get("status", ""))
+    confidence = sl.get("email_confidence")
+    detail = f" ({confidence:.0f}% confidence)" if confidence is not None else ""
+    return (
+        f"<b>✚ Email added:</b> {email}<br>"
+        f"<b>Source:</b> Seamless{detail}, used only because no other source had one<br>"
+        f"<b>MillionVerifier:</b> {mv_text}<br>"
+    )
+
+
+# Seamless calls started ahead of FullEnrich (see _seamless_start). Sized for every contact
+# of every run one Cloud Run instance can hold at once (concurrency 4 x 3 contacts), so a
+# start never queues behind another.
+_SEAMLESS_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="seamless")
+
+
+def _seamless_start(
+    first: str, last: str, *, found_title: str, facility_domain: str, facility_name: str,
+    operator_name: str,
+) -> Future:
+    """
+    Start the Seamless lookup now, to be handed to _seamless_fill(prefetched=...) later.
+
+    Only for a contact that is missing a phone: that contact is researched at Seamless
+    whatever FullEnrich finds, so starting early costs no extra lookup and the contact
+    waits for the slower vendor instead of both, one after the other. The call is the same
+    one _seamless_fill would have made; what to use from the answer is still decided there,
+    once FullEnrich has answered.
+    """
+    return _SEAMLESS_POOL.submit(
+        seamless_lookup, first, last, domain=facility_domain, company=facility_name,
+        operator_name=operator_name, title=found_title,
+    )
+
+
+def _seamless_fill(
+    first: str, last: str, *, need_email: bool, need_phone: bool, found_title: str,
+    facility_domain: str, facility_name: str, operator_name: str,
+    prefetched: "Future | None" = None,
+) -> _SeamlessOutcome:
+    """
+    Ask Seamless for what is still missing, and screen what comes back.
+
+    *prefetched* is the lookup _seamless_start began earlier; it is waited for here instead
+    of making the call now. It is only ever passed when a phone is missing, so it is a call
+    this function would have made anyway.
+
+    One call serves both gaps, and nothing is asked when neither is open. The phone is
+    judged by the client (do-not-call, switchboards, non-US, confidence). The email is a
+    FALLBACK: it must be at the facility or its operator (else held, and not paid to
+    verify) and must verify. A person Seamless shows at a different organisation yields
+    nothing, and the note says where they are.
+    """
+    out = _SeamlessOutcome()
+    if not (need_email or need_phone):
+        return out
+    if prefetched is not None:
+        sl = prefetched.result()
+    else:
+        sl = seamless_lookup(
+            first, last, domain=facility_domain, company=facility_name,
+            operator_name=operator_name, title=found_title,
+        )
+    if not sl:
+        return out
+    out.linkedin = sl.get("linkedin", "")
+    if sl.get("moved"):
+        out.note_lines.append(
+            f"<b>⚠ Seamless:</b> {first} {last} appears to have moved to {sl.get('company') or 'another organisation'}. "
+            f"Their phone and email were not used.<br>"
+        )
+        return out
+    if need_phone:
+        if sl.get("phone"):
+            out.phone, out.phone_line = sl["phone"], _seamless_phone_line(sl)
+        elif sl.get("phone_rejected") and sl["phone_rejected"] != "no phone returned":
+            out.note_lines.append(f"<b>Seamless phone not used:</b> {sl['phone_rejected']}<br>")
+    if need_email and sl.get("email"):
+        email = sl["email"]
+        if not _belongs_to_operator(email, facility_domain, facility_name, operator_name):
+            out.note_lines.append(_email_held_line(email))
+        else:
+            ev = verify_email_millionverifier(email)
+            if ev.get("status") != "INVALID":
+                out.email, out.ev, out.email_line = email, ev, _seamless_email_added_line(email, sl, ev)
+            else:
+                out.note_lines.append(
+                    f"<b>✗ Email suppressed:</b> {email}<br>"
+                    f"<b>Reason:</b> Seamless found this address but MillionVerifier flagged it as INVALID<br>"
+                )
+    return out
+
+
 def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
     """HTML block for an email discovered by FullEnrich and added to HubSpot."""
     fe_status = fe_info.get("email_status", "")
@@ -366,7 +543,7 @@ def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
     mv_status = ev.get("status", "")
     mv_text = {
         "VERIFIED": "✓ Verified", "INVALID": "✗ Invalid", "RISKY": "~ Risky",
-        "UNKNOWN": "? Unknown (M365 blocks SMTP probe — likely valid)",
+        "UNKNOWN": "? Unknown — inconclusive",
         "UNVERIFIED": "Not checked", "ERROR": "Error",
     }.get(mv_status, mv_status)
     return (
@@ -487,6 +664,7 @@ def _enrich_and_associate_existing_contact(
     source_path: str,
     _base: dict,
     dh_executive_id: str = "",
+    operator_name: str = "",
 ) -> "ContactAction":
     """
     Enrich and finalise an existing HubSpot contact after it has been associated.
@@ -505,11 +683,14 @@ def _enrich_and_associate_existing_contact(
 
     Returns a ContactAction with action="associated_existing".
     """
+    held_email_note = _base.pop("email_held_note", "")   # before _base is spread into a ContactAction
     enriched_email = found_email
     enriched_email_status = email_validation.get("status", "")
     enriched_email_quality = email_validation.get("quality", "")
+    enriched_email_result = email_validation.get("result", "")
     enriched_phone = found_phone
-    note_lines: list[str] = []
+    note_lines: list[str] = [held_email_note] if held_email_note else []
+    existing_email_ev: dict = {}   # MillionVerifier's answer for the address ALREADY on the contact
     fe_info: dict = {}
 
     try:
@@ -602,6 +783,8 @@ def _enrich_and_associate_existing_contact(
             enriched_email = existing_email
             enriched_email_status = ev.get("status", "")
             enriched_email_quality = ev.get("quality", "")
+            enriched_email_result = ev.get("result", "")
+            existing_email_ev = ev
             note_lines.append(_email_verification_line(existing_email, ev, source="existing"))
             if ev.get("status") == "INVALID":
                 logger.info(
@@ -620,6 +803,7 @@ def _enrich_and_associate_existing_contact(
         # all properties in one body, and none of these decisions depend on a
         # previous write having already landed (they all read local state).
         pending_updates: dict = {}
+        pending_updates.update(_verification_properties(existing_email_ev))
 
         if data_freshness_value:
             pending_updates["data_freshness_according_to_definitive"] = data_freshness_value
@@ -627,10 +811,14 @@ def _enrich_and_associate_existing_contact(
         # ── DH-sourced email/phone if contact has none ────────────────────────
         if not existing_email and enriched_email and email_validation.get("status") != "INVALID":
             pending_updates["email"] = enriched_email
+            pending_updates.update(_verification_properties(email_validation))
             logger.info(
                 "Writing DH-sourced email %r to contact %s (no existing email)",
                 enriched_email, matched_contact_id,
             )
+        elif (existing_email and enriched_email and email_validation
+              and enriched_email.strip().lower() == existing_email.strip().lower()):
+            pending_updates.update(_verification_properties(email_validation))
         if not existing_phone and enriched_phone:
             pending_updates["phone"] = enriched_phone
             note_lines.append(_phone_dh_line(enriched_phone))
@@ -648,6 +836,19 @@ def _enrich_and_associate_existing_contact(
         # it lacks. Phones come from Definitive or the existing record.
         email_still_missing = not (existing_email or enriched_email)
 
+        # A contact with no phone is researched at Seamless whatever FullEnrich finds, so when
+        # FullEnrich is about to run, Seamless starts now and the two waits overlap. One with a
+        # phone is asked at Seamless only if FullEnrich finds no email, and after it: asking
+        # early would pay for a lookup a FullEnrich email makes unnecessary. FullEnrich does
+        # not raise (it returns an empty answer), so the early call is never left orphaned.
+        sl_first, sl_last = _split_name(found_name)
+        seamless_early = None
+        if email_still_missing and not (existing_phone or enriched_phone):
+            seamless_early = _seamless_start(
+                sl_first, sl_last, found_title=found_title, facility_domain=facility_domain,
+                facility_name=facility_name, operator_name=operator_name,
+            )
+
         if email_still_missing:
             fe_first, fe_last = _split_name(found_name)
             fe_info = enrich_contact_info(
@@ -658,13 +859,19 @@ def _enrich_and_associate_existing_contact(
                 linkedin_url=found_linkedin,
             )
 
-            if fe_info.get("email"):
-                new_email = fe_info["email"]
+            fe_email = fe_info.get("email", "")
+            if fe_email and not _belongs_to_operator(fe_email, facility_domain, facility_name, operator_name):
+                note_lines.append(_email_held_line(fe_email))
+                logger.info("Holding FullEnrich address for contact %s: not at the facility or operator", matched_contact_id)
+            elif fe_email:
+                new_email = fe_email
                 ev = verify_email_millionverifier(new_email)
                 enriched_email_status = ev.get("status", "")
                 enriched_email_quality = ev.get("quality", "")
+                enriched_email_result = ev.get("result", "")
                 if ev.get("status") != "INVALID":
                     pending_updates["email"] = new_email
+                    pending_updates.update(_verification_properties(ev))
                     enriched_email = new_email
                     note_lines.append(_email_added_line(new_email, fe_info, ev))
                 else:
@@ -682,12 +889,40 @@ def _enrich_and_associate_existing_contact(
             if alt_emails:
                 pending_updates["hs_additional_emails"] = alt_emails
 
+        # ── Seamless: the phone, and an email if nobody else found one ────────
+        # Phones come from Definitive or the existing record, then Seamless (FullEnrich is
+        # asked for email only). An existing value is never overwritten.
+        seamless = _seamless_fill(
+            sl_first, sl_last,
+            need_email=not (existing_email or enriched_email),
+            need_phone=not (existing_phone or enriched_phone),
+            found_title=found_title, facility_domain=facility_domain,
+            facility_name=facility_name, operator_name=operator_name,
+            prefetched=seamless_early,
+        )
+        note_lines.extend(seamless.note_lines)
+        if seamless.phone:
+            pending_updates["phone"] = seamless.phone
+            enriched_phone = seamless.phone
+            _base["found_phone_source"] = "Seamless"
+            note_lines.append(seamless.phone_line)
+        if seamless.email:
+            pending_updates["email"] = seamless.email
+            pending_updates.update(_verification_properties(seamless.ev))
+            enriched_email = seamless.email
+            enriched_email_status = seamless.ev.get("status", "")
+            enriched_email_quality = seamless.ev.get("quality", "")
+            enriched_email_result = seamless.ev.get("result", "")
+            note_lines.append(seamless.email_line)
+
         # ── LinkedIn URL if we have it and the contact doesn't ────────────────
-        linkedin_to_write = found_linkedin or fe_info.get("linkedin_url", "")
+        linkedin_to_write = found_linkedin or fe_info.get("linkedin_url", "") or seamless.linkedin
         if linkedin_to_write and not existing_linkedin:
             pending_updates["hs_linkedin_url"] = linkedin_to_write
             source = "Definitive Healthcare" if source_path == "definitive_healthcare" and found_linkedin else (
-                "FullEnrich People Search" if found_linkedin else "FullEnrich Bulk Enrich"
+                "FullEnrich People Search" if found_linkedin else (
+                    "FullEnrich Bulk Enrich" if fe_info.get("linkedin_url") else "Seamless"
+                )
             )
             note_lines.append(
                 f"<b>✚ LinkedIn added:</b> <a href=\"{linkedin_to_write}\">{linkedin_to_write}</a><br>"
@@ -732,6 +967,7 @@ def _enrich_and_associate_existing_contact(
         found_phone=enriched_phone,
         email_validation_status=enriched_email_status,
         email_validation_quality=enriched_email_quality,
+        email_validation_result=enriched_email_result,
     )
     return ContactAction(
         action="associated_existing",
@@ -759,6 +995,7 @@ def _create_and_enrich_new_contact(
     research_reasoning: str,
     _base: dict,
     dh_executive_id: str = "",
+    operator_name: str = "",
 ) -> "ContactAction":
     """
     Create a new HubSpot contact with the found details, associate it with the
@@ -769,6 +1006,7 @@ def _create_and_enrich_new_contact(
 
     Returns a ContactAction with action="created_new" or action="error".
     """
+    held_email_note = _base.pop("email_held_note", "")   # before _base is spread into a ContactAction
     contact_props: dict = {
         "firstname": first,
         "lastname": last,
@@ -776,6 +1014,7 @@ def _create_and_enrich_new_contact(
     }
     if email_to_use:
         contact_props["email"] = email_to_use.strip()
+        contact_props.update(_verification_properties({"result": _base.get("email_validation_result", "")}))
     if found_phone:
         contact_props["phone"] = found_phone.strip()
     if found_linkedin:
@@ -800,7 +1039,7 @@ def _create_and_enrich_new_contact(
         )
 
     # ── FullEnrich bulk enrich (work email only; see the existing-contact path) ─
-    new_note_lines: list[str] = []
+    new_note_lines: list[str] = [held_email_note] if held_email_note else []
     new_fe_info: dict = {}
     # Accumulate every post-creation property write into one batched PATCH
     # (FullEnrich email/phone/LinkedIn, data freshness, enrichment date)
@@ -812,6 +1051,15 @@ def _create_and_enrich_new_contact(
         _base["found_phone_source"] = "Definitive Healthcare (direct line)"
         new_note_lines.append(_phone_dh_line(found_phone))
 
+    # See the existing-contact path: no phone means Seamless is asked anyway, so it starts
+    # before FullEnrich and the two waits overlap.
+    seamless_early = None
+    if not email_to_use and not found_phone:
+        seamless_early = _seamless_start(
+            first, last, found_title=found_title, facility_domain=facility_domain,
+            facility_name=facility_name, operator_name=operator_name,
+        )
+
     if not email_to_use:
         new_fe_info = enrich_contact_info(
             firstname=first,
@@ -821,14 +1069,20 @@ def _create_and_enrich_new_contact(
             linkedin_url=found_linkedin,
         )
 
-        if new_fe_info.get("email"):
-            new_email = new_fe_info["email"]
+        fe_email = new_fe_info.get("email", "")
+        if fe_email and not _belongs_to_operator(fe_email, facility_domain, facility_name, operator_name):
+            new_note_lines.append(_email_held_line(fe_email))
+            logger.info("Holding FullEnrich address for new contact %s: not at the facility or operator", new_id)
+        elif fe_email:
+            new_email = fe_email
             ev = verify_email_millionverifier(new_email)
             if ev.get("status") != "INVALID":
                 pending_updates["email"] = new_email
+                pending_updates.update(_verification_properties(ev))
                 _base["found_email"] = new_email
                 _base["email_validation_status"] = ev.get("status", "")
                 _base["email_validation_quality"] = ev.get("quality", "")
+                _base["email_validation_result"] = ev.get("result", "")
                 _base["fe_email_found"] = True
                 new_note_lines.append(_email_added_line(new_email, new_fe_info, ev))
             else:
@@ -848,6 +1102,36 @@ def _create_and_enrich_new_contact(
                 f"<b>✚ LinkedIn added:</b> <a href=\"{new_fe_info['linkedin_url']}\">{new_fe_info['linkedin_url']}</a><br>"
                 f"<b>Source:</b> FullEnrich Bulk Enrich<br>"
             )
+
+    # ── Seamless: the phone, and an email if nobody else found one ────────────
+    seamless = _seamless_fill(
+        first, last,
+        need_email=not (email_to_use or pending_updates.get("email")),
+        need_phone=not found_phone,
+        found_title=found_title, facility_domain=facility_domain,
+        facility_name=facility_name, operator_name=operator_name,
+        prefetched=seamless_early,
+    )
+    new_note_lines.extend(seamless.note_lines)
+    if seamless.phone:
+        pending_updates["phone"] = seamless.phone
+        _base["found_phone"] = seamless.phone
+        _base["found_phone_source"] = "Seamless"
+        new_note_lines.append(seamless.phone_line)
+    if seamless.email:
+        pending_updates["email"] = seamless.email
+        pending_updates.update(_verification_properties(seamless.ev))
+        _base["found_email"] = seamless.email
+        _base["email_validation_status"] = seamless.ev.get("status", "")
+        _base["email_validation_quality"] = seamless.ev.get("quality", "")
+        _base["email_validation_result"] = seamless.ev.get("result", "")
+        new_note_lines.append(seamless.email_line)
+    if seamless.linkedin and not found_linkedin and not pending_updates.get("hs_linkedin_url"):
+        pending_updates["hs_linkedin_url"] = seamless.linkedin
+        new_note_lines.append(
+            f"<b>✚ LinkedIn added:</b> <a href=\"{seamless.linkedin}\">{seamless.linkedin}</a><br>"
+            f"<b>Source:</b> Seamless<br>"
+        )
 
     if data_freshness_value:
         pending_updates["data_freshness_according_to_definitive"] = data_freshness_value
@@ -910,11 +1194,23 @@ def _process_found_contact(
     fe_updated_at: str = "",
     research_source_name: str = "",
     dh_executive_id: str = "",
+    operator_name: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
     """
     source_urls = _extract_urls(research_findings)[:20]
+
+    # ── Identity gate: a vendor-found address must be at the facility or operator ──
+    # MillionVerifier only says whether a mailbox is real, not whether it is the right
+    # person's. A vendor returns the person's CURRENT employer's address, which is a
+    # stranger's if they have moved. Hold it (not written, not paid to verify) and say so
+    # on the contact note. Definitive and the state association are not second-guessed.
+    held_email = ""
+    if found_email and source_path in _VENDOR_SOURCE_PATHS and not _belongs_to_operator(
+        found_email, facility_domain, facility_name, operator_name
+    ):
+        held_email, found_email = found_email, ""
 
     # ── Email validation (MillionVerifier) ────────────────────────────────────
     # email_to_use is cleared when the email is definitively INVALID so it is
@@ -943,6 +1239,7 @@ def _process_found_contact(
         target_company_id=target_company_id,
         email_validation_status=email_validation.get("status", ""),
         email_validation_quality=email_validation.get("quality", ""),
+        email_validation_result=email_validation.get("result", ""),
         research_reasoning=research_reasoning,
         source_path=source_path,
         fe_people_search_ran=fe_people_search_ran,
@@ -954,6 +1251,9 @@ def _process_found_contact(
         match_method="",         # populated below when a match is found
         found_phone_source="",   # populated in the enrich helpers
     )
+
+    if held_email:
+        _base["email_held_note"] = _email_held_line(held_email)   # picked up by the helpers below
 
     # Track match method for company-note display
     _match_method = ""
@@ -1050,6 +1350,7 @@ def _process_found_contact(
             source_path=source_path,
             _base=_base,
             dh_executive_id=dh_executive_id,
+            operator_name=operator_name,
         )
 
     return _create_and_enrich_new_contact(
@@ -1068,6 +1369,7 @@ def _process_found_contact(
         research_reasoning=research_reasoning,
         _base=_base,
         dh_executive_id=dh_executive_id,
+        operator_name=operator_name,
     )
 
 
@@ -1151,7 +1453,7 @@ def _enrich_existing_leadership(
             elif dh["confirmed"]:
                 dh_verified = True
                 dh_last_update_val = dh.get("dh_last_update", "")
-                table_label = {"executives": "Executives table", "full_feed": "Full Feed"}.get(
+                table_label = {"executives": "Executives table"}.get(
                     dh["source_table"], dh["source_table"]
                 )
                 update_str = f", updated {dh_last_update_val}" if dh_last_update_val else ""
@@ -1339,7 +1641,6 @@ def _run_workflow1_single_facility(
                 response_format=structured_format,
                 extra_params=extra,
             )
-        time.sleep(W1_RATE_LIMIT_SECONDS)
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 
@@ -1710,7 +2011,7 @@ def _build_note(
             "VERIFIED":   "✓ Verified — inbox confirmed deliverable",
             "INVALID":    "✗ Invalid — address does not exist",
             "RISKY":      "~ Risky — catch-all domain; deliverability uncertain",
-            "UNKNOWN":    "? Unverifiable (M365 blocks SMTP probe — likely valid)",
+            "UNKNOWN":    "? Unverifiable — inconclusive",
             "UNVERIFIED": "not checked (API key not configured)",
             "ERROR":      "validation error",
         }
@@ -1776,7 +2077,7 @@ def _build_note(
                 elif vstatus == "RISKY":
                     v_suffix = " <em>~ risky/catchall" + (f" &mdash; quality: {vquality}" if vquality else "") + "</em>"
                 elif vstatus == "UNKNOWN":
-                    v_suffix = " <em>? unverifiable (M365 blocks SMTP probe &mdash; likely valid)</em>"
+                    v_suffix = " <em>? unverifiable &mdash; inconclusive</em>"
                 elif vstatus == "UNVERIFIED":
                     v_suffix = " <em>(not validated &mdash; API key not configured)</em>"
                 elif vstatus == "ERROR":
@@ -1943,9 +2244,20 @@ def run_enrichment(company_id: str) -> None:
         logger.error(f"BigQuery connection failed: {exc}")
         errors.append(f"BigQuery unavailable: {exc}")
 
+    # Contact matching reads a BigQuery copy of HubSpot. If that sync has frozen,
+    # say so on the company note too, so a rep reading it knows duplicates are possible.
+    if bq_client:
+        mirror_hours = check_hubspot_mirror_freshness(bq_client)
+        if mirror_hours is not None and mirror_hours > HUBSPOT_MIRROR_MAX_AGE_HOURS:
+            errors.append(
+                f"HubSpot data mirror is {mirror_hours:.0f} hours old: contacts added to HubSpot "
+                f"since then were not matched, so a duplicate is possible"
+            )
+
     # ── Step 4: Route by hierarchy type ──────────────────────────────────────
     results: list[dict] = []
     workflow_label = ""
+    parent_corp_name = ""   # W1 fills this in; passed on so an operator-domain address is not held as a stranger's
 
     if hierarchy_type == CHILD_HIERARCHY_TYPE:
         # ── Workflow 1: research this specific child facility ─────────────────
@@ -2001,6 +2313,22 @@ def run_enrichment(company_id: str) -> None:
     elif hierarchy_type == CORP_HIERARCHY_TYPE:
         # ── Workflow 2: research Definitive corporate-level contacts ──────────
         workflow_label = "Workflow 2 — Definitive Corporate Contact Research"
+
+        # FullEnrich's search for this corporation's executives does not depend on what
+        # Definitive or Sonar find: their names only filter what it returns, which still
+        # happens below. It was the last step of a run only because it was written last,
+        # so it starts now and is read after Sonar discovery. It is asked once per run
+        # either way; only the waiting overlaps.
+        fe_corp_future = _BACKGROUND.submit(
+            search_facility_contacts,
+            company_name=company_name,
+            city="",
+            state=props.get("state", "") or "",
+            titles=W2_CORPORATE_TITLES,
+            domain=props.get("website", "") or "",
+            corporate_mode=True,   # disables location scoring, enables seniority filters
+        )
+
         if bq_client and definitive_id_raw:
             try:
                 network_id = int(definitive_id_raw)
@@ -2059,14 +2387,7 @@ def run_enrichment(company_id: str) -> None:
         logger.info(
             f"W2 FullEnrich supplement: searching for corporate executives at '{company_name}'"
         )
-        fe_corp_contacts = search_facility_contacts(
-            company_name=company_name,
-            city="",
-            state=props.get("state", "") or "",
-            titles=W2_CORPORATE_TITLES,
-            domain=props.get("website", "") or "",
-            corporate_mode=True,   # disables location scoring, enables seniority filters
-        )
+        fe_corp_contacts = fe_corp_future.result()
         fe_added = 0
         for fe in fe_corp_contacts:
             if (fe["full_name"] or "").lower().strip() not in known_names:
@@ -2149,6 +2470,7 @@ def run_enrichment(company_id: str) -> None:
             fe_updated_at=result.get("fe_updated_at", ""),
             research_source_name=result.get("research_source_name", ""),
             dh_executive_id=str(result.get("executive_id", "") or ""),
+            operator_name=parent_corp_name,
         )
 
     actions: list[ContactAction] = []

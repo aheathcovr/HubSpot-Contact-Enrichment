@@ -8,6 +8,10 @@ and /enrich must refuse anything not carrying Cloud Tasks' OIDC token. These
 tests pin that behaviour so a dependency upgrade to FastAPI/Starlette cannot
 change it unnoticed.
 
+They also pin what keeps the webhook inside HubSpot's 5 second window: one reused
+Cloud Tasks client, an enqueue that never blocks the event loop, and a task name
+that makes HubSpot's redeliveries of one event collapse into a single task.
+
 Run with:
     python3 -m pytest "State Association Contact Enrichment/test_webhook_server.py" -v
 """
@@ -18,11 +22,13 @@ import hmac
 import json
 import os
 import sys
+import threading
 import time
 from unittest.mock import create_autospec
 
 import pytest
 from fastapi.testclient import TestClient
+from google.api_core import exceptions as gexc
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,14 +56,38 @@ def _signed_headers(body: bytes, secret: str = _SECRET, timestamp: str | None = 
     }
 
 
-def _trigger_event(company_id="12345", value="true", prop="request_to_enrich") -> bytes:
-    return json.dumps([{"objectId": int(company_id), "propertyName": prop, "propertyValue": value}]).encode()
+def _trigger_event(company_id="12345", value="true", prop="request_to_enrich", **extra) -> bytes:
+    event = {"objectId": int(company_id), "propertyName": prop, "propertyValue": value, **extra}
+    return json.dumps([event]).encode()
+
+
+def _trigger_events(*company_ids) -> bytes:
+    return json.dumps([
+        {"objectId": int(c), "propertyName": "request_to_enrich", "propertyValue": "true"} for c in company_ids
+    ]).encode()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_tasks_client():
+    """The Cloud Tasks client is built once per process; every test starts without one."""
+    webhook_server._tasks_client = None
+    yield
+    webhook_server._tasks_client = None
 
 
 @pytest.fixture
 def enqueued(monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(webhook_server, "_enqueue_enrichment", calls.append)
+    monkeypatch.setattr(webhook_server, "_enqueue_enrichment",
+                        lambda company_id, event_key="": calls.append(company_id))
+    return calls
+
+
+@pytest.fixture
+def enqueued_with_keys(monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(webhook_server, "_enqueue_enrichment",
+                        lambda company_id, event_key="": calls.append((company_id, event_key)))
     return calls
 
 
@@ -194,21 +224,98 @@ def test_oidc_check_refuses_a_missing_bearer_token(monkeypatch):
     assert webhook_server._verify_cloud_tasks_oidc(_FakeRequest("")) is False
 
 
+# ── /webhook: what it hands to the enqueue ───────────────────────────────────
+
+def test_the_hubspot_event_time_travels_with_the_company_so_redeliveries_can_be_recognised(client, enqueued_with_keys):
+    body = _trigger_event(company_id="12345", occurredAt=1760000000000, eventId=77)
+
+    client.post("/webhook", content=body, headers=_signed_headers(body))
+
+    assert enqueued_with_keys == [("12345", "1760000000000-77")]
+
+
+def test_an_event_without_a_timestamp_carries_no_key(client, enqueued_with_keys):
+    body = _trigger_event(company_id="12345")
+
+    client.post("/webhook", content=body, headers=_signed_headers(body))
+
+    assert enqueued_with_keys == [("12345", "")]
+
+
+def test_every_company_in_one_webhook_is_enqueued_even_when_one_enqueue_fails(client, monkeypatch):
+    seen: list[str] = []
+
+    def flaky(company_id, event_key=""):
+        seen.append(company_id)
+        if company_id == "222":
+            raise RuntimeError("Cloud Tasks is having a moment")
+
+    monkeypatch.setattr(webhook_server, "_enqueue_enrichment", flaky)
+    body = _trigger_events("111", "222", "333")
+
+    response = client.post("/webhook", content=body, headers=_signed_headers(body))
+
+    assert response.status_code == 200
+    assert sorted(seen) == ["111", "222", "333"]
+
+
+def test_a_slow_enqueue_does_not_stall_the_event_loop(client, monkeypatch):
+    """HubSpot gives the webhook 5 seconds. A blocking Cloud Tasks call on the loop made every other
+    request on the instance wait behind it: 9 enqueueing webhooks took 1 to 7.4 seconds on 2026-09-24."""
+    release, started = threading.Event(), threading.Event()
+
+    def slow(company_id, event_key=""):
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(webhook_server, "_enqueue_enrichment", slow)
+    body = _trigger_event()
+    poster = threading.Thread(
+        target=lambda: client.post("/webhook", content=body, headers=_signed_headers(body)))
+    poster.start()
+    try:
+        assert started.wait(2), "the enqueue never started"
+        began = time.monotonic()
+        health = client.get("/health")
+        waited = time.monotonic() - began
+    finally:
+        release.set()
+        poster.join(5)
+
+    assert health.status_code == 200
+    assert waited < 1.0, f"/health waited {waited:.1f}s behind the enqueue"
+
+
 # ── The task the webhook enqueues ─────────────────────────────────────────────
 
-def test_enqueued_task_posts_to_enrich_with_an_oidc_token(monkeypatch):
-    """Built against the real Cloud Tasks client's signatures, with only the network stubbed."""
+def _fake_tasks_client(monkeypatch):
+    """The real Cloud Tasks client's signatures, with only the network stubbed.
+    Returns (client, constructions): how many times the service built a client."""
     from google.cloud import tasks_v2
 
     fake_client = create_autospec(tasks_v2.CloudTasksClient, instance=True)
     fake_client.queue_path.side_effect = tasks_v2.CloudTasksClient.queue_path
+    fake_client.task_path.side_effect = tasks_v2.CloudTasksClient.task_path
     fake_client.create_task.return_value.name = "projects/p/locations/l/queues/q/tasks/t"
-    monkeypatch.setattr(tasks_v2, "CloudTasksClient", lambda: fake_client)
+    constructions: list[int] = []
+
+    def build():
+        constructions.append(1)
+        return fake_client
+
+    monkeypatch.setattr(tasks_v2, "CloudTasksClient", build)
     monkeypatch.setenv("GCP_PROJECT_ID", "proj")
     monkeypatch.setenv("GCP_LOCATION", "us-central1")
     monkeypatch.setenv("CLOUD_TASKS_QUEUE", "hubspot-enrichment")
     monkeypatch.setenv("CLOUD_RUN_SERVICE_URL", "https://svc.example.run.app/")
     monkeypatch.setenv("CLOUD_TASKS_SA_EMAIL", "tasks@proj.iam.gserviceaccount.com")
+    return fake_client, constructions
+
+
+def test_enqueued_task_posts_to_enrich_with_an_oidc_token(monkeypatch):
+    from google.cloud import tasks_v2
+
+    fake_client, _ = _fake_tasks_client(monkeypatch)
 
     webhook_server._enqueue_enrichment("12345")
 
@@ -222,3 +329,74 @@ def test_enqueued_task_posts_to_enrich_with_an_oidc_token(monkeypatch):
         "service_account_email": "tasks@proj.iam.gserviceaccount.com",
         "audience": "https://svc.example.run.app",
     }
+
+
+def test_the_cloud_tasks_client_is_built_once_and_reused(monkeypatch):
+    """A new client per enqueue meant a new gRPC channel and a credentials lookup on every webhook."""
+    fake_client, constructions = _fake_tasks_client(monkeypatch)
+
+    webhook_server._enqueue_enrichment("111")
+    webhook_server._enqueue_enrichment("222")
+    webhook_server._enqueue_enrichment("333")
+
+    assert len(constructions) == 1
+    assert fake_client.create_task.call_count == 3
+
+
+def test_the_task_is_named_after_the_hubspot_event_so_a_redelivery_cannot_queue_a_second_run(monkeypatch):
+    """HubSpot retries a webhook it thinks timed out, with the same occurredAt. The same name makes
+    Cloud Tasks refuse the second task."""
+    fake_client, _ = _fake_tasks_client(monkeypatch)
+
+    webhook_server._enqueue_enrichment("12345", "1760000000000-77")
+
+    task = fake_client.create_task.call_args.kwargs["request"]["task"]
+    assert task["name"] == "projects/proj/locations/us-central1/queues/hubspot-enrichment/tasks/enrich-12345-1760000000000-77"
+
+
+def test_a_task_name_only_ever_contains_characters_cloud_tasks_allows(monkeypatch):
+    fake_client, _ = _fake_tasks_client(monkeypatch)
+
+    webhook_server._enqueue_enrichment("12345", "17600/00:00 77")
+
+    task_id = fake_client.create_task.call_args.kwargs["request"]["task"]["name"].rsplit("/", 1)[-1]
+    assert task_id == "enrich-12345-17600-00-00-77"
+
+
+def test_an_event_without_a_key_makes_an_unnamed_task(monkeypatch):
+    fake_client, _ = _fake_tasks_client(monkeypatch)
+
+    webhook_server._enqueue_enrichment("12345")
+
+    assert "name" not in fake_client.create_task.call_args.kwargs["request"]["task"]
+
+
+def test_a_duplicate_delivery_is_not_an_error(monkeypatch):
+    fake_client, _ = _fake_tasks_client(monkeypatch)
+    fake_client.create_task.side_effect = gexc.AlreadyExists("task exists")
+
+    webhook_server._enqueue_enrichment("12345", "1760000000000-77")   # must not raise
+
+    assert fake_client.create_task.call_count == 1
+
+
+def test_any_other_enqueue_failure_still_surfaces(monkeypatch):
+    fake_client, _ = _fake_tasks_client(monkeypatch)
+    fake_client.create_task.side_effect = gexc.PermissionDenied("no")
+
+    with pytest.raises(gexc.PermissionDenied):
+        webhook_server._enqueue_enrichment("12345", "1760000000000-77")
+
+
+def test_the_task_may_run_as_long_as_the_service_does(monkeypatch):
+    """Cloud Tasks gives an HTTP task 10 minutes by default and Cloud Run 30. A long corporation run cut
+    off at 10 was retried, and a retry pays the vendors again."""
+    from google.cloud import tasks_v2
+
+    fake_client, _ = _fake_tasks_client(monkeypatch)
+
+    webhook_server._enqueue_enrichment("12345", "1760000000000-77")
+
+    request = fake_client.create_task.call_args.kwargs["request"]
+    proto = tasks_v2.CreateTaskRequest(request)     # the real message: a malformed field raises here
+    assert proto.task.dispatch_deadline.seconds == 1800

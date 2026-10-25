@@ -46,6 +46,13 @@ RUNTIME_SA="${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 TASKS_SA="hubspot-enrichment-tasks@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA="hubspot-enrichment-build@${PROJECT_ID}.iam.gserviceaccount.com"
 
+# Secrets the service reads when they exist. A missing one is skipped, not an error:
+# BOUNCEBAN_API_KEY turns on the BounceBan second opinion behind MillionVerifier, and
+# the service runs the same without it. Creating one is a separate step (see the PR).
+OPTIONAL_SECRETS=(
+  BOUNCEBAN_API_KEY
+)
+
 # Must match the --set-secrets list in cloudbuild.yaml.
 SECRETS=(
   HUBSPOT_API_KEY
@@ -55,10 +62,13 @@ SECRETS=(
   HUBSPOT_WEBHOOK_SECRET
 )
 
-# Datasets the matcher reads: HubSpot_Airbyte (companies, contacts),
+# Datasets the matcher reads: HubSpot_Airbyte_Self_Hosted (the current HubSpot
+# mirror: companies, contacts; HubSpot_Airbyte stopped syncing on 2026-09-29),
 # definitive_healthcare (the DH tables), state_associations (state association table).
+# This script only ever adds access: if the account was granted HubSpot_Airbyte
+# before, that grant is now unused and can be removed by hand.
 DATASETS=(
-  HubSpot_Airbyte
+  HubSpot_Airbyte_Self_Hosted
   definitive_healthcare
   state_associations
 )
@@ -87,6 +97,20 @@ for secret in "${SECRETS[@]}"; do
     --project="${PROJECT_ID}" \
     --condition=None --quiet >/dev/null
   echo "    ${secret}"
+done
+
+echo "--- Granting secretAccessor on optional secrets that exist..."
+for secret in "${OPTIONAL_SECRETS[@]}"; do
+  if gcloud secrets describe "${secret}" --project="${PROJECT_ID}" &>/dev/null; then
+    gcloud secrets add-iam-policy-binding "${secret}" \
+      --member="serviceAccount:${RUNTIME_SA}" \
+      --role="roles/secretmanager.secretAccessor" \
+      --project="${PROJECT_ID}" \
+      --condition=None --quiet >/dev/null
+    echo "    ${secret}"
+  else
+    echo "    ${secret}: no such secret yet, skipped"
+  fi
 done
 
 # ── 3. BigQuery: permission to run query jobs ─────────────────────────────────
@@ -164,7 +188,7 @@ echo "  1. Verify the account can do its job before switching. Impersonating it"
 echo "     needs roles/iam.serviceAccountTokenCreator on it (Owner does not include"
 echo "     that); grant it temporarily and remove it afterwards:"
 echo "       CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT=${RUNTIME_SA} \\"
-echo "         bq query --use_legacy_sql=false 'SELECT COUNT(*) FROM \`${PROJECT_ID}.HubSpot_Airbyte.companies\`'"
+echo "         bq query --use_legacy_sql=false 'SELECT COUNT(*) FROM \`${PROJECT_ID}.HubSpot_Airbyte_Self_Hosted.companies\`'"
 echo ""
 echo "  2. Switch the service (creates a new revision):"
 echo "       gcloud run services update ${SERVICE_NAME} --region=${REGION} \\"

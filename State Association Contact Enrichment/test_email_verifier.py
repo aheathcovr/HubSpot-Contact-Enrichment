@@ -22,7 +22,8 @@ from email_verifier import verify_email_millionverifier
 
 
 def _mock_response(
-    result: str, quality: str, free=False, role=False, didyoumean="", error=""
+    result: str, quality: str, free=False, role=False, didyoumean="", error="",
+    subresult=None, credits=None, livemode=None,
 ):
     """
     Shape of a MillionVerifier v3 single-verification reply.
@@ -42,6 +43,9 @@ def _mock_response(
         "didyoumean": didyoumean,
         "error":      error,
     }
+    for key, value in (("subresult", subresult), ("credits", credits), ("livemode", livemode)):
+        if value is not None:
+            mock_resp.json.return_value[key] = value
     return mock_resp
 
 
@@ -207,6 +211,82 @@ class TestVerifyEmailMillionverifier(unittest.TestCase):
         result = verify_email_millionverifier("user@gmai.com")
 
         self.assertEqual(result["didyoumean"], "user@gmail.com")
+
+
+    # ── 9: use the longest timeout MillionVerifier allows ─────────────────────
+
+    @patch("email_verifier._session.get")
+    def test_asks_for_the_longest_timeout_millionverifier_allows(self, mock_get):
+        # The API accepts 2-60s (default 20): how long it waits on the recipient's mail
+        # server before giving up with `unknown`. 10s timed out slow servers into
+        # `unknown` that a longer wait would have settled; the outbound repo uses 60.
+        os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
+        mock_get.return_value = _mock_response("ok", "good")
+
+        verify_email_millionverifier("jane@facility.com")
+
+        self.assertEqual(mock_get.call_args.kwargs["params"]["timeout"], 60)
+        self.assertGreater(mock_get.call_args.kwargs["timeout"], 60)    # our own wait outlasts theirs
+
+    # ── 10: the detail MillionVerifier returns and we used to drop ────────────
+
+    @patch("email_verifier._session.get")
+    def test_subresult_is_passed_through(self, mock_get):
+        os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
+        mock_get.return_value = _mock_response("invalid", "bad", subresult="no_mailbox")
+
+        result = verify_email_millionverifier("ghost@facility.com")
+
+        self.assertEqual(result["subresult"], "no_mailbox")
+
+    @patch("email_verifier._session.get")
+    def test_unverified_is_a_real_result_word_and_is_unknown_without_a_warning(self, mock_get):
+        os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
+        mock_get.return_value = _mock_response("unverified", "")
+
+        with self.assertNoLogs("email_verifier", level="WARNING"):
+            result = verify_email_millionverifier("jane@facility.com")
+
+        self.assertEqual(result["status"], "UNKNOWN")
+
+    # ── 11: the balance rides on every response ───────────────────────────────
+
+    @patch("email_verifier._session.get")
+    def test_low_credits_are_reported_once_per_window_with_an_alert_tag(self, mock_get):
+        import email_verifier
+        email_verifier._last_low_credits_warning = None
+        os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
+        mock_get.return_value = _mock_response("ok", "good", credits=50)
+
+        with self.assertLogs("email_verifier", level="WARNING") as logged:
+            verify_email_millionverifier("a@facility.com")
+            verify_email_millionverifier("b@facility.com")
+
+        flagged = [r for r in logged.records if getattr(r, "json_fields", {}).get("alert") == "millionverifier_credits_low"]
+        self.assertEqual(len(flagged), 1)
+
+    @patch("email_verifier._session.get")
+    def test_a_healthy_balance_is_not_reported(self, mock_get):
+        os.environ["MILLIONVERIFIER_API_KEY"] = "test-key"
+        mock_get.return_value = _mock_response("ok", "good", credits=1880)
+
+        with self.assertNoLogs("email_verifier", level="WARNING"):
+            verify_email_millionverifier("jane@facility.com")
+
+    # ── 12: a test key must never pass for a real answer ──────────────────────
+
+    @patch("email_verifier._session.get")
+    def test_a_test_mode_key_is_reported_as_an_error(self, mock_get):
+        import email_verifier
+        email_verifier._last_low_credits_warning = None
+        os.environ["MILLIONVERIFIER_API_KEY"] = "API_KEY_FOR_OK"
+        mock_get.return_value = _mock_response("ok", "good", credits=5000, livemode=False)
+
+        with self.assertLogs("email_verifier", level="ERROR") as logged:
+            verify_email_millionverifier("jane@facility.com")
+
+        flagged = [r for r in logged.records if getattr(r, "json_fields", {}).get("alert") == "millionverifier_test_mode"]
+        self.assertEqual(len(flagged), 1)
 
 
 if __name__ == "__main__":

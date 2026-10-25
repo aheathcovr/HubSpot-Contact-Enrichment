@@ -144,15 +144,27 @@ def _extract_bare_domain(url: str) -> str:
 BQ_PROJECT_ID = os.getenv("BQ_PROJECT_ID", "gen-lang-client-0844868008")
 BQ_LOCATION   = os.getenv("BQ_LOCATION",   "US")
 
-HUBSPOT_COMPANIES_TABLE = f"{BQ_PROJECT_ID}.HubSpot_Airbyte.companies"
-HUBSPOT_CONTACTS_TABLE  = f"{BQ_PROJECT_ID}.HubSpot_Airbyte.contacts"
+# The copy of HubSpot that Airbyte keeps in BigQuery, which contact matching reads.
+# Two syncs exist and they have frozen and thawed before: `HubSpot_Airbyte` last
+# synced 2026-09-29 (25 days stale on 2026-10-24, so 2,425 contacts were invisible
+# here) while `HubSpot_Airbyte_Self_Hosted` was current. Both carry every column
+# the queries below read. Override with HUBSPOT_MIRROR_DATASET if that flips again.
+HUBSPOT_MIRROR_DATASET  = os.getenv("HUBSPOT_MIRROR_DATASET", "HubSpot_Airbyte_Self_Hosted")
+HUBSPOT_COMPANIES_TABLE = f"{BQ_PROJECT_ID}.{HUBSPOT_MIRROR_DATASET}.companies"
+HUBSPOT_CONTACTS_TABLE  = f"{BQ_PROJECT_ID}.{HUBSPOT_MIRROR_DATASET}.contacts"
+
+# Past this the mirror is treated as stale. Matches the limit the outbound repo's
+# scripts refuse at.
+HUBSPOT_MIRROR_MAX_AGE_HOURS = 36.0
+_MIRROR_CHECK_TTL_SECONDS = 900
+_mirror_age_cache: dict = {}      # "checked" -> (monotonic time, hours or None)
+_mirror_age_lock = threading.Lock()
 
 DH_TABLES = {
     "snf_overview": f"{BQ_PROJECT_ID}.definitive_healthcare.SNF Overview",
     "alf_overview": f"{BQ_PROJECT_ID}.definitive_healthcare.ALF Overview",
     "executives":   f"{BQ_PROJECT_ID}.definitive_healthcare.Executives",
     "corporation":  f"{BQ_PROJECT_ID}.definitive_healthcare.Corporate Executives",
-    "full_feed":    f"{BQ_PROJECT_ID}.definitive_healthcare.December SNF AND ALF Contact Full Feed",
 }
 
 STATE_ASSOC_TABLE = f"{BQ_PROJECT_ID}.state_associations.state_association_snf_al_il_information"
@@ -263,6 +275,65 @@ _GUIDE_CACHE: tuple[list[dict], list[dict]] | None = None
 
 
 # call_openrouter, parse_found_name, normalize_phone — imported from state_association.llm_client
+
+
+def check_hubspot_mirror_freshness(
+    client: bigquery.Client,
+    max_age_hours: float = HUBSPOT_MIRROR_MAX_AGE_HOURS,
+) -> Optional[float]:
+    """
+    Return how many hours old the HubSpot mirror is, and say so loudly if it is stale.
+
+    Contact matching reads the mirror, so a frozen sync means contacts added to
+    HubSpot since then are not found and can be created a second time. Past
+    *max_age_hours* this logs one ERROR tagged ``alert: hubspot_mirror_stale`` (it
+    is counted by the "unexpected errors" alert). It never raises and never blocks
+    enrichment: the HubSpot API still catches an exact-email duplicate on create.
+
+    Returns None when the age cannot be determined (the check failed, or the table
+    has no sync timestamp). The answer is cached for 15 minutes so one query serves
+    every enrichment on a warm instance.
+    """
+    now = time.monotonic()
+    with _mirror_age_lock:
+        cached = _mirror_age_cache.get("checked")
+        if cached and now - cached[0] < _MIRROR_CHECK_TTL_SECONDS:
+            return cached[1]
+
+    hours: Optional[float] = None
+    try:
+        rows = list(client.query(f"""
+            SELECT TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(_airbyte_extracted_at), MINUTE) AS minutes_old
+            FROM `{HUBSPOT_CONTACTS_TABLE}`
+        """).result())
+        minutes_old = rows[0].minutes_old if rows else None
+        if minutes_old is None:
+            logger.error(
+                "HubSpot mirror %s has no sync timestamp: cannot tell how stale it is",
+                HUBSPOT_MIRROR_DATASET,
+                extra={"json_fields": {"alert": "hubspot_mirror_stale", "mirror": HUBSPOT_MIRROR_DATASET}},
+            )
+        else:
+            hours = minutes_old / 60.0
+            if hours > max_age_hours:
+                logger.error(
+                    "HubSpot mirror %s is %.0f hours old (limit %.0f): contacts added to HubSpot since "
+                    "then are not matched, so duplicates are possible",
+                    HUBSPOT_MIRROR_DATASET, hours, max_age_hours,
+                    extra={"json_fields": {
+                        "alert": "hubspot_mirror_stale",
+                        "mirror": HUBSPOT_MIRROR_DATASET,
+                        "hours_old": round(hours, 1),
+                    }},
+                )
+            else:
+                logger.info("HubSpot mirror %s is %.1f hours old", HUBSPOT_MIRROR_DATASET, hours)
+    except Exception as exc:
+        logger.warning("Could not check HubSpot mirror freshness: %s", exc)
+
+    with _mirror_age_lock:
+        _mirror_age_cache["checked"] = (now, hours)
+    return hours
 
 
 def lookup_hubspot_contact_enhanced(
@@ -1175,35 +1246,6 @@ def load_corporate_level_contacts(
     except Exception as e:
         logger.warning(f"Corporate Executives table query failed: {e}")
 
-    # ── Source 3: December Full Feed (contacts at network_id HOSPITAL_ID) ──
-    feed_query = f"""
-    SELECT
-        EXECUTIVE_ID,
-        CAST(HOSPITAL_ID AS INT64) AS hospital_id,
-        EXECUTIVE_NAME,
-        FIRST_NAME,
-        LAST_NAME,
-        LOWER(TRIM(TITLE)) AS title,
-        EMAIL,
-        NULL AS DIRECT_PHONE,
-        NULL AS LOCATION_PHONE,
-        LINKEDIN_PROFILE,
-        HOSPITAL_NAME,
-        LAST_UPDATE,
-        'december_full_feed' AS source_table
-    FROM `{DH_TABLES['full_feed']}`
-    WHERE HOSPITAL_ID = @network_id
-      AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W2_TITLE_PATTERN}')
-      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_FORMER_FILTER}')
-      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{_EXCLUDED_FUNCTIONS}')
-    """
-    try:
-        rows = [dict(r) for r in client.query(feed_query, job_config=_net_cfg).result()]
-        all_rows.extend(rows)
-        logger.info(f"December Full Feed (network level): {len(rows)} rows")
-    except Exception as e:
-        logger.warning(f"December Full Feed query failed: {e}")
-
     if not all_rows:
         logger.info("No corporate-level executive contacts found in Definitive Healthcare.")
         return pd.DataFrame()
@@ -1212,7 +1254,7 @@ def load_corporate_level_contacts(
 
     # Deduplicate step 1: keep one row per EXECUTIVE_ID, preferring the richest source.
     # (same person can appear in multiple tables with the same EXECUTIVE_ID)
-    priority = {"december_full_feed": 0, "corporate_executives": 1, "executives": 2}
+    priority = {"corporate_executives": 0, "executives": 1}
     df["_priority"] = df["source_table"].map(priority).fillna(9)
     df = df.sort_values("_priority").drop_duplicates(subset=["EXECUTIVE_ID"], keep="first")
     df = df.drop(columns=["_priority"])
@@ -1243,8 +1285,8 @@ def query_dh_facility_contacts(
     """
     Query Definitive Healthcare for facility-level contacts at a specific HOSPITAL_ID.
 
-    Checks both the Executives table and the December Full Feed, filtering to
-    Administrator, Executive Director, Director of Nursing, and related titles.
+    Reads the Executives table, filtering to Administrator, Executive Director,
+    Director of Nursing, and related titles.
     Tech/IT roles (Database Administrator, Systems Admin, etc.) are excluded.
 
     Returns a list of contact dicts ordered by title priority
@@ -1263,58 +1305,44 @@ def query_dh_facility_contacts(
         bigquery.ScalarQueryParameter("hospital_id", "INT64", hospital_id_int),
     ])
 
-    # The executives and full_feed tables have slightly different schemas:
-    #   executives: has DIRECT_PHONE, LOCATION_PHONE
-    #   full_feed:  has PHONE (no DIRECT_PHONE), LOCATION_PHONE
-    # Build table-specific SELECT expressions for the phone column.
-    _phone_cols = {
-        "executives": "TRIM(DIRECT_PHONE)          AS direct_phone",
-        "full_feed":  "TRIM(PHONE)                 AS direct_phone",
-    }
-
-    for table_key, table in [("executives", DH_TABLES["executives"]), ("full_feed", DH_TABLES["full_feed"])]:
-        phone_col = _phone_cols[table_key]
-        query = f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(CAST(EXECUTIVE_ID AS STRING)), ''), '') AS executive_id,
-            COALESCE(NULLIF(TRIM(FIRST_NAME),   ''), '') AS first_name,
-            COALESCE(NULLIF(TRIM(LAST_NAME),    ''), '') AS last_name,
-            COALESCE(
-                NULLIF(TRIM(EXECUTIVE_NAME), ''),
-                CONCAT(TRIM(FIRST_NAME), ' ', TRIM(LAST_NAME))
-            ) AS full_name,
-            LOWER(TRIM(TITLE))          AS title,
-            TRIM(EMAIL)                 AS email,
-            {phone_col},
-            TRIM(LOCATION_PHONE)        AS location_phone,
-            TRIM(LINKEDIN_PROFILE)      AS linkedin_url,
-            CAST(LAST_UPDATE AS STRING) AS last_update,
-            '{table_key}'               AS source_table
-        FROM `{table}`
-        WHERE CAST(HOSPITAL_ID AS INT64) = @hospital_id
-          AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W1_TITLE_PATTERN}')
-          AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W1_TECH_EXCLUDE}')
-        """
-        try:
-            rows = [dict(r) for r in client.query(query, job_config=job_config).result()]
-            all_rows.extend(rows)
-            if rows:
-                logger.info(
-                    "DH facility lookup (%s, HOSPITAL_ID=%s): %d contact(s)",
-                    table_key, hospital_id_int, len(rows),
-                )
-        except Exception as exc:
-            logger.warning(
-                "DH facility contact query failed (%s, HOSPITAL_ID=%s): %s",
-                table_key, hospital_id_int, exc,
+    query = f"""
+    SELECT
+        COALESCE(NULLIF(TRIM(CAST(EXECUTIVE_ID AS STRING)), ''), '') AS executive_id,
+        COALESCE(NULLIF(TRIM(FIRST_NAME),   ''), '') AS first_name,
+        COALESCE(NULLIF(TRIM(LAST_NAME),    ''), '') AS last_name,
+        COALESCE(
+            NULLIF(TRIM(EXECUTIVE_NAME), ''),
+            CONCAT(TRIM(FIRST_NAME), ' ', TRIM(LAST_NAME))
+        ) AS full_name,
+        LOWER(TRIM(TITLE))          AS title,
+        TRIM(EMAIL)                 AS email,
+        TRIM(DIRECT_PHONE)          AS direct_phone,
+        TRIM(LOCATION_PHONE)        AS location_phone,
+        TRIM(LINKEDIN_PROFILE)      AS linkedin_url,
+        CAST(LAST_UPDATE AS STRING) AS last_update,
+        'executives'                AS source_table
+    FROM `{DH_TABLES['executives']}`
+    WHERE CAST(HOSPITAL_ID AS INT64) = @hospital_id
+      AND REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W1_TITLE_PATTERN}')
+      AND NOT REGEXP_CONTAINS(LOWER(TRIM(TITLE)), r'{DH_W1_TECH_EXCLUDE}')
+    """
+    try:
+        all_rows = [dict(r) for r in client.query(query, job_config=job_config).result()]
+        if all_rows:
+            logger.info(
+                "DH facility lookup (HOSPITAL_ID=%s): %d contact(s)",
+                hospital_id_int, len(all_rows),
             )
+    except Exception as exc:
+        logger.warning(
+            "DH facility contact query failed (HOSPITAL_ID=%s): %s",
+            hospital_id_int, exc,
+        )
 
     if not all_rows:
         return []
 
-    # Deduplicate by normalised full name, preferring executives table
-    _priority = {"executives": 0, "full_feed": 1}
-    all_rows.sort(key=lambda r: _priority.get(r.get("source_table", ""), 9))
+    # Deduplicate by normalised full name
     seen: set[str] = set()
     deduped: list[dict] = []
     for r in all_rows:
@@ -1579,7 +1607,7 @@ def verify_contact_in_definitive(
     Check whether a contact is still listed in Definitive Healthcare for a
     specific facility (HOSPITAL_ID).
 
-    Queries the Executives table first, then the Full Feed as a fallback.
+    Queries the Executives table.
 
     Returns a dict:
       confirmed (bool)        — True if found by name at this HOSPITAL_ID
@@ -1587,7 +1615,7 @@ def verify_contact_in_definitive(
       dh_title (str)          — Title in DH
       dh_email (str)          — Email in DH (may be empty)
       dh_last_update (str)    — LAST_UPDATE as ISO date string
-      source_table (str)      — "executives" | "full_feed" | ""
+      source_table (str)      — "executives" | ""
       error (str)             — non-empty string if lookup was skipped or failed
     """
     _empty = {"confirmed": False, "dh_name": "", "dh_title": "", "dh_email": "",
@@ -1600,47 +1628,46 @@ def verify_contact_in_definitive(
 
     hospital_id_int = int(str(definitive_hospital_id).strip())
 
-    for table_key in ("executives", "full_feed"):
-        table = DH_TABLES[table_key]
-        query = f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(EXECUTIVE_NAME), ''),
-                     CONCAT(TRIM(FIRST_NAME), ' ', TRIM(LAST_NAME))) AS dh_name,
-            LOWER(TRIM(TITLE))              AS dh_title,
-            TRIM(EMAIL)                     AS dh_email,
-            CAST(LAST_UPDATE AS STRING)     AS dh_last_update
-        FROM `{table}`
-        WHERE CAST(HOSPITAL_ID AS INT64) = @hospital_id
-          AND LOWER(TRIM(FIRST_NAME)) = LOWER(@first_name)
-          AND LOWER(TRIM(LAST_NAME))  = LOWER(@last_name)
-        LIMIT 1
-        """
-        job_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("hospital_id", "INT64", hospital_id_int),
-            bigquery.ScalarQueryParameter("first_name",  "STRING", first_name.strip()),
-            bigquery.ScalarQueryParameter("last_name",   "STRING", last_name.strip()),
-        ])
-        try:
-            rows = list(client.query(query, job_config=job_config).result())
-            if rows:
-                r = dict(rows[0])
-                return {
-                    "confirmed":      True,
-                    "dh_name":        str(r.get("dh_name") or ""),
-                    "dh_title":       str(r.get("dh_title") or ""),
-                    "dh_email":       str(r.get("dh_email") or ""),
-                    "dh_last_update": str(r.get("dh_last_update") or "")[:10],
-                    "source_table":   table_key,
-                    "error":          "",
-                }
-        except Exception as exc:
-            logger.warning(
-                "DH verification query (%s) failed for %s %s at HOSPITAL_ID=%s: %s",
-                table_key, first_name, last_name, hospital_id_int, exc,
-            )
-            return {**_empty, "error": "query_failed"}
+    query = f"""
+    SELECT
+        COALESCE(NULLIF(TRIM(EXECUTIVE_NAME), ''),
+                 CONCAT(TRIM(FIRST_NAME), ' ', TRIM(LAST_NAME))) AS dh_name,
+        LOWER(TRIM(TITLE))              AS dh_title,
+        TRIM(EMAIL)                     AS dh_email,
+        CAST(LAST_UPDATE AS STRING)     AS dh_last_update
+    FROM `{DH_TABLES['executives']}`
+    WHERE CAST(HOSPITAL_ID AS INT64) = @hospital_id
+      AND LOWER(TRIM(FIRST_NAME)) = LOWER(@first_name)
+      AND LOWER(TRIM(LAST_NAME))  = LOWER(@last_name)
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("hospital_id", "INT64", hospital_id_int),
+        bigquery.ScalarQueryParameter("first_name",  "STRING", first_name.strip()),
+        bigquery.ScalarQueryParameter("last_name",   "STRING", last_name.strip()),
+    ])
+    try:
+        rows = list(client.query(query, job_config=job_config).result())
+    except Exception as exc:
+        logger.warning(
+            "DH verification query failed for %s %s at HOSPITAL_ID=%s: %s",
+            first_name, last_name, hospital_id_int, exc,
+        )
+        return {**_empty, "error": "query_failed"}
 
-    return {**_empty, "error": ""}   # queried successfully, not found
+    if not rows:
+        return {**_empty, "error": ""}   # queried successfully, not found
+
+    r = dict(rows[0])
+    return {
+        "confirmed":      True,
+        "dh_name":        str(r.get("dh_name") or ""),
+        "dh_title":       str(r.get("dh_title") or ""),
+        "dh_email":       str(r.get("dh_email") or ""),
+        "dh_last_update": str(r.get("dh_last_update") or "")[:10],
+        "source_table":   "executives",
+        "error":          "",
+    }
 
 
 # ─── Concurrent worker functions ─────────────────────────────────────────────
@@ -2335,7 +2362,6 @@ def search_facility_website_for_leadership(
                 extra_params=extra_params,
                 timeout=W2_TIMEOUT,
             )
-        time.sleep(W1_RATE_LIMIT_SECONDS)
         data = json.loads(raw)
         contacts = data.get("contacts", [])
     except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
@@ -2435,7 +2461,6 @@ def search_corporation_website_for_executives(
                 extra_params=extra_params,
                 timeout=W2_TIMEOUT,
             )
-        time.sleep(W2_RATE_LIMIT_SECONDS)
         data = json.loads(raw)
         contacts = data.get("contacts", [])
     except (RuntimeError, json.JSONDecodeError, AttributeError, TypeError) as exc:
