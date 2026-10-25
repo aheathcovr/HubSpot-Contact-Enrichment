@@ -1,7 +1,8 @@
 # State Senior Care Association Directory: Agent Reference
 
-**version:** 3.0
-**date:** 2026-03-13
+**version:** 3.1
+**date:** 2026-10-25
+**revision 3.1:** entries marked "Checked 2026-10-25" were opened in a browser. Washington, Virginia, North Dakota, Montana, Indiana, Colorado (SNF), Delaware, Alabama (SNF) and Missouri were confirmed to show a named contact; New York and Idaho were found to show none; the Oklahoma and New Mexico directories are behind a Cloudflare bot challenge; PALA, NCALA, CALA (Colorado) and Maine render no list without a search or login. Entries not mentioned were not re-checked.
 **purpose:** Machine-readable reference for an autonomous agent performing facility-level contact research (Administrator, Executive Director, Director of Nursing) across US senior care facilities.
 
 ## Agent Instructions
@@ -40,10 +41,10 @@ sources:
     directory_url: https://www.whca.org/facility-finder/
     login_required: false
     contacts_available:
-      - executive_director_name
-      - executive_director_phone
+      - administrator_name
+      - administrator_phone
     url_pattern: https://www.whca.org/facility-finder/{slug}/
-    access_notes: Individual facility pages render via JavaScript. Use Firecrawl or a headless browser. The slug is typically the full facility name lowercased with spaces replaced by hyphens.
+    access_notes: 'Checked 2026-10-25 in a browser: the detail page shows the person labelled "Administrator" with phone, fax and website (no email). About 766 facility pages are linked from the finder; robots.txt asks for Crawl-delay 10. The slug is the facility name lowercased with spaces replaced by hyphens.'
     verified: true
 ```
 
@@ -149,11 +150,10 @@ sources:
     directory_url: https://www.dhcfa.org/care-finder/directory/
     login_required: false
     contacts_available:
-      - executive_director_name
       - administrator_name
-      - director_of_nursing_name
-    url_pattern: null
-    access_notes: Combined association for SNF and ALF. Directory lists multiple contacts per facility including ED, Admin, and DON.
+      - administrator_phone
+    url_pattern: https://www.dhcfa.org/care-finder/directory/{slug}/
+    access_notes: 'Checked 2026-10-25 in a browser: the detail page shows the Administrator (with credential, e.g. NHA) and phone. About 68 facility pages. The earlier note that ED and DON are also listed was not seen on the page checked. robots.txt asks for Crawl-delay 10.'
     verified: true
 ```
 
@@ -178,8 +178,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Member directory lists a contact person per ALF.
-    verified: true
+    access_notes: 'Checked 2026-10-25 in a browser: the page shows only a Sign-in header; no facility list rendered without a search or login. The earlier claim is not confirmed.'
+    verified: false
 ```
 
 ```yaml
@@ -204,8 +204,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Member directory lists a contact person per ALF.
-    verified: true
+    access_notes: 'Checked 2026-10-25 in a browser: the page renders almost nothing (about 1 KB, no list). The earlier claim of a contact person per ALF is not confirmed.'
+    verified: false
 ```
 
 ```yaml
@@ -219,8 +219,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Directory lists Administrator per SNF facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25: the page returns a Cloudflare "Performing security verification" bot challenge to a browser session. Not crawlable without getting past it, which we do not do. The contents were not seen.'
+    verified: false
   - type: ALF
     association_name: Care Providers Oklahoma
     association_url: https://www.careoklahoma.com
@@ -229,8 +229,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Directory lists Administrator per ALF facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25: Cloudflare bot challenge, same as the SNF directory. Not crawlable; contents not seen.'
+    verified: false
 ```
 
 ```yaml
@@ -242,9 +242,10 @@ sources:
     directory_url: https://www.cohca.org/consumers/find-care/
     login_required: false
     contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: Directory lists Administrator per SNF facility.
+      - executive_director_name
+      - executive_director_phone
+    url_pattern: https://www.cohca.org/consumers/find-care/{slug}/
+    access_notes: 'Checked 2026-10-25 in a browser: the detail page shows the person (labelled "Executive Director" on the page checked) with phone and an EMAIL address. About 254 facility pages; robots.txt asks for Crawl-delay 10.'
     verified: true
   - type: ALF
     association_name: Colorado Assisted Living Association (CALA)
@@ -254,8 +255,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Directory lists Administrator per ALF facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25 in a browser: the provider-directory page renders no facility list (about 2 KB of text). The earlier claim is not confirmed.'
+    verified: false
 ```
 
 ```yaml
@@ -266,21 +267,19 @@ sources:
     association_url: https://www.idhca.org
     directory_url: https://members.idhca.org/atlas/directory/category/skilled-nursing-facility
     login_required: false
-    contacts_available:
-      - administrator_name
+    contacts_available: []
     url_pattern: null
-    access_notes: Member directory lists a contact person per SNF facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25 in a browser: the page is a JavaScript app (wait about 5 seconds). It lists 47 SNFs with name, phone, address and "Member Since" only; no contact names. The earlier claim of a contact person per facility is not supported.'
+    verified: false
   - type: ALF
     association_name: Idaho Health Care Association (IHCA)
     association_url: https://www.idhca.org
     directory_url: https://members.idhca.org/atlas/directory/category/assisted-living-facility
     login_required: false
-    contacts_available:
-      - administrator_name
+    contacts_available: []
     url_pattern: null
-    access_notes: Member directory lists a contact person per ALF facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25 in a browser: lists 80 ALFs with name, phone, address and "Member Since" only; no contact names. The earlier claim of a contact person per facility is not supported.'
+    verified: false
 ```
 
 ```yaml
@@ -294,8 +293,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Combined association for SNF and ALF. Directory lists a contact person per facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25 in a browser: the page is a search form (AF_MemberDirectory.asp); no list is shown until it is submitted, and we did not submit it. The earlier claim is not confirmed.'
+    verified: false
 ```
 
 ```yaml
@@ -309,8 +308,8 @@ sources:
     contacts_available:
       - administrator_name
     url_pattern: null
-    access_notes: Combined association for SNF and ALF. Member directory lists Administrator per facility.
-    verified: true
+    access_notes: 'Checked 2026-10-25: the directory returns a Cloudflare "Performing security verification" bot challenge. Not crawlable without getting past it, which we do not do. Contents not seen.'
+    verified: false
 ```
 
 ```yaml
@@ -319,13 +318,12 @@ sources:
   - type: SNF/ALF
     association_name: New York State Health Facilities Association / New York State Center for Assisted Living (NYSHFA/NYSCAL)
     association_url: https://nyshfa-nyscal.org
-    directory_url: https://www.nyshfa-nyscal.org/find-care-in-ny/
+    directory_url: https://www.nyshfa-nyscal.org/assisted-living-skilled-nursing/find-care-in-ny/
     login_required: false
-    contacts_available:
-      - administrator_name
-    url_pattern: null
-    access_notes: Combined directory for SNF and ALF. Lists Administrator per facility.
-    verified: true
+    contacts_available: []
+    url_pattern: https://www.nyshfa-nyscal.org/find-care-new-york/{slug}/
+    access_notes: 'Checked 2026-10-25 in a browser: the old URL now redirects to the one above. The detail page checked (Shaker Place) shows phone, fax and website only, with no named contact, so the earlier "Administrator per facility" claim is not supported. Only one detail page was checked.'
+    verified: false
 ```
 
 ```yaml
@@ -484,9 +482,10 @@ sources:
   login_required: false
   contacts_available:
   - administrator_name
+  - director_of_nursing_name
   url_pattern: null
-  access_notes: 'Facility locator lists Administrator per SNF. Verify individual facility pages. [Auto-updated: URL verified/fixed on "The provided URL works and lists facilities with Administrator and Director of Nursing names."]'
-  verified: false
+  access_notes: 'Checked 2026-10-25 in a browser: ONE page lists about 215 facilities with City, County, Region, Administrator and Dir of Nursing columns, plus phone, fax and email. No per-facility pages needed. The site serves a short JavaScript "You are being redirected" step, so a plain HTTP client sees a 307; use a browser. robots.txt asks for Crawl-delay 30.'
+  verified: true
 - type: ALF
   association_name: Assisted Living Association of Alabama (ALAA)
   association_url: https://alaaweb.org
@@ -878,10 +877,12 @@ sources:
     association_url: https://www.mohealthcare.com
     directory_url: https://www.mohealthcare.com/facility-directory/
     login_required: false
-    contacts_available: []
-    url_pattern: null
-    access_notes: Combined association for SNF and ALF. Directory reportedly lists Administrator but could not be fully verified. Attempt manual lookup.
-    verified: false
+    contacts_available:
+      - administrator_name
+      - administrator_phone
+    url_pattern: https://www.mohealthcare.com/facility-directory/{slug}/
+    access_notes: 'Checked 2026-10-25 in a browser: the detail page shows the Administrator with phone and an EMAIL address. About 369 facility pages; robots.txt asks for Crawl-delay 10.'
+    verified: true
 ```
 
 ```yaml
