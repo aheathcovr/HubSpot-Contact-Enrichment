@@ -40,6 +40,7 @@ from config import (
 from email_verifier import verify_email_millionverifier
 from fullenrich_client import enrich_contact_info, search_facility_contacts
 from hubspot_client import HubSpotClient, HubSpotError
+from identity_gate import same_org_or_affiliate
 from state_association_matcher import (
     _build_facility_research_prompt,
     _format_hubspot_matches_enhanced,
@@ -137,6 +138,7 @@ class ContactAction:
     found_linkedin: str = ""
     email_validation_status: str = ""   # VERIFIED | INVALID | UNKNOWN | RISKY | UNVERIFIED | ERROR
     email_validation_quality: str = ""  # good | risky | bad | ""
+    email_validation_result: str = ""   # MillionVerifier's own word: ok | catch_all | unknown | invalid | disposable | ""
     fe_email_found: bool = False        # True when FullEnrich Bulk Enrich contributed the email
     research_reasoning: str = ""        # Sonar Pro explanation of why this contact was identified
     research_source_name: str = ""      # Human-readable name of the source (e.g. "WA HCAP directory")
@@ -366,6 +368,51 @@ def _email_verification_line(email: str, ev: dict, source: str = "existing", fe_
     return h
 
 
+# What MillionVerifier can say about an address. Anything else ("skipped", "error",
+# "") means verification did not run, and there is nothing to record.
+_MV_RESULT_WORDS = frozenset({"ok", "catch_all", "unknown", "invalid", "disposable"})
+
+# source_path values for an address a paid vendor found (as opposed to Definitive,
+# the state association, or the operator's own site).
+_VENDOR_SOURCE_PATHS = frozenset({"fullenrich", "fullenrich_people_search"})
+
+
+def _verification_properties(ev: dict) -> dict:
+    """
+    The two contact properties that record a MillionVerifier answer.
+
+    `email_verification_result` and `email_verification_date` already exist in the
+    portal and are what the outbound lead loaders read to decide whether an address
+    is sendable and from which mailbox, so the result is written in MillionVerifier's
+    own words. Returns {} when verification did not actually run.
+    """
+    result = (ev or {}).get("result", "")
+    if result not in _MV_RESULT_WORDS:
+        return {}
+    return {
+        "email_verification_result": result,
+        "email_verification_date": str(HubSpotClient.epoch_ms_today_utc()),
+    }
+
+
+def _belongs_to_operator(email: str, facility_domain: str, facility_name: str, operator_name: str = "") -> bool:
+    """Is a vendor-found address at the facility, or at the operator that runs it?"""
+    return (
+        same_org_or_affiliate(email, facility_domain, facility_name)
+        or (bool(operator_name) and same_org_or_affiliate(email, "", operator_name))
+    )
+
+
+def _email_held_line(email: str) -> str:
+    """Note line for a vendor-found address that is not at the facility or its operator."""
+    return (
+        f"<b>⚠ Email held:</b> {email}<br>"
+        f"<b>Reason:</b> not at the facility's or operator's domain. It is probably another "
+        f"company's address (the person may have moved), so it was not verified or written. "
+        f"Check it by hand before using it.<br>"
+    )
+
+
 def _email_added_line(email: str, fe_info: dict, ev: dict) -> str:
     """HTML block for an email discovered by FullEnrich and added to HubSpot."""
     fe_status = fe_info.get("email_status", "")
@@ -494,6 +541,7 @@ def _enrich_and_associate_existing_contact(
     source_path: str,
     _base: dict,
     dh_executive_id: str = "",
+    operator_name: str = "",
 ) -> "ContactAction":
     """
     Enrich and finalise an existing HubSpot contact after it has been associated.
@@ -512,11 +560,14 @@ def _enrich_and_associate_existing_contact(
 
     Returns a ContactAction with action="associated_existing".
     """
+    held_email_note = _base.pop("email_held_note", "")   # before _base is spread into a ContactAction
     enriched_email = found_email
     enriched_email_status = email_validation.get("status", "")
     enriched_email_quality = email_validation.get("quality", "")
+    enriched_email_result = email_validation.get("result", "")
     enriched_phone = found_phone
-    note_lines: list[str] = []
+    note_lines: list[str] = [held_email_note] if held_email_note else []
+    existing_email_ev: dict = {}   # MillionVerifier's answer for the address ALREADY on the contact
     fe_info: dict = {}
 
     try:
@@ -609,6 +660,8 @@ def _enrich_and_associate_existing_contact(
             enriched_email = existing_email
             enriched_email_status = ev.get("status", "")
             enriched_email_quality = ev.get("quality", "")
+            enriched_email_result = ev.get("result", "")
+            existing_email_ev = ev
             note_lines.append(_email_verification_line(existing_email, ev, source="existing"))
             if ev.get("status") == "INVALID":
                 logger.info(
@@ -627,6 +680,7 @@ def _enrich_and_associate_existing_contact(
         # all properties in one body, and none of these decisions depend on a
         # previous write having already landed (they all read local state).
         pending_updates: dict = {}
+        pending_updates.update(_verification_properties(existing_email_ev))
 
         if data_freshness_value:
             pending_updates["data_freshness_according_to_definitive"] = data_freshness_value
@@ -634,10 +688,14 @@ def _enrich_and_associate_existing_contact(
         # ── DH-sourced email/phone if contact has none ────────────────────────
         if not existing_email and enriched_email and email_validation.get("status") != "INVALID":
             pending_updates["email"] = enriched_email
+            pending_updates.update(_verification_properties(email_validation))
             logger.info(
                 "Writing DH-sourced email %r to contact %s (no existing email)",
                 enriched_email, matched_contact_id,
             )
+        elif (existing_email and enriched_email and email_validation
+              and enriched_email.strip().lower() == existing_email.strip().lower()):
+            pending_updates.update(_verification_properties(email_validation))
         if not existing_phone and enriched_phone:
             pending_updates["phone"] = enriched_phone
             note_lines.append(_phone_dh_line(enriched_phone))
@@ -665,13 +723,19 @@ def _enrich_and_associate_existing_contact(
                 linkedin_url=found_linkedin,
             )
 
-            if fe_info.get("email"):
-                new_email = fe_info["email"]
+            fe_email = fe_info.get("email", "")
+            if fe_email and not _belongs_to_operator(fe_email, facility_domain, facility_name, operator_name):
+                note_lines.append(_email_held_line(fe_email))
+                logger.info("Holding FullEnrich address for contact %s: not at the facility or operator", matched_contact_id)
+            elif fe_email:
+                new_email = fe_email
                 ev = verify_email_millionverifier(new_email)
                 enriched_email_status = ev.get("status", "")
                 enriched_email_quality = ev.get("quality", "")
+                enriched_email_result = ev.get("result", "")
                 if ev.get("status") != "INVALID":
                     pending_updates["email"] = new_email
+                    pending_updates.update(_verification_properties(ev))
                     enriched_email = new_email
                     note_lines.append(_email_added_line(new_email, fe_info, ev))
                 else:
@@ -739,6 +803,7 @@ def _enrich_and_associate_existing_contact(
         found_phone=enriched_phone,
         email_validation_status=enriched_email_status,
         email_validation_quality=enriched_email_quality,
+        email_validation_result=enriched_email_result,
     )
     return ContactAction(
         action="associated_existing",
@@ -766,6 +831,7 @@ def _create_and_enrich_new_contact(
     research_reasoning: str,
     _base: dict,
     dh_executive_id: str = "",
+    operator_name: str = "",
 ) -> "ContactAction":
     """
     Create a new HubSpot contact with the found details, associate it with the
@@ -776,6 +842,7 @@ def _create_and_enrich_new_contact(
 
     Returns a ContactAction with action="created_new" or action="error".
     """
+    held_email_note = _base.pop("email_held_note", "")   # before _base is spread into a ContactAction
     contact_props: dict = {
         "firstname": first,
         "lastname": last,
@@ -783,6 +850,7 @@ def _create_and_enrich_new_contact(
     }
     if email_to_use:
         contact_props["email"] = email_to_use.strip()
+        contact_props.update(_verification_properties({"result": _base.get("email_validation_result", "")}))
     if found_phone:
         contact_props["phone"] = found_phone.strip()
     if found_linkedin:
@@ -807,7 +875,7 @@ def _create_and_enrich_new_contact(
         )
 
     # ── FullEnrich bulk enrich (work email only; see the existing-contact path) ─
-    new_note_lines: list[str] = []
+    new_note_lines: list[str] = [held_email_note] if held_email_note else []
     new_fe_info: dict = {}
     # Accumulate every post-creation property write into one batched PATCH
     # (FullEnrich email/phone/LinkedIn, data freshness, enrichment date)
@@ -828,14 +896,20 @@ def _create_and_enrich_new_contact(
             linkedin_url=found_linkedin,
         )
 
-        if new_fe_info.get("email"):
-            new_email = new_fe_info["email"]
+        fe_email = new_fe_info.get("email", "")
+        if fe_email and not _belongs_to_operator(fe_email, facility_domain, facility_name, operator_name):
+            new_note_lines.append(_email_held_line(fe_email))
+            logger.info("Holding FullEnrich address for new contact %s: not at the facility or operator", new_id)
+        elif fe_email:
+            new_email = fe_email
             ev = verify_email_millionverifier(new_email)
             if ev.get("status") != "INVALID":
                 pending_updates["email"] = new_email
+                pending_updates.update(_verification_properties(ev))
                 _base["found_email"] = new_email
                 _base["email_validation_status"] = ev.get("status", "")
                 _base["email_validation_quality"] = ev.get("quality", "")
+                _base["email_validation_result"] = ev.get("result", "")
                 _base["fe_email_found"] = True
                 new_note_lines.append(_email_added_line(new_email, new_fe_info, ev))
             else:
@@ -917,11 +991,23 @@ def _process_found_contact(
     fe_updated_at: str = "",
     research_source_name: str = "",
     dh_executive_id: str = "",
+    operator_name: str = "",
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
     """
     source_urls = _extract_urls(research_findings)[:20]
+
+    # ── Identity gate: a vendor-found address must be at the facility or operator ──
+    # MillionVerifier only says whether a mailbox is real, not whether it is the right
+    # person's. A vendor returns the person's CURRENT employer's address, which is a
+    # stranger's if they have moved. Hold it (not written, not paid to verify) and say so
+    # on the contact note. Definitive and the state association are not second-guessed.
+    held_email = ""
+    if found_email and source_path in _VENDOR_SOURCE_PATHS and not _belongs_to_operator(
+        found_email, facility_domain, facility_name, operator_name
+    ):
+        held_email, found_email = found_email, ""
 
     # ── Email validation (MillionVerifier) ────────────────────────────────────
     # email_to_use is cleared when the email is definitively INVALID so it is
@@ -950,6 +1036,7 @@ def _process_found_contact(
         target_company_id=target_company_id,
         email_validation_status=email_validation.get("status", ""),
         email_validation_quality=email_validation.get("quality", ""),
+        email_validation_result=email_validation.get("result", ""),
         research_reasoning=research_reasoning,
         source_path=source_path,
         fe_people_search_ran=fe_people_search_ran,
@@ -961,6 +1048,9 @@ def _process_found_contact(
         match_method="",         # populated below when a match is found
         found_phone_source="",   # populated in the enrich helpers
     )
+
+    if held_email:
+        _base["email_held_note"] = _email_held_line(held_email)   # picked up by the helpers below
 
     # Track match method for company-note display
     _match_method = ""
@@ -1057,6 +1147,7 @@ def _process_found_contact(
             source_path=source_path,
             _base=_base,
             dh_executive_id=dh_executive_id,
+            operator_name=operator_name,
         )
 
     return _create_and_enrich_new_contact(
@@ -1075,6 +1166,7 @@ def _process_found_contact(
         research_reasoning=research_reasoning,
         _base=_base,
         dh_executive_id=dh_executive_id,
+        operator_name=operator_name,
     )
 
 
@@ -1953,6 +2045,7 @@ def run_enrichment(company_id: str) -> None:
     # ── Step 4: Route by hierarchy type ──────────────────────────────────────
     results: list[dict] = []
     workflow_label = ""
+    parent_corp_name = ""   # W1 fills this in; passed on so an operator-domain address is not held as a stranger's
 
     if hierarchy_type == CHILD_HIERARCHY_TYPE:
         # ── Workflow 1: research this specific child facility ─────────────────
@@ -2156,6 +2249,7 @@ def run_enrichment(company_id: str) -> None:
             fe_updated_at=result.get("fe_updated_at", ""),
             research_source_name=result.get("research_source_name", ""),
             dh_executive_id=str(result.get("executive_id", "") or ""),
+            operator_name=parent_corp_name,
         )
 
     actions: list[ContactAction] = []
