@@ -275,9 +275,14 @@ class TestLookupGuideSources:
 
     @pytest.fixture(autouse=True)
     def use_minimal_guide(self, guide_file):
-        """Point guide helpers at the temp file for all tests in this class."""
-        with patch.object(m, "_GUIDE_PATH", str(guide_file)):
-            yield
+        """Load the synthetic guide into the cache for all tests in this class.
+
+        Patching _GUIDE_PATH does not work: _load_association_guide binds its default
+        path at import time, so these tests used to read the real guide (and broke
+        whenever it was edited). Loading from the temp file fills the cache instead.
+        """
+        m._load_association_guide(str(guide_file))
+        yield
 
     @pytest.mark.parametrize("state,ftype,expected_tier", [
         ("Washington", "SNF",  "1"),   # SNF/ALF combined, contacts public
@@ -333,21 +338,18 @@ class TestFormatSourcesForPrompt:
 
     @pytest.fixture
     def wa_tier1_data(self, guide_file):
-        with patch.object(m, "_GUIDE_PATH", str(guide_file)):
-            tier, srcs, fbs = m._lookup_guide_sources("Washington", "SNF")
-        return tier, srcs, fbs
+        m._load_association_guide(str(guide_file))
+        return m._lookup_guide_sources("Washington", "SNF")
 
     @pytest.fixture
     def fl_tier2_data(self, guide_file):
-        with patch.object(m, "_GUIDE_PATH", str(guide_file)):
-            tier, srcs, fbs = m._lookup_guide_sources("Florida", "SNF")
-        return tier, srcs, fbs
+        m._load_association_guide(str(guide_file))
+        return m._lookup_guide_sources("Florida", "SNF")
 
     @pytest.fixture
     def tx_tier3_data(self, guide_file):
-        with patch.object(m, "_GUIDE_PATH", str(guide_file)):
-            tier, srcs, fbs = m._lookup_guide_sources("Texas", "SNF")
-        return tier, srcs, fbs
+        m._load_association_guide(str(guide_file))
+        return m._lookup_guide_sources("Texas", "SNF")
 
     # Tier 1 assertions
     def test_tier1_contains_association_name(self, wa_tier1_data):
