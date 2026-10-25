@@ -26,19 +26,43 @@ The caller uses `status` for gating logic:
 
 If MILLIONVERIFIER_API_KEY is unset, returns status="UNVERIFIED" immediately
 (no HTTP call made). All exceptions are caught; errors return status="ERROR".
+
+Second opinion. MillionVerifier cannot settle an address behind a catch-all or a mail
+gateway: it says `catch_all` or `unknown`. For exactly those two answers, and only
+when BOUNCEBAN_API_KEY is set, BounceBan is asked (see bounceban_client). If it settles
+the address (ok / invalid, or catch_all for what MillionVerifier left unknown) its
+answer, already in MillionVerifier's words, replaces the result, and the dict gains
+`second_opinion="bounceban"`, `mv_result` (what MillionVerifier said) and
+`bounceban_score`. An `ok` or `invalid` from MillionVerifier is never second-guessed.
 """
 
 import logging
 import os
+import time
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import bounceban_client
+
 logger = logging.getLogger(__name__)
 
 _API_URL = "https://api.millionverifier.com/api/v3/"
-_TIMEOUT = 10  # MV API's own internal timeout (seconds); requests timeout = _TIMEOUT + 2
+# How long MillionVerifier waits on the recipient's mail server before giving up with
+# `unknown`. The API accepts 2-60s (default 20). 10s timed slow servers out into
+# `unknown`s that a longer wait settles, and `unknown` is the answer that then costs a
+# BounceBan credit. The outbound repo uses the 60s maximum for the same reason. Our own
+# wait must outlast it.
+_TIMEOUT = 60
+_REQUEST_SLACK = 20
+
+# MillionVerifier puts the account's remaining credits on every response. They do not
+# renew, so say so before they run out, at most once every ten minutes.
+_LOW_CREDITS = 200
+_WARNING_INTERVAL_S = 600
+_last_low_credits_warning = None     # monotonic time, or None if never warned
+_last_test_mode_warning = None
 
 
 def _build_session() -> requests.Session:
@@ -68,7 +92,11 @@ _RESULT_TO_STATUS: dict[str, str] = {
     "invalid":    "INVALID",
     "disposable": "INVALID",
     "unknown":    "UNKNOWN",
+    "unverified": "UNKNOWN",     # MillionVerifier's own word for "could not verify"
 }
+
+# The two answers MillionVerifier gives when the mail server will not settle an address.
+_UNSETTLED = frozenset({"unknown", "catch_all"})
 
 _UNVERIFIED: dict = {
     "result":     "skipped",
@@ -87,6 +115,33 @@ _ERROR: dict = {
     "role":       False,
     "didyoumean": "",
 }
+
+
+def _warn_throttled(last, message, *args, level=logging.WARNING, alert, **fields):
+    """Log at most once per _WARNING_INTERVAL_S. Returns the new "last warned" time."""
+    now = time.monotonic()
+    if last is not None and now - last < _WARNING_INTERVAL_S:
+        return last
+    logger.log(level, message, *args, extra={"json_fields": {"alert": alert, **fields}})
+    return now
+
+
+def _report_account_state(data: dict) -> None:
+    """Credits left and test mode, both of which ride on every response."""
+    global _last_low_credits_warning, _last_test_mode_warning
+    credits = data.get("credits")
+    if isinstance(credits, (int, float)) and not isinstance(credits, bool) and credits < _LOW_CREDITS:
+        _last_low_credits_warning = _warn_throttled(
+            _last_low_credits_warning,
+            "MillionVerifier has %s credits left and they do not renew", credits,
+            alert="millionverifier_credits_low", credits=credits,
+        )
+    if data.get("livemode") is False:
+        _last_test_mode_warning = _warn_throttled(
+            _last_test_mode_warning,
+            "MillionVerifier answered in test mode: this is a demo key, so these results are not real",
+            level=logging.ERROR, alert="millionverifier_test_mode",
+        )
 
 
 def verify_email_millionverifier(email: str) -> dict:
@@ -108,7 +163,7 @@ def verify_email_millionverifier(email: str) -> dict:
         resp = _session.get(
             _API_URL,
             params={"api": api_key, "email": email.strip(), "timeout": _TIMEOUT},
-            timeout=_TIMEOUT + 2,  # requests-level timeout slightly longer than MV's internal one
+            timeout=_TIMEOUT + _REQUEST_SLACK,  # our wait must outlast MV's own
         )
         resp.raise_for_status()
         data = resp.json()
@@ -130,11 +185,28 @@ def verify_email_millionverifier(email: str) -> dict:
             mv_result, email,
         )
 
-    return {
+    _report_account_state(data)
+
+    out = {
         "result":     mv_result,
         "quality":    mv_quality,
+        "subresult":  str(data.get("subresult", "") or ""),    # e.g. no_mailbox vs no_domain
         "status":     _RESULT_TO_STATUS.get(mv_result, "UNKNOWN"),
         "free":       bool(data.get("free", False)),
         "role":       bool(data.get("role", False)),
         "didyoumean": str(data.get("didyoumean", "") or ""),
     }
+
+    if mv_result in _UNSETTLED:
+        second = bounceban_client.second_opinion(email)
+        # BounceBan's own "unknown" adds nothing: keep MillionVerifier's answer, which
+        # may be the more informative one (catch_all vs unknown).
+        if second and second["result"] != "unknown":
+            out.update(
+                result=second["result"],
+                status=_RESULT_TO_STATUS.get(second["result"], "UNKNOWN"),
+                mv_result=mv_result,
+                second_opinion="bounceban",
+                bounceban_score=second["score"],
+            )
+    return out
