@@ -45,6 +45,7 @@ Key behaviours:
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 
@@ -56,9 +57,28 @@ logger = logging.getLogger(__name__)
 
 _SEARCH_URL  = "https://app.fullenrich.com/api/v2/people/search"
 _ENRICH_URL  = "https://app.fullenrich.com/api/v2/contact/enrich/bulk"
+_CREDITS_URL = "https://app.fullenrich.com/api/v2/account/credits"
 _TIMEOUT     = 15
 _POLL_INTERVAL = 5   # seconds between polling attempts
 _POLL_MAX      = 18  # max polls → 18 × 5s = 90s total wait
+
+# Rate limits. A 429 means the request was NOT processed, so a paid submit that gets
+# one can be repeated without any risk of being billed twice (the outbound repo's
+# FullEnrich client works the same way); a read timeout or 5xx cannot, which is why
+# those are still never repeated. A 429 while polling is different again: the credits
+# are already committed, so the job must be waited on, not abandoned.
+_RATE_LIMIT_DEFAULT_WAIT_S = 20.0   # when the 429 does not say how long to wait
+_RATE_LIMIT_MAX_WAIT_S = 60.0       # longest single wait, whatever the API asks for
+_RATE_LIMIT_ATTEMPTS = 4            # submits: tries in all, including the first
+_POLL_RATE_LIMIT_CAP_S = 180.0      # most time spent waiting out 429s on one paid job
+
+# Balance. Credits do not refill, and an account that has run dry fails every lookup
+# the same quiet way (an empty result), so say so once, loudly, and stop asking.
+_CREDITS_TTL_S = 300
+_credits_cache: dict = {}           # "checked" -> (monotonic time, balance or None)
+_credits_lock = threading.Lock()
+
+_sleep = time.sleep                 # replaced in tests so waits are recorded, not slept
 
 
 def _build_session() -> requests.Session:
@@ -91,6 +111,80 @@ def _build_session() -> requests.Session:
 
 
 _session = _build_session()
+
+
+def _retry_after_seconds(resp) -> float:
+    """How long a 429 asks us to wait: the Retry-After header, else "Try again in 1m" in the body, else a default."""
+    header = str(resp.headers.get("Retry-After", "") or "").strip()
+    try:
+        if header:
+            return float(header)
+    except ValueError:
+        pass    # an HTTP-date; not worth parsing, the default is safe
+    match = re.search(
+        r"in\s+(\d+(?:\.\d+)?)\s*(m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\b",
+        getattr(resp, "text", "") or "", re.I,
+    )
+    if not match:
+        return _RATE_LIMIT_DEFAULT_WAIT_S
+    amount = float(match.group(1))
+    return amount * 60 if match.group(2).lower().startswith("m") else amount
+
+
+def _post_waiting_out_rate_limit(url: str, payload: dict, api_key: str):
+    """
+    POST a paid request, waiting out a 429 and repeating it.
+
+    Only a 429 is repeated: it was not processed. Any other failure is returned (or
+    raised) as it came, because a read timeout or 5xx on a paid POST does not mean it
+    was not processed. Returns the last response, which the caller checks as usual.
+    """
+    for attempt in range(1, _RATE_LIMIT_ATTEMPTS + 1):
+        resp = _session.post(
+            url, json=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=_TIMEOUT,
+        )
+        if resp.status_code != 429 or attempt == _RATE_LIMIT_ATTEMPTS:
+            return resp
+        wait = min(_retry_after_seconds(resp), _RATE_LIMIT_MAX_WAIT_S)
+        logger.warning(
+            "FullEnrich rate limited (429, attempt %d/%d): the request was not processed, retrying in %.0fs",
+            attempt, _RATE_LIMIT_ATTEMPTS, wait,
+        )
+        _sleep(wait)
+    return resp    # unreachable; keeps the type checker honest
+
+
+def _credits_exhausted(api_key: str) -> bool:
+    """
+    True only when FullEnrich says the balance is gone.
+
+    The balance is cached for five minutes. If the check itself fails the answer is
+    "no", so a broken balance endpoint never blocks a lookup that would have worked.
+    """
+    now = time.monotonic()
+    with _credits_lock:
+        cached = _credits_cache.get("checked")
+    if cached and now - cached[0] < _CREDITS_TTL_S:
+        balance = cached[1]
+    else:
+        balance = None
+        try:
+            resp = _session.get(_CREDITS_URL, headers={"Authorization": f"Bearer {api_key}"}, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            raw = resp.json().get("balance")
+            balance = float(raw) if raw is not None else None
+        except Exception as exc:
+            logger.warning("Could not check the FullEnrich balance: %s", exc)
+        with _credits_lock:
+            _credits_cache["checked"] = (now, balance)
+    if balance is not None and balance < 1:
+        logger.warning(
+            "FullEnrich credits exhausted (balance %s): skipping the lookup. Credits do not refill.",
+            balance,
+            extra={"json_fields": {"alert": "fullenrich_credits_exhausted", "balance": balance}},
+        )
+        return True
+    return False
 
 # US state name → abbreviation map for normalising FullEnrich region strings
 _STATE_ABBR: dict[str, str] = {
@@ -263,12 +357,7 @@ def _search_one_title(
         identifier = company_name
 
     try:
-        resp = _session.post(
-            _SEARCH_URL,
-            json=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=_TIMEOUT,
-        )
+        resp = _post_waiting_out_rate_limit(_SEARCH_URL, payload, api_key)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -470,6 +559,9 @@ def search_facility_contacts(
         return []
 
     if not titles or (not company_name and not domain):
+        return []
+
+    if _credits_exhausted(api_key):
         return []
 
     bare_domain = _strip_domain(domain)
@@ -691,6 +783,9 @@ def enrich_contact_info(
     if not firstname or not lastname:
         return _empty
 
+    if _credits_exhausted(api_key):
+        return _empty
+
     bare_domain = _strip_domain(domain)
     identifier = bare_domain or company_name or f"{firstname} {lastname}"
 
@@ -710,11 +805,8 @@ def enrich_contact_info(
     job_name = f"revops-{firstname.lower()}-{lastname.lower()}-{uuid.uuid4().hex[:8]}"
 
     try:
-        resp = _session.post(
-            _ENRICH_URL,
-            json={"name": job_name, "data": [contact_record]},
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=_TIMEOUT,
+        resp = _post_waiting_out_rate_limit(
+            _ENRICH_URL, {"name": job_name, "data": [contact_record]}, api_key,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -733,23 +825,45 @@ def enrich_contact_info(
         return _empty
 
     poll_url = f"{_ENRICH_URL}/{enrichment_id}"
-    for attempt in range(1, _POLL_MAX + 1):
-        time.sleep(_POLL_INTERVAL)
+    attempt = 0
+    rate_limit_waited = 0.0
+    while attempt < _POLL_MAX:
+        _sleep(_POLL_INTERVAL)
         try:
             poll_resp = _session.get(
                 poll_url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=_TIMEOUT,
             )
+            if poll_resp.status_code == 429:
+                # The credits are already committed: wait the limit out rather than
+                # lose the result. A rate-limited poll does not use up an attempt.
+                wait = min(_retry_after_seconds(poll_resp), _RATE_LIMIT_MAX_WAIT_S)
+                rate_limit_waited += wait
+                if rate_limit_waited > _POLL_RATE_LIMIT_CAP_S:
+                    logger.warning(
+                        "FullEnrich enrich job %r is still rate limited after %.0fs of waiting; giving up. "
+                        "It is already paid for: its result can be read back with this id.",
+                        enrichment_id, rate_limit_waited - wait,
+                    )
+                    return _empty
+                logger.warning(
+                    "FullEnrich enrich poll rate limited (id=%r): waiting %.0fs, the job is already paid for",
+                    enrichment_id, wait,
+                )
+                _sleep(wait)
+                continue
             poll_resp.raise_for_status()
             poll_data = poll_resp.json()
         except Exception as exc:
+            attempt += 1
             logger.warning(
                 "FullEnrich enrich poll failed (attempt %d/%d, id=%r): %s",
                 attempt, _POLL_MAX, enrichment_id, exc,
             )
             continue
 
+        attempt += 1
         status = (poll_data.get("status") or "").upper()
         logger.debug(
             "FullEnrich enrich job %r: status=%r (attempt %d/%d)",
