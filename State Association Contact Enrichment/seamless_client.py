@@ -39,6 +39,7 @@ import time
 import requests
 
 from identity_gate import (
+    bare_domain,
     names_share_a_distinctive_word,
     same_org_domain,
     same_org_or_affiliate,
@@ -347,7 +348,7 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
     global _last_low_credits_warning
     key = os.getenv("SEAMLESS_API_KEY", "").strip()
     first, last = (first or "").strip(), (last or "").strip()
-    domain = (domain or "").strip().lower().removeprefix("www.").split("/")[0]
+    domain = bare_domain(domain)
     if not key or not first or not last or not (domain or company):
         return None
 
