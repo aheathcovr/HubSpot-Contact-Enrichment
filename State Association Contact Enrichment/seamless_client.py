@@ -278,7 +278,7 @@ def _request(method: str, path: str, key: str, **kw):
             return None
         _read_credits(resp)
         code = resp.status_code
-        if code == 200:
+        if 200 <= code < 300:        # a research submit is answered 202 Accepted, a poll 200
             try:
                 return resp.json()
             except Exception as exc:
