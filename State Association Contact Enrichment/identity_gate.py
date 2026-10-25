@@ -89,3 +89,13 @@ def same_org_or_affiliate(email: object, domain: object, org_name: object) -> bo
         return False
     stem = re.sub(r"[^a-z0-9]", "", host.rsplit(".", 1)[0])
     return any(word in stem for word in _distinctive_words(org_name))
+
+
+def names_share_a_distinctive_word(name: object, org_name: object) -> bool:
+    """
+    Do two organisation NAMES share a word that actually identifies one?
+
+    The same idea as the address check, for when a vendor gives a company name rather
+    than a domain. Generic trade words ("Health Care", "Senior Living") never count.
+    """
+    return bool(_distinctive_words(name) & _distinctive_words(org_name))
