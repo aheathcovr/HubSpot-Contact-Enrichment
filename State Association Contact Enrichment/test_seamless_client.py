@@ -57,7 +57,7 @@ def _identifies_a_person(item: dict) -> bool:
 class _FakeSeamless:
     """Local stand-in for api.seamless.ai: submit research, then poll for it."""
 
-    def __init__(self, polls=None, submit_statuses=(200,), credits_header="900", reset_in=0):
+    def __init__(self, polls=None, submit_statuses=(202,), credits_header="900", reset_in=0):
         # polls: one entry per GET poll, in order, then the last repeats.
         #   a dict is the JSON body, an int is a bare HTTP status.
         self.polls = list(polls) if polls is not None else [{"success": True, "data": [
@@ -98,12 +98,15 @@ class _FakeSeamless:
                     return self._send(400, {"status": 400, "code": "invalidArguments",
                                             "msg": "Contacts are missing required properties."})
                 outer.auth.append({"Token": self.headers.get("Token"), "Authorization": self.headers.get("Authorization")})
-                status = outer.submit_statuses.pop(0) if outer.submit_statuses else 200
-                if status == 200:
-                    return self._send(200, {"requestIds": ["r1"]})
+                status = outer.submit_statuses.pop(0) if outer.submit_statuses else 202
+                if status in (200, 202):
+                    # The real API accepts a research with 202 and a request id (seen 2026-10-25).
+                    return self._send(status, {"success": True, "requestIds": ["r1"]})
                 if status == 422:
                     return self._send(422, {"error": "insufficientCredits"})
-                return self._send(status, {"error": f"status {status}"})
+                # An error body that also names a request id: a client that took the error as an
+                # answer would go on to poll it.
+                return self._send(status, {"error": f"status {status}", "requestIds": ["r1"]})
 
             def do_GET(self):
                 if not urlparse(self.path).path.endswith("/poll"):
@@ -432,3 +435,38 @@ def test_with_neither_a_host_name_nor_a_company_nothing_is_sent(server):
 
     assert sl.lookup_person("Jane", "Doe", domain="https://", company="") is None
     assert s.submits == []
+
+
+# ── The real API answers a submit with 202 Accepted ───────────────────────────
+# The client accepted only exactly 200, so the first real research (2026-10-25) was logged as a
+# failure and dropped: the credit was spent at submit and the result was never polled.
+
+def test_a_submit_the_api_accepts_with_202_is_polled_and_its_contact_returned(server):
+    s = server(submit_statuses=[202])
+
+    result = sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")
+
+    assert result is not None and result["email"] == "jane.doe@valleyview.org"
+    assert s.poll_count >= 1 and len(s.submits) == 1
+
+
+def test_a_plain_200_submit_is_accepted_too(server):
+    s = server(submit_statuses=[200])
+
+    result = sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center")
+
+    assert result is not None and s.poll_count >= 1
+
+
+def test_a_refused_submit_is_not_polled_and_not_repeated(server):
+    s = server(submit_statuses=[400])
+
+    assert sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center") is None
+    assert s.poll_count == 0 and len(s.submits) == 1
+
+
+def test_a_reply_that_is_neither_success_nor_a_known_failure_is_not_taken_as_an_answer(server):
+    s = server(submit_statuses=[300])
+
+    assert sl.lookup_person("Jane", "Doe", domain="valleyview.org", company="Valley View Care Center") is None
+    assert s.poll_count == 0
