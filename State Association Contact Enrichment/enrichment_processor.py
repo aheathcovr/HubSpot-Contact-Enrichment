@@ -55,7 +55,6 @@ from state_association_matcher import (
     workflow_2_research_contacts,
     OPENROUTER_MODEL,
     OPENROUTER_MODEL_TIER23,
-    W1_RATE_LIMIT_SECONDS,
     RESEARCH_SYSTEM_PROMPT,
     _CONTACT_JSON_SCHEMA,
     _OPENROUTER_SEMAPHORE,
@@ -75,6 +74,11 @@ CORP_HIERARCHY_TYPE = "Corporation / Operator"
 # plus several HubSpot API round-trips — running them serially turned every
 # extra contact found for a company into a linear multiplier on request time.
 _CONTACT_MAX_WORKERS = 3
+
+# Calls that do not depend on one another's answers are started side by side, so a run
+# waits for the slowest of them instead of the sum. Shared by every run in the process;
+# bounded well above Cloud Run's per-instance concurrency so a start never queues.
+_BACKGROUND = ThreadPoolExecutor(max_workers=8, thread_name_prefix="enrich-bg")
 
 # BigQuery client is process-global and lazily created once per container,
 # not per enrichment. Building a fresh client re-runs ADC credential discovery
@@ -1438,7 +1442,6 @@ def _run_workflow1_single_facility(
                 response_format=structured_format,
                 extra_params=extra,
             )
-        time.sleep(W1_RATE_LIMIT_SECONDS)
         result["research_findings"] = research_result[:2000]
         logger.info(f"  Research complete ({len(research_result)} chars)")
 
@@ -2101,6 +2104,22 @@ def run_enrichment(company_id: str) -> None:
     elif hierarchy_type == CORP_HIERARCHY_TYPE:
         # ── Workflow 2: research Definitive corporate-level contacts ──────────
         workflow_label = "Workflow 2 — Definitive Corporate Contact Research"
+
+        # FullEnrich's search for this corporation's executives does not depend on what
+        # Definitive or Sonar find: their names only filter what it returns, which still
+        # happens below. It was the last step of a run only because it was written last,
+        # so it starts now and is read after Sonar discovery. It is asked once per run
+        # either way; only the waiting overlaps.
+        fe_corp_future = _BACKGROUND.submit(
+            search_facility_contacts,
+            company_name=company_name,
+            city="",
+            state=props.get("state", "") or "",
+            titles=W2_CORPORATE_TITLES,
+            domain=props.get("website", "") or "",
+            corporate_mode=True,   # disables location scoring, enables seniority filters
+        )
+
         if bq_client and definitive_id_raw:
             try:
                 network_id = int(definitive_id_raw)
@@ -2159,14 +2178,7 @@ def run_enrichment(company_id: str) -> None:
         logger.info(
             f"W2 FullEnrich supplement: searching for corporate executives at '{company_name}'"
         )
-        fe_corp_contacts = search_facility_contacts(
-            company_name=company_name,
-            city="",
-            state=props.get("state", "") or "",
-            titles=W2_CORPORATE_TITLES,
-            domain=props.get("website", "") or "",
-            corporate_mode=True,   # disables location scoring, enables seniority filters
-        )
+        fe_corp_contacts = fe_corp_future.result()
         fe_added = 0
         for fe in fe_corp_contacts:
             if (fe["full_name"] or "").lower().strip() not in known_names:
