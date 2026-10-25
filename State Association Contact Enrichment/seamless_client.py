@@ -324,6 +324,7 @@ def _poll(request_ids: list, key: str):
                 logger.info("Seamless already researched this person and names no request to read it from")
                 return None
             if status in _TERMINAL:
+                logger.info("Seamless research %s ended with status %r: nothing to take", row.get("requestId", ""), status)
                 return None
         _sleep(_POLL_INTERVAL_S)
         waited += _POLL_INTERVAL_S
@@ -332,6 +333,19 @@ def _poll(request_ids: list, key: str):
         ",".join(request_ids), _POLL_TIMEOUT_S,
     )
     return None
+
+
+def _describe(answer: dict) -> str:
+    """One line saying what was taken from a researched contact and, for what was not, why."""
+    if answer.get("moved"):
+        return f"no longer at this organisation (now {answer.get('company') or 'unknown'}); nothing used"
+    parts = []
+    for kind in ("phone", "email"):
+        if answer.get(kind):
+            parts.append(f"{kind} accepted (confidence {answer.get(kind + '_confidence')})")
+        else:
+            parts.append(f"{kind} not used: {answer.get(kind + '_rejected') or 'none returned'}")
+    return "; ".join(parts)
 
 
 # ── Public ────────────────────────────────────────────────────────────────────
@@ -384,7 +398,14 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
         return None
 
     contact = _poll([str(i) for i in ids], key)
-    if not contact or not _name_matches(first, last, contact):
+    if not contact:
+        logger.info("Seamless: no usable contact came back for %s %s", first, last)
+        return None
+    if not _name_matches(first, last, contact):
+        logger.info(
+            "Seamless returned a different person (%s %s) for %s %s; nothing used",
+            contact.get("firstName", ""), contact.get("lastName", ""), first, last,
+        )
         return None
 
     same_org = _same_organisation(contact, domain, company, operator_name)
@@ -404,6 +425,7 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
         reason = "no longer at this organisation" if same_org is False else "organisation not confirmed"
         answer = {**base, "phone": "", "phone_type": "", "phone_confidence": None, "phone_rejected": reason,
                   "email": "", "email_confidence": None, "email_rejected": reason}
+    logger.info("Seamless: %s %s: %s", first, last, _describe(answer))
     with _lock:
         _answers[(first.lower(), last.lower(), where)] = (now, answer)
     return answer
