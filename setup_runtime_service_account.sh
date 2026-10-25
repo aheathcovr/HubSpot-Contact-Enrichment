@@ -13,7 +13,7 @@
 # service does at runtime. Everything is granted at the narrowest scope that
 # works, and the script is safe to re-run.
 #
-#   Secret Manager   secretAccessor on each of the five secrets the service mounts
+#   Secret Manager   secretAccessor on each of the secrets the service mounts
 #   BigQuery         jobUser on the project, plus READER on the three datasets the
 #                    matcher queries (read-only; the service never writes)
 #   Cloud Tasks      enqueuer on the one queue
@@ -46,20 +46,17 @@ RUNTIME_SA="${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 TASKS_SA="hubspot-enrichment-tasks@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA="hubspot-enrichment-build@${PROJECT_ID}.iam.gserviceaccount.com"
 
-# Secrets the service reads when they exist. A missing one is skipped, not an error:
-# BOUNCEBAN_API_KEY turns on the BounceBan second opinion behind MillionVerifier, and
-# the service runs the same without it. Creating one is a separate step (see the PR).
-OPTIONAL_SECRETS=(
-  BOUNCEBAN_API_KEY
-)
-
-# Must match the --set-secrets list in cloudbuild.yaml.
+# Must match the --set-secrets list in cloudbuild.yaml (test_deploy_config.py checks it). Every
+# push to main deploys with that list, so each secret must exist before this runs, including
+# BOUNCEBAN_API_KEY and SEAMLESS_API_KEY: without its secret the deploy fails.
 SECRETS=(
   HUBSPOT_API_KEY
   OPENROUTER_API_KEY
   MILLIONVERIFIER_API_KEY
   FULLENRICH_API_KEY
   HUBSPOT_WEBHOOK_SECRET
+  BOUNCEBAN_API_KEY
+  SEAMLESS_API_KEY
 )
 
 # Datasets the matcher reads: HubSpot_Airbyte_Self_Hosted (the current HubSpot
@@ -88,7 +85,7 @@ else
   echo "    Created."
 fi
 
-# ── 2. Secret Manager: read access to the five mounted secrets, per secret ────
+# ── 2. Secret Manager: read access to the mounted secrets, per secret ─────────
 echo "--- Granting secretAccessor on each secret..."
 for secret in "${SECRETS[@]}"; do
   gcloud secrets add-iam-policy-binding "${secret}" \
@@ -97,20 +94,6 @@ for secret in "${SECRETS[@]}"; do
     --project="${PROJECT_ID}" \
     --condition=None --quiet >/dev/null
   echo "    ${secret}"
-done
-
-echo "--- Granting secretAccessor on optional secrets that exist..."
-for secret in "${OPTIONAL_SECRETS[@]}"; do
-  if gcloud secrets describe "${secret}" --project="${PROJECT_ID}" &>/dev/null; then
-    gcloud secrets add-iam-policy-binding "${secret}" \
-      --member="serviceAccount:${RUNTIME_SA}" \
-      --role="roles/secretmanager.secretAccessor" \
-      --project="${PROJECT_ID}" \
-      --condition=None --quiet >/dev/null
-    echo "    ${secret}"
-  else
-    echo "    ${secret}: no such secret yet, skipped"
-  fi
 done
 
 # ── 3. BigQuery: permission to run query jobs ─────────────────────────────────

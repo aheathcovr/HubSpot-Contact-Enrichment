@@ -34,6 +34,12 @@ steps:
       - '--set-secrets=MILLIONVERIFIER_API_KEY=MILLIONVERIFIER_API_KEY:latest'
       - '--set-secrets=FULLENRICH_API_KEY=FULLENRICH_API_KEY:latest'
       - '--set-secrets=HUBSPOT_WEBHOOK_SECRET=HUBSPOT_WEBHOOK_SECRET:latest'
+      # --set-secrets replaces the service's whole list on every deploy, so a vendor key that is
+      # only attached by hand is gone after the next merge. Every key the code reads goes here
+      # (test_deploy_config.py checks it). Both secrets must exist, and the runtime account must
+      # be able to read them (setup_runtime_service_account.sh), or the deploy fails.
+      - '--set-secrets=BOUNCEBAN_API_KEY=BOUNCEBAN_API_KEY:latest'
+      - '--set-secrets=SEAMLESS_API_KEY=SEAMLESS_API_KEY:latest'
 
 images:
   - 'gcr.io/$PROJECT_ID/hubspot-enrichment:$COMMIT_SHA'
