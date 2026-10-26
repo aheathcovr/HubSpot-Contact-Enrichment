@@ -648,6 +648,28 @@ def _build_contact_enrichment_note(
 # ── Contact processing ────────────────────────────────────────────────────────
 
 
+# Where a title with more than one role is cut into its roles: "Administrator/Executive Director",
+# "Administrator & Executive Director", "Executive Director - Elm Court". A hyphen inside a word
+# ("Co-Administrator") is not a separator, because that is one role, not two.
+_TITLE_SEPARATORS = re.compile(r"\s*[/&|;,]\s*|\s+and\s+|\s+[-–—]+\s*|\s*[-–—]+\s+", re.IGNORECASE)
+
+
+def _title_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip().casefold()
+
+
+def _existing_title_covers(existing: str, found: str) -> bool:
+    """
+    True when the title already on a contact says what *found* says, as one of its own roles.
+
+    "Administrator/Executive Director" covers "Administrator" and "Executive Director". A title
+    that only mentions the words does not ("Assistant Administrator", "Interim Administrator"),
+    so the found title still replaces it.
+    """
+    wanted = _title_key(found)
+    return bool(wanted) and any(_title_key(part) == wanted for part in _TITLE_SEPARATORS.split(existing or ""))
+
+
 def _enrich_and_associate_existing_contact(
     hs: HubSpotClient,
     matched_contact_id: str,
@@ -705,11 +727,17 @@ def _enrich_and_associate_existing_contact(
         # ── Update jobtitle if DH/research has a better/different title ───────
         id_and_title_updates: dict = {}
         if found_title and found_title.strip() and found_title.strip() != existing_jobtitle.strip():
-            id_and_title_updates["jobtitle"] = found_title.strip()
-            logger.info(
-                "Queuing jobtitle update for contact %s: %r → %r",
-                matched_contact_id, existing_jobtitle, found_title,
-            )
+            if _existing_title_covers(existing_jobtitle, found_title):
+                logger.info(
+                    "Keeping title %r on contact %s: it already includes %r",
+                    existing_jobtitle, matched_contact_id, found_title.strip(),
+                )
+            else:
+                id_and_title_updates["jobtitle"] = found_title.strip()
+                logger.info(
+                    "Queuing jobtitle update for contact %s: %r → %r",
+                    matched_contact_id, existing_jobtitle, found_title,
+                )
         if dh_executive_id:
             id_and_title_updates["definitive_executive_id"] = str(dh_executive_id)
         if id_and_title_updates:
