@@ -2,8 +2,8 @@
 Every company a contact is linked to, not only the primary one.
 
 The mirror's `associatedcompanyid` and the name search's `associatedcompanyid` are the PRIMARY
-company only. A contact can be linked to several (Sean Buelow was linked to The Meridian and to a
-customer's facility at once), and whether one of them is the facility being enriched is exactly what
+company only. A contact can be linked to several (one was linked to a facility and to another
+operator's facility at once), and whether one of them is the facility being enriched is exactly what
 decides whether the contact may be reused.
 
 Run with:
@@ -36,17 +36,17 @@ class _Recorded(HubSpotClient):
 
 def test_every_linked_company_is_returned_as_text():
     client = _Recorded({"results": [{"toObjectId": 28153294136, "associationTypes": []},
-                                    {"toObjectId": "28187803295", "associationTypes": []}]})
+                                    {"toObjectId": "320000000002", "associationTypes": []}]})
 
-    assert client.get_contact_company_ids("190698808613") == ["28153294136", "28187803295"]
+    assert client.get_contact_company_ids("310000000001") == ["28153294136", "320000000002"]
 
 
 def test_it_asks_the_contacts_company_associations():
     client = _Recorded({"results": []})
 
-    client.get_contact_company_ids("190698808613")
+    client.get_contact_company_ids("310000000001")
 
-    assert client.calls[0][0] == "/crm/v4/objects/contacts/190698808613/associations/companies"
+    assert client.calls[0][0] == "/crm/v4/objects/contacts/310000000001/associations/companies"
 
 
 def test_a_contact_linked_to_nothing_has_no_companies():

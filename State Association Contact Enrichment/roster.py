@@ -88,7 +88,7 @@ def normalize_person_name(raw) -> str:
     """
     One person's name as "First Last", or "" when the text is not one person's name.
 
-    Handles "SEAN L BUELOW", "TIEN, VINCE", " Megan  Loar", "Angela S. Compton" and "Jane Doe, NHA".
+    Handles "DANA R KESTREL", "TIEN, VINCE", " Megan  Loar", "Angela S. Compton" and "Jane Doe, NHA".
     Rejects email addresses, two people, a person plus a second role, placeholders such as VACANT,
     company and facility names, and anything with digits.
     """

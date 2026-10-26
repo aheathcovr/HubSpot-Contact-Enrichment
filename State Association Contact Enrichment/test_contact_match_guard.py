@@ -1,9 +1,9 @@
 """
 When may a person the run just found be treated as a contact HubSpot already has?
 
-On 2026-10-25 a test run found "Sean Buelow" at The Meridian and, on the name alone, took the
-HubSpot contact of that name, which belonged to a customer's account at another operator, linked
-it to The Meridian and changed its title and email. The name was the only thing checked.
+On 2026-10-25 a test run found a person at one facility and, on the name alone, took the HubSpot
+contact of that name, which belonged to a customer's account at another operator, linked it to the
+new facility and changed its title and email. The name was the only thing checked.
 
 The rule: an existing contact is reused when it is the same email, or it is already linked to this
 facility or its operator, or it is linked to no company at all. A contact linked ONLY to other

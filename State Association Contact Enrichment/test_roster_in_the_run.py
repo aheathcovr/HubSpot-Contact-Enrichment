@@ -28,7 +28,7 @@ _PROPS = {"name": "The Meridian", "city": "Galveston", "state": "TX", "facility_
 
 def _contact():
     return roster.row_to_contact({
-        "administrator": "SEAN L BUELOW", "source_url": "https://apps.hhs.texas.gov/providers",
+        "administrator": "DANA R KESTREL", "source_url": "https://apps.hhs.texas.gov/providers",
         "extracted_date": "2026-10-25", "source_state": "TX", "phone": "409-763-6437", "email": "info@x.com",
     })
 
@@ -60,7 +60,7 @@ def test_a_roster_that_names_the_administrator_ends_the_search(world):
     results = _run()
 
     assert len(results) == 1
-    assert results[0]["found_name"] == "Sean Buelow" and results[0]["found_title"] == "Administrator"
+    assert results[0]["found_name"] == "Dana Kestrel" and results[0]["found_title"] == "Administrator"
     assert results[0]["source_path"] == "state_association_bq_table"
 
 
@@ -75,7 +75,7 @@ def test_no_phone_or_email_is_offered_to_the_hubspot_match_as_the_persons(world)
     _run()
 
     (lookup,) = world.lookups
-    assert lookup["full_name"] == "Sean Buelow"
+    assert lookup["full_name"] == "Dana Kestrel"
     assert lookup["email"] == "" and lookup["phone"] == ""
 
 
