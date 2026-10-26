@@ -56,6 +56,7 @@ from typing import Optional
 
 import pandas as pd
 
+import roster
 from config import (
     DH_W2_TITLE_PATTERN,
     DH_W1_TITLE_PATTERN,
@@ -1463,65 +1464,30 @@ def find_facilities_missing_leadership(
 
 
 # ─── State association BigQuery table lookup ──────────────────────────────────
+# The table holds state licensing rosters; which row of a facility to believe and how to read a
+# name out of it live in roster.py. The roster's `phone` and `email` columns are the FACILITY's,
+# so they are never passed on as the person's.
 
-# Priority-ordered column name candidates for each contact field.
-# The table schema may vary; we try these in order and take the first non-empty value.
-_SA_NAME_COLS  = [
-    "administrator_name", "admin_name", "executive_director_name", "ed_name",
-    "contact_name", "director_name", "full_name",
-]
-_SA_TITLE_COLS = [
-    "administrator_title", "contact_title", "title", "job_title",
-]
-_SA_PHONE_COLS = [
-    "administrator_phone", "admin_phone", "executive_director_phone", "ed_phone",
-    "contact_phone", "phone", "telephone",
-]
-_SA_EMAIL_COLS = [
-    "administrator_email", "admin_email", "executive_director_email", "ed_email",
-    "contact_email", "email",
-]
-_SA_URL_COLS = [
-    "source_url", "url", "directory_url", "facility_url", "profile_url",
-]
+_ROSTER_COLUMNS = (
+    "facility_id, license_number, facility_name, facility_type, street_address, city, source_state, "
+    "administrator, executive_director, source_url, extracted_date"
+)
+# Texas rows have no `state`; their state is in `source_state`.
+_ROSTER_STATE_TEST = "COALESCE(NULLIF(UPPER(TRIM(state)), ''), UPPER(TRIM(source_state))) = @state"
+_ROSTER_NAME_KEY = "REGEXP_REPLACE(LOWER(facility_name), r'[^a-z0-9]', '')"
+_ROSTER_MIN_LOOSE_KEY = 8        # a shorter name is only ever matched exactly
 
 
-def _map_state_assoc_row(row: dict) -> Optional[dict]:
-    """
-    Map a raw BigQuery row from the state association table to a standard contact dict.
-    Uses priority-ordered column name lists to handle varying schemas.
-    Returns None if no usable name is found.
-    """
-    row_lc = {k.lower(): v for k, v in row.items()}
+def _roster_max_age_days() -> int:
+    try:
+        return int(os.getenv("STATE_ROSTER_MAX_AGE_DAYS", "120"))
+    except ValueError:
+        return 120
 
-    def _get(cols: list) -> str:
-        for col in cols:
-            val = row_lc.get(col)
-            if val and str(val).strip() not in ("", "None", "nan"):
-                return str(val).strip()
-        return ""
 
-    found_name  = _get(_SA_NAME_COLS)
-    found_title = _get(_SA_TITLE_COLS)
-    found_phone = _get(_SA_PHONE_COLS)
-    found_email = _get(_SA_EMAIL_COLS)
-    source_url  = _get(_SA_URL_COLS)
-
-    if not found_name:
-        return None
-
-    return {
-        "found_name":          found_name,
-        "found_title":         found_title or "Administrator",
-        "found_phone":         normalize_phone(found_phone) if found_phone else "",
-        "found_email":         found_email,
-        # Store source_url in research_findings so _extract_urls() picks it up
-        # for the note's "Sources cited" / "How to Verify" section.
-        "research_findings":   source_url,
-        "research_confidence": "high",
-        "source_tier":         "1",
-        "source_path":         "state_association_bq_table",
-    }
+def _roster_states() -> set:
+    """STATE_ROSTER_STATES narrows the roster to those states; empty means every state."""
+    return {roster.to_state_abbr(x) for x in os.getenv("STATE_ROSTER_STATES", "").split(",") if roster.to_state_abbr(x)}
 
 
 def query_state_association_bq_table(
@@ -1529,71 +1495,63 @@ def query_state_association_bq_table(
     facility_name: str,
     city: str,
     state: str,
+    facility_type: str = "",
+    max_age_days: Optional[int] = None,
 ) -> Optional[dict]:
     """
-    Look up contact data for a facility in the
-    state_associations.state_association_snf_al_il_information BigQuery table.
+    The licensed administrator the state roster names for a facility, as a contact dict, or None.
 
-    Tries an exact facility-name + state match first, then a LIKE match
-    (table facility_name contains the search term) as a fallback.
-
-    Returns a contact dict with keys:
-        found_name, found_title, found_phone, found_email,
-        research_confidence ("high"), source_tier ("1"),
-        source_path ("state_association_bq_table")
-    or None if no match is found or the query fails.
+    Matches the facility on its name without case or punctuation and on its state, first exactly and
+    then (for a name long enough) by one name containing the other. Of the copies the table keeps of
+    a facility only the newest counts and only if it is inside the age window; a vacancy or a name
+    that fits two facilities (the kind of facility and the city tell them apart) gives None. The
+    contact carries no phone or email.
     """
-    if not facility_name or not state:
+    state_abbr = roster.to_state_abbr(state)
+    name_key = re.sub(r"[^a-z0-9]", "", str(facility_name or "").lower())
+    if not name_key or not state_abbr:
         return None
+    allowed = _roster_states()
+    if allowed and state_abbr not in allowed:
+        return None
+    window = max_age_days if max_age_days is not None else _roster_max_age_days()
 
-    name_clean  = facility_name.strip()
-    state_clean = state.strip().upper()
-
-    strategies = [
-        # 1. Exact facility_name + state
-        (
-            f"""
-            SELECT *
-            FROM `{STATE_ASSOC_TABLE}`
-            WHERE LOWER(TRIM(facility_name)) = LOWER(@name)
-              AND UPPER(TRIM(state)) = @state
-            LIMIT 5
-            """,
-            [
-                bigquery.ScalarQueryParameter("name",  "STRING", name_clean),
-                bigquery.ScalarQueryParameter("state", "STRING", state_clean),
-            ],
-        ),
-        # 2. Facility name contains the search term + state
-        (
-            f"""
-            SELECT *
-            FROM `{STATE_ASSOC_TABLE}`
-            WHERE LOWER(facility_name) LIKE CONCAT('%', LOWER(@name), '%')
-              AND UPPER(TRIM(state)) = @state
-            LIMIT 5
-            """,
-            [
-                bigquery.ScalarQueryParameter("name",  "STRING", name_clean),
-                bigquery.ScalarQueryParameter("state", "STRING", state_clean),
-            ],
-        ),
+    name_tests = [f"{_ROSTER_NAME_KEY} = @name_key"]
+    if len(name_key) >= _ROSTER_MIN_LOOSE_KEY:
+        name_tests.append(
+            f"(STRPOS({_ROSTER_NAME_KEY}, @name_key) > 0 "
+            f"OR (LENGTH({_ROSTER_NAME_KEY}) >= {_ROSTER_MIN_LOOSE_KEY} AND STRPOS(@name_key, {_ROSTER_NAME_KEY}) > 0))"
+        )
+    params = [
+        bigquery.ScalarQueryParameter("name_key", "STRING", name_key),
+        bigquery.ScalarQueryParameter("state", "STRING", state_abbr),
+        bigquery.ScalarQueryParameter("window_days", "INT64", window),
     ]
-
-    for sql, params in strategies:
-        try:
-            job_config = bigquery.QueryJobConfig(query_parameters=params)
-            rows = list(client.query(sql, job_config=job_config).result())
+    try:
+        for name_test in name_tests:
+            sql = f"""
+            SELECT {_ROSTER_COLUMNS}
+            FROM `{STATE_ASSOC_TABLE}`
+            WHERE {name_test}
+              AND {_ROSTER_STATE_TEST}
+              AND extracted_date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @window_days DAY)
+            ORDER BY extracted_date DESC
+            LIMIT 50
+            """
+            rows = [dict(r) for r in client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()]
             if not rows:
                 continue
-            contact = _map_state_assoc_row(dict(rows[0]))
+            picked = roster.pick_roster_row(rows, city=city, max_age_days=window, facility_type=facility_type)
+            contact = roster.row_to_contact(picked) if picked else None
             if contact:
-                return contact
-        except Exception as exc:
-            logger.warning("State association BQ table query failed for '%s' (%s): %s",
-                           facility_name, state, exc)
-            return None
-
+                logger.info(
+                    "State roster (%s, loaded %s): %s is the licensed %s of %s",
+                    contact["source_state"] or state_abbr, contact["source_date"], contact["found_name"],
+                    contact["found_title"].lower(), facility_name,
+                )
+            return contact       # a facility that was found is not then searched for more loosely
+    except Exception as exc:
+        logger.warning("State association BQ table query failed for '%s' (%s): %s", facility_name, state, exc)
     return None
 
 
@@ -1944,7 +1902,7 @@ def _research_one_facility(
     }
 
     # ── State association BigQuery table check (cheapest source — run first) ───
-    sa_contact = query_state_association_bq_table(client, facility_name, city, state)
+    sa_contact = query_state_association_bq_table(client, facility_name, city, state, facility_type)
     if sa_contact:
         logger.info(f"{facility_name}: found in state association BQ table — {sa_contact['found_name']}")
         result.update(sa_contact)
