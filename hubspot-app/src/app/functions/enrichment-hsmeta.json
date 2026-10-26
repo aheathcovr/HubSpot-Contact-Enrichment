@@ -1,0 +1,8 @@
+{
+  "uid": "enrichment",
+  "type": "app-function",
+  "config": {
+    "entrypoint": "/app/functions/enrichment.js",
+    "secretKeys": []
+  }
+}

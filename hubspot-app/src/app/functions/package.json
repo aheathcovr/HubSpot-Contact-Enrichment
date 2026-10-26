@@ -1,0 +1,7 @@
+{
+  "name": "covr-enrichment-function",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reads a company's enrichment status and sets Request to enrich for the Enrichment card. No dependencies: it calls the HubSpot API with Node's https module.",
+  "dependencies": {}
+}

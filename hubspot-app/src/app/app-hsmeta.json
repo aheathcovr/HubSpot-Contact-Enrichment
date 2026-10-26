@@ -1,0 +1,25 @@
+{
+  "uid": "covr_enrichment_app",
+  "type": "app",
+  "config": {
+    "name": "Covr Enrichment",
+    "description": "Adds the Enrichment card to company records. A rep asks for an enrichment run and sees when the company was last enriched and which contacts it has, with each email's check result. The run itself happens in Covr's enrichment service.",
+    "distribution": "private",
+    "auth": {
+      "type": "static",
+      "requiredScopes": [
+        "oauth",
+        "crm.objects.companies.read",
+        "crm.objects.companies.write",
+        "crm.objects.contacts.read"
+      ],
+      "optionalScopes": [],
+      "conditionallyRequiredScopes": []
+    },
+    "permittedUrls": {
+      "fetch": [],
+      "iframe": [],
+      "img": []
+    }
+  }
+}
