@@ -1,0 +1,23 @@
+{
+  "name": "covr-enrichment-app-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tests for the Enrichment card and its app function. Not uploaded to HubSpot.",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.card.json && tsc -p tsconfig.json",
+    "bundle": "node bundle-check.mjs",
+    "check": "npm run typecheck && npm test && npm run bundle"
+  },
+  "devDependencies": {
+    "@hubspot/ui-extensions": "0.17.1",
+    "@hubspot/ui-extensions-dev-server": "2.2.2",
+    "@types/node": "22.20.5",
+    "@types/react": "18.3.31",
+    "esbuild": "0.28.2",
+    "react": "18.3.1",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "covr-enrichment-card",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hubspot/ui-extensions": "^0.17.1",
+    "react": "^18.2.0"
+  }
+}

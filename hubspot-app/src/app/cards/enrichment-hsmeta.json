@@ -1,0 +1,11 @@
+{
+  "uid": "enrichment_card",
+  "type": "card",
+  "config": {
+    "name": "Enrichment",
+    "description": "Ask for an enrichment run on this company and see when it was last enriched and which contacts it has, with each email's check result.",
+    "location": "crm.record.sidebar",
+    "entrypoint": "/app/cards/Enrichment.tsx",
+    "objectTypes": ["companies"]
+  }
+}

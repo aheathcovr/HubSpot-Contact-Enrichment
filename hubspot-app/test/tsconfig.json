@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowJs": false,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@hubspot/ui-extensions": ["node_modules/@hubspot/ui-extensions/dist/index.d.ts"],
+      "@hubspot/ui-extensions/*": ["node_modules/@hubspot/ui-extensions/dist/*/index.d.ts"],
+      "react": ["node_modules/@types/react/index.d.ts"],
+      "react/*": ["node_modules/@types/react/*"],
+      "vitest": ["node_modules/vitest/dist/index.d.ts"]
+    },
+    "typeRoots": ["./node_modules/@types"]
+  },
+  "include": [
+    "../src/app/cards/*.ts",
+    "../src/app/cards/*.tsx",
+    "*.test.ts",
+    "*.test.tsx",
+    "fixtures.ts",
+    "hubspot-fake.ts"
+  ]
+}
