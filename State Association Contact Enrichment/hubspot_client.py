@@ -297,6 +297,26 @@ class HubSpotClient:
             "most_recent_enrichment_date": p.get("most_recent_enrichment_date") or "",
         }
 
+    def get_contact_company_ids(self, contact_id: str) -> list[str]:
+        """
+        Every company the contact is associated with, as text ids (not only the primary one).
+
+        A contact can be linked to several companies at once, and `associatedcompanyid` names only
+        one of them. Raises HubSpotError when the request fails: the caller decides what an unknown
+        answer means.
+        """
+        ids: list[str] = []
+        after = ""
+        while True:
+            params = {"limit": 100}
+            if after:
+                params["after"] = after
+            data = self._get(f"/crm/v4/objects/contacts/{contact_id}/associations/companies", params=params)
+            ids.extend(str(r["toObjectId"]) for r in data.get("results", []) if r.get("toObjectId") is not None)
+            after = ((data.get("paging") or {}).get("next") or {}).get("after", "")
+            if not after:
+                return ids
+
     def get_associated_contacts(self, company_id: str, limit: int = 20) -> list[dict]:
         """
         Return contacts whose primary associated company is *company_id*.

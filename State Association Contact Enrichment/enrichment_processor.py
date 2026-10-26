@@ -21,6 +21,7 @@ Flow:
   7. Update revops_enrichment_date + reset request_to_enrich
 """
 
+import html
 import logging
 import os
 import re
@@ -37,6 +38,7 @@ from config import (
     FACILITY_LEADERSHIP_TITLES as LEADERSHIP_TITLES,
     W2_CORPORATE_TITLES,
 )
+import contact_match_guard
 from email_verifier import verify_email_millionverifier
 from fullenrich_client import enrich_contact_info, search_facility_contacts
 from hubspot_client import HubSpotClient, HubSpotError
@@ -684,6 +686,7 @@ def _enrich_and_associate_existing_contact(
     Returns a ContactAction with action="associated_existing".
     """
     held_email_note = _base.pop("email_held_note", "")   # before _base is spread into a ContactAction
+    _base.pop("match_declined_note", None)
     enriched_email = found_email
     enriched_email_status = email_validation.get("status", "")
     enriched_email_quality = email_validation.get("quality", "")
@@ -1007,6 +1010,7 @@ def _create_and_enrich_new_contact(
     Returns a ContactAction with action="created_new" or action="error".
     """
     held_email_note = _base.pop("email_held_note", "")   # before _base is spread into a ContactAction
+    declined_note = _base.pop("match_declined_note", "")
     contact_props: dict = {
         "firstname": first,
         "lastname": last,
@@ -1039,7 +1043,7 @@ def _create_and_enrich_new_contact(
         )
 
     # ── FullEnrich bulk enrich (work email only; see the existing-contact path) ─
-    new_note_lines: list[str] = [held_email_note] if held_email_note else []
+    new_note_lines: list[str] = [x for x in (declined_note, held_email_note) if x]
     new_fe_info: dict = {}
     # Accumulate every post-creation property write into one batched PATCH
     # (FullEnrich email/phone/LinkedIn, data freshness, enrichment date)
@@ -1171,6 +1175,50 @@ def _create_and_enrich_new_contact(
     )
 
 
+def _decide_reuse(
+    hs: HubSpotClient, contact_id: str, existing_email: str, *, found_email: str, source_path: str,
+    dh_verified: bool, related_ids: set, facility_domain: str, facility_name: str, operator_name: str,
+):
+    """
+    May the HubSpot contact *contact_id* be used for the person just found? Returns (decision, the
+    companies it is linked to). When HubSpot will not say what it is linked to, the answer is no:
+    a duplicate can be merged later, a wrong overwrite cannot easily be undone.
+    """
+    try:
+        linked = {str(c) for c in hs.get_contact_company_ids(contact_id)}
+    except Exception as exc:
+        logger.warning("Could not read which companies contact %s is linked to: %s", contact_id, exc)
+        return contact_match_guard.Decision(False, "HubSpot would not say which companies it is linked to"), set()
+    signals = contact_match_guard.signals_for(
+        source_path=source_path, dh_verified=dh_verified,
+        found_email_at_domain=bool(found_email) and _belongs_to_operator(found_email, facility_domain, facility_name, operator_name),
+        existing_email_at_domain=bool(existing_email) and _belongs_to_operator(existing_email, facility_domain, facility_name, operator_name),
+    )
+    same_email = bool(found_email) and found_email.strip().lower() == (existing_email or "").strip().lower()
+    decision = contact_match_guard.decide(
+        candidate_company_ids=linked, related_company_ids=related_ids, signals=signals, same_email=same_email,
+    )
+    return decision, linked
+
+
+def _company_label(hs: HubSpotClient, company_id: str) -> str:
+    try:
+        return str(hs.get_company_properties(company_id).get("name") or "") or f"company {company_id}"
+    except Exception:
+        return f"company {company_id}"
+
+
+def _match_declined_line(hs: HubSpotClient, found_name: str, contact_id: str, decision, linked: set) -> str:
+    """Note line saying a same-named contact was left alone, and why."""
+    where = ", ".join(_company_label(hs, c) for c in sorted(linked)) or "unknown"
+    return (
+        f"<b>ℹ Not merged with an existing contact:</b> HubSpot already has a contact named "
+        f"{html.escape(found_name)} (#{contact_id}, linked to {html.escape(where)}), but "
+        f"{html.escape(decision.reason)}. This separate contact was created and the other one was left "
+        f"untouched. If they are the same person, merge them by hand.<br>"
+    )
+
+
 def _process_found_contact(
     hs: HubSpotClient,
     found_name: str,
@@ -1195,9 +1243,15 @@ def _process_found_contact(
     research_source_name: str = "",
     dh_executive_id: str = "",
     operator_name: str = "",
+    related_company_ids: tuple = (),
 ) -> ContactAction:
     """
     Decide whether to create a new HubSpot contact or associate an existing one.
+
+    A contact is only reused when it is safe (see contact_match_guard): the same email, already
+    linked to this facility or its operator, linked to no company, or placed here by two independent
+    sources. A same-named contact linked only to other companies is left untouched and a separate
+    contact is made, with the reason on its note.
     """
     source_urls = _extract_urls(research_findings)[:20]
 
@@ -1283,8 +1337,29 @@ def _process_found_contact(
     matched_contact_id: str = ""
     matched_detail: str = ""
 
+    related_ids = {str(x) for x in related_company_ids if x} | {str(target_company_id)}
+    declined: list[str] = []
+
+    def _reuse_ok(cid: str, existing_email: str) -> bool:
+        decision, linked = _decide_reuse(
+            hs, cid, existing_email, found_email=found_email, source_path=source_path, dh_verified=dh_verified,
+            related_ids=related_ids, facility_domain=facility_domain, facility_name=facility_name,
+            operator_name=operator_name,
+        )
+        if decision.reuse:
+            return True
+        logger.info("Not reusing existing contact %s for %s: %s", cid, found_name, decision.reason)
+        declined.append(_match_declined_line(hs, found_name, cid, decision, linked))
+        return False
+
     existing_ids = [x for x in (pre_populated_contact_ids or "").split("|") if x]
     for cid in existing_ids:
+        try:
+            existing_email = hs.get_contact_properties(cid).get("email", "") if found_email else ""
+        except HubSpotError:
+            existing_email = ""
+        if not _reuse_ok(cid, existing_email):
+            continue
         try:
             hs.associate_contact_to_company(cid, target_company_id)
             matched_contact_id = cid
@@ -1316,6 +1391,8 @@ def _process_found_contact(
     if not matched_contact_id:
         name_matches = hs.search_contacts_by_name(first, last)
         for contact in name_matches:
+            if not _reuse_ok(contact["id"], contact.get("email", "")):
+                continue
             try:
                 hs.associate_contact_to_company(contact["id"], target_company_id)
                 matched_contact_id = contact["id"]
@@ -1330,6 +1407,8 @@ def _process_found_contact(
                 logger.warning(f"Name-match association failed for contact {contact['id']}: {exc}")
 
     # ── Route to existing-contact or new-contact path ─────────────────────────
+    if declined and not matched_contact_id:
+        _base["match_declined_note"] = " ".join(declined)       # picked up by the new-contact helper
     _base["match_method"] = _match_method
     if matched_contact_id:
         return _enrich_and_associate_existing_contact(
@@ -1583,7 +1662,7 @@ def _run_workflow1_single_facility(
     }
 
     # ── State association BigQuery table check (cheapest source — run first) ───
-    sa_contact = query_state_association_bq_table(bq_client, facility_name, city, state)
+    sa_contact = query_state_association_bq_table(bq_client, facility_name, city, state, facility_type)
     if sa_contact:
         logger.info(f"  ✓ Found in state association BQ table: {sa_contact['found_name']}")
         result.update(sa_contact)
@@ -1667,7 +1746,6 @@ def _run_workflow1_single_facility(
                 facility_hubspot_id=company_id,
                 parent_hubspot_id=props.get("hs_parent_company_id", ""),
             )
-            from state_association_matcher import _format_hubspot_matches_enhanced
             ids, detail, summary = _format_hubspot_matches_enhanced(
                 matches, match_strategy=match_strategy, facility_name=facility_name
             )
@@ -2471,6 +2549,7 @@ def run_enrichment(company_id: str) -> None:
             research_source_name=result.get("research_source_name", ""),
             dh_executive_id=str(result.get("executive_id", "") or ""),
             operator_name=parent_corp_name,
+            related_company_ids=tuple(x for x in {child_id, parent_company_id, company_id} if x),
         )
 
     actions: list[ContactAction] = []
