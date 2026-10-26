@@ -56,7 +56,7 @@ def _now_minus(days):
 def _row(**over):
     row = {
         "facility_id": "110349", "license_number": None, "facility_name": "THE MERIDIAN", "street_address": None,
-        "city": None, "source_state": "TX", "administrator": "SEAN L BUELOW", "executive_director": None,
+        "city": None, "source_state": "TX", "administrator": "DANA R KESTREL", "executive_director": None,
         "phone": "409-763-6437", "email": "info@meridiangalveston.com",
         "source_url": "https://apps.hhs.texas.gov/providers", "extracted_date": _now_minus(1),
     }
@@ -75,7 +75,7 @@ def test_a_facility_in_the_roster_gives_its_licensed_administrator():
 
     contact = sam.query_state_association_bq_table(client, "The Meridian", "Galveston", "TX")
 
-    assert contact["found_name"] == "Sean Buelow" and contact["found_title"] == "Administrator"
+    assert contact["found_name"] == "Dana Kestrel" and contact["found_title"] == "Administrator"
     assert contact["source_path"] == "state_association_bq_table"
 
 
@@ -139,15 +139,15 @@ def test_the_age_window_can_be_changed_by_the_environment(monkeypatch):
 
 def test_only_the_newest_copy_of_the_facility_is_believed():
     client = _FakeBigQuery([_row(administrator="OLD PERSON", extracted_date=_now_minus(60)),
-                            _row(administrator="SEAN L BUELOW", extracted_date=_now_minus(1))])
+                            _row(administrator="DANA R KESTREL", extracted_date=_now_minus(1))])
 
     contact = sam.query_state_association_bq_table(client, "The Meridian", "", "TX")
 
-    assert contact["found_name"] == "Sean Buelow"
+    assert contact["found_name"] == "Dana Kestrel"
 
 
 def test_a_newest_copy_that_says_vacant_is_no_one_and_does_not_fall_back_to_an_older_name():
-    client = _FakeBigQuery([_row(administrator="SEAN L BUELOW", extracted_date=_now_minus(60)),
+    client = _FakeBigQuery([_row(administrator="DANA R KESTREL", extracted_date=_now_minus(60)),
                             _row(administrator="VACANT", extracted_date=_now_minus(1))])
 
     assert sam.query_state_association_bq_table(client, "The Meridian", "", "TX") is None
@@ -209,14 +209,14 @@ def test_using_the_roster_is_logged_with_where_and_when_it_came_from(caplog):
     with caplog.at_level(logging.INFO):
         sam.query_state_association_bq_table(client, "The Meridian", "", "TX")
 
-    assert any("roster" in m.lower() and "TX" in m and "Sean Buelow" in m and "The Meridian" in m for m in caplog.messages)
+    assert any("roster" in m.lower() and "TX" in m and "Dana Kestrel" in m and "The Meridian" in m for m in caplog.messages)
 
 
 def test_the_kind_of_facility_separates_two_with_the_same_name():
-    client = _FakeBigQuery([_row(administrator="SEAN L BUELOW", facility_id="4862", facility_type="SNF"),
+    client = _FakeBigQuery([_row(administrator="DANA R KESTREL", facility_id="4862", facility_type="SNF"),
                             _row(administrator="ARIS TAN", facility_id="107196", facility_type="ALF")])
 
     contact = sam.query_state_association_bq_table(client, "The Meridian", "", "TX", "SNF")
 
-    assert contact["found_name"] == "Sean Buelow"
+    assert contact["found_name"] == "Dana Kestrel"
     assert "facility_type" in client.calls[0]["sql"]

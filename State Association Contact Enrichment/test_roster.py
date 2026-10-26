@@ -7,7 +7,7 @@ facility, and it is the one source we hold that names a person with legal standi
 reader never returned anyone from it (it looked for columns that do not exist), so it settled
 nothing. What a correct reader has to get right, from the real rows of 2026-10-25:
 
-  - names arrive as "SEAN L BUELOW", "TIEN, VINCE", " Megan  Loar", "Angela S. Compton";
+  - names arrive as "DANA R KESTREL", "TIEN, VINCE", " Megan  Loar", "Angela S. Compton";
   - some "names" are not one person: Alaska's are state staff email addresses, Hawaii's are two
     people with titles, and any state may say VACANT;
   - the table keeps a copy of every load, so only the NEWEST row of a facility counts, and a
@@ -35,7 +35,7 @@ _TODAY = date(2026, 10, 25)
 # ── Names ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("raw, expected", [
-    ("SEAN L BUELOW", "Sean Buelow"),                      # Texas: caps, middle initial
+    ("DANA R KESTREL", "Dana Kestrel"),                      # Texas: caps, middle initial
     ("TIEN, VINCE", "Vince Tien"),                         # California: LAST, FIRST
     (" Megan  Loar", "Megan Loar"),                        # Louisiana: stray and doubled spaces
     ("Zuccarelli, Patrick", "Patrick Zuccarelli"),         # Wisconsin
@@ -93,7 +93,7 @@ def test_a_state_name_or_abbreviation_becomes_the_abbreviation(raw, expected):
 def _row(**over):
     row = {
         "facility_id": "110349", "facility_name": "THE MERIDIAN", "city": "GALVESTON", "state": None,
-        "source_state": "TX", "administrator": "SEAN L BUELOW", "executive_director": None,
+        "source_state": "TX", "administrator": "DANA R KESTREL", "executive_director": None,
         "phone": "409-763-6437", "email": "info@meridiangalveston.com",
         "source_url": "https://apps.hhs.texas.gov/providers", "extracted_date": datetime(2026, 10, 25, 9, 34, 56),
     }
@@ -104,7 +104,7 @@ def _row(**over):
 def test_a_roster_row_becomes_the_licensed_administrator_with_where_it_came_from():
     contact = roster.row_to_contact(_row())
 
-    assert contact["found_name"] == "Sean Buelow"
+    assert contact["found_name"] == "Dana Kestrel"
     assert contact["found_title"] == "Administrator"
     assert contact["research_confidence"] == "high"
     assert contact["source_path"] == "state_association_bq_table"
@@ -127,7 +127,7 @@ def test_an_executive_director_is_used_when_there_is_no_administrator():
 def test_the_administrator_wins_over_the_executive_director():
     contact = roster.row_to_contact(_row(executive_director="Pat Lee"))
 
-    assert contact["found_name"] == "Sean Buelow"
+    assert contact["found_name"] == "Dana Kestrel"
 
 
 @pytest.mark.parametrize("administrator", [None, "", "VACANT", "Meagan.Adams@alaska.gov", "ACME LLC"])
@@ -142,21 +142,21 @@ def _snap(day, name, **over):
 
 
 def test_only_the_newest_row_of_a_facility_counts():
-    rows = [_snap((3, 21), "OLD PERSON"), _snap((10, 25), "SEAN L BUELOW"), _snap((7, 1), "MIDDLE PERSON")]
+    rows = [_snap((3, 21), "OLD PERSON"), _snap((10, 25), "DANA R KESTREL"), _snap((7, 1), "MIDDLE PERSON")]
 
     picked = roster.pick_roster_row(rows, city="Galveston", max_age_days=120, today=_TODAY)
 
-    assert picked["administrator"] == "SEAN L BUELOW"
+    assert picked["administrator"] == "DANA R KESTREL"
 
 
 def test_a_newest_row_that_says_vacant_beats_an_older_row_that_names_someone():
-    rows = [_snap((7, 1), "SEAN L BUELOW"), _snap((10, 25), "VACANT")]
+    rows = [_snap((7, 1), "DANA R KESTREL"), _snap((10, 25), "VACANT")]
 
     assert roster.pick_roster_row(rows, city="Galveston", max_age_days=120, today=_TODAY) is None
 
 
 def test_a_row_older_than_the_limit_is_not_trusted():
-    rows = [_snap((5, 1), "SEAN L BUELOW")]                           # 177 days before 2026-10-25
+    rows = [_snap((5, 1), "DANA R KESTREL")]                           # 177 days before 2026-10-25
 
     assert roster.pick_roster_row(rows, city="", max_age_days=120, today=_TODAY) is None
     assert roster.pick_roster_row(rows, city="", max_age_days=200, today=_TODAY) is not None
@@ -186,7 +186,7 @@ def test_two_facilities_in_the_same_city_with_one_name_are_still_not_guessed_bet
 
 
 def test_a_city_the_roster_does_not_have_is_not_held_against_the_facility():
-    rows = [_snap((10, 25), "SEAN L BUELOW", city=None)]              # Texas rows have no city
+    rows = [_snap((10, 25), "DANA R KESTREL", city=None)]              # Texas rows have no city
 
     assert roster.pick_roster_row(rows, city="Galveston", max_age_days=120, today=_TODAY) is not None
 
@@ -218,12 +218,12 @@ def test_no_rows_is_no_row():
 # living one, with no city on either row. HubSpot knows which one it is looking for.
 
 def _two_meridians():
-    return [_snap((10, 25), "SEAN L BUELOW", facility_id="4862", facility_type="SNF"),
+    return [_snap((10, 25), "DANA R KESTREL", facility_id="4862", facility_type="SNF"),
             _snap((10, 25), "ARIS TAN", facility_id="107196", facility_type="ALF")]
 
 
 @pytest.mark.parametrize("hubspot_type, expected", [
-    ("SNF", "SEAN L BUELOW"), ("AL/IL/MC", "ARIS TAN"), ("ALF", "ARIS TAN"), ("assisted living", "ARIS TAN"),
+    ("SNF", "DANA R KESTREL"), ("AL/IL/MC", "ARIS TAN"), ("ALF", "ARIS TAN"), ("assisted living", "ARIS TAN"),
 ])
 def test_the_kind_of_facility_picks_between_facilities_with_one_name(hubspot_type, expected):
     picked = roster.pick_roster_row(_two_meridians(), city="", max_age_days=120, today=_TODAY, facility_type=hubspot_type)
@@ -240,7 +240,7 @@ def test_a_kind_nobody_recognises_does_not_pick_either():
 
 
 def test_a_roster_row_with_no_kind_is_not_ruled_out_by_one():
-    rows = [_snap((10, 25), "SEAN L BUELOW", facility_id="4862", facility_type=None)]
+    rows = [_snap((10, 25), "DANA R KESTREL", facility_id="4862", facility_type=None)]
 
     assert roster.pick_roster_row(rows, city="", max_age_days=120, today=_TODAY, facility_type="SNF") is not None
 
