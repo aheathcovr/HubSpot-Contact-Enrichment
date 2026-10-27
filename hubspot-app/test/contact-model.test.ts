@@ -23,6 +23,8 @@ const run = (over: Partial<RunView> = {}): RunView => ({
   requestedBy: 'rep@example.org',
   createdAt: '2026-10-26T16:00:00Z',
   finishedAt: '2026-10-26T16:00:09Z',
+  companyId: null,
+  batchId: null,
   ...over,
 });
 
@@ -119,6 +121,11 @@ describe('naming a run', () => {
     expect(objectiveLabel('find_mobile')).toBe('Find mobile');
     expect(objectiveLabel('verify_email')).toBe('Verify email');
     expect(objectiveLabel('something_new')).toBe('something_new');
+  });
+
+  it('names the two runs the company card makes that have no contact to begin with', () => {
+    expect(objectiveLabel('find_by_title')).toBe('Find by job title');
+    expect(objectiveLabel('add_candidate')).toBe('Add person');
   });
 });
 

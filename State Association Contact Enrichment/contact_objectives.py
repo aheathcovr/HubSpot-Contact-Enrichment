@@ -35,6 +35,7 @@ from seamless_client import lookup_person as seamless_lookup
 logger = logging.getLogger(__name__)
 
 FACILITY_TYPE = "Individual Facility / Child"
+CORPORATION_TYPE = "Corporation / Operator"
 # Companies read to find the one a contact is checked against. A contact is linked to one or two.
 _MAX_COMPANIES = 5
 
@@ -46,6 +47,11 @@ OBJECTIVES = (
 )
 _LABELS = {oid: label for oid, label, _ in OBJECTIVES}
 
+# What the company card offers for the contacts a rep picks: the three above, and Enrich, which means whichever of
+# them the contact is missing. Enrich is only a plan (plan_for): each step is a run of one of the three.
+ENRICH_ID = "enrich"
+BATCH_OBJECTIVES = OBJECTIVES + ((ENRICH_ID, "Enrich", "whatever is missing: up to 3 lookups and 1 check"),)
+
 _NEEDS_A_NAME = "Needs a first and last name."
 
 
@@ -56,6 +62,8 @@ class Outcome:
     outcome: str
     message: str
     wrote: list = field(default_factory=list)
+    # The contact the run made or reused, for a run that started without one (adding a person a title search found).
+    contact_id: str = ""
 
 
 @dataclass
@@ -91,6 +99,39 @@ def objectives_for(contact: dict) -> list[dict]:
         reason = _availability(oid, contact)
         out.append({"id": oid, "label": label, "available": reason is None, "reason": reason, "spends": spends})
     return out
+
+
+def company_kind(hierarchy_type: str) -> str:
+    """facility, corporation or other: how a company's Company Type reads to the app."""
+    return {FACILITY_TYPE: "facility", CORPORATION_TYPE: "corporation"}.get((hierarchy_type or "").strip(), "other")
+
+
+def plan_for(objective: str, contact: dict) -> "tuple[list[str], Optional[str]]":
+    """
+    The runs a choice means for one contact, as (objective ids, None), or ([], why there is nothing to run).
+
+    A named objective is that one run when it is open to the contact. Enrich fills what is missing: an email that has
+    never been checked is checked, a missing email is looked for, and a missing mobile is looked for. An email that
+    already has a check on it is left alone, like every other value that is already there.
+    """
+    if objective == ENRICH_ID:
+        runs = []
+        if contact.get("email"):
+            if not contact.get("email_verification_result"):
+                runs.append("verify_email")
+        elif _availability("find_email", contact) is None:
+            runs.append("find_email")
+        if _availability("find_mobile", contact) is None:
+            runs.append("find_mobile")
+        if runs:
+            return runs, None
+        if not _has_name(contact):
+            return [], _NEEDS_A_NAME
+        return [], "Nothing is missing."
+    if objective not in _LABELS:
+        raise ValueError(f"Unknown objective {objective!r}")
+    reason = _availability(objective, contact)
+    return ([objective], None) if reason is None else ([], reason)
 
 
 def _day(raw: str) -> Optional[str]:

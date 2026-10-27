@@ -21,7 +21,7 @@ const contact = (over: Partial<ContactInfo> = {}): ContactInfo => ({
 
 const run = (over: Partial<RunView> = {}): RunView => ({
   runId: 'a'.repeat(32), contactId: CONTACT_ID, objective: 'find_email', status: 'queued', outcome: null, message: null, wrote: [],
-  requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, ...over,
+  requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: null, batchId: null, ...over,
 });
 
 const quota = (remaining = 22, cap = 25): Quota => ({ cap, used: cap - remaining, remaining });

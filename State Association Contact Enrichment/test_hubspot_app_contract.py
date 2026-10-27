@@ -159,3 +159,187 @@ def test_the_contact_card_names_every_outcome_the_service_can_report():
     cases = set(re.findall(r"case '(\w+)':", _card_source("contact-model.ts")))
 
     assert outcomes <= cases, f"the card does not name these outcomes: {sorted(outcomes - cases)}"
+
+
+# ── The company card picks contacts ───────────────────────────────────────────
+#
+# The Enrichment card (company-model.ts, usePicker.ts, PickPanel.tsx) calls /app/company/status and /app/company/run.
+# These compare what it declares with what the service sends and does.
+
+def _interface(source, name):
+    return re.search(rf"export interface {name} \{{(.*?)\n\}}", source, re.S).group(1)
+
+
+def _keys(declared):
+    return set(re.findall(r"^\s+(\w+)\??:", declared, re.M))
+
+
+def _fakes(monkeypatch):
+    """A company with one contact, a memory run store, and a queue that takes everything: what the two routes need."""
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock
+
+    import app_run_store
+    import hubspot_request_auth
+
+    hs = MagicMock()
+    hs.get_company_properties.return_value = {"name": "Elm Court Care Center", "hierarchy_type": "Individual Facility / Child"}
+    hs.get_contact_company_ids.return_value = ["500"]
+    hs.get_contact_for_app.return_value = {"firstname": "Pat", "lastname": "Lee", "email": "", "mobilephone": ""}
+    store = app_run_store.MemoryRunStore()
+    monkeypatch.setattr(webhook_server, "_hubspot", lambda: hs)
+    monkeypatch.setattr(webhook_server, "_run_store", lambda: store)
+    monkeypatch.setattr(webhook_server, "_enqueue_app_run", lambda run_id: None)
+    monkeypatch.setattr(webhook_server, "_utcnow", lambda: datetime(2026, 10, 26, 16, tzinfo=timezone.utc))
+    return hubspot_request_auth.Identity(user_id="77", email="rep@example.org", portal_id="1", app_id="2")
+
+
+def test_the_company_card_offers_the_objectives_the_service_plans():
+    import contact_objectives
+
+    declared = re.search(r"id: ([^;]+);", _interface(_card_source("company-model.ts"), "BatchObjective")).group(1)
+
+    assert re.findall(r"'([^']+)'", declared) == [oid for oid, _, _ in contact_objectives.BATCH_OBJECTIVES]
+
+
+def test_the_company_card_calls_routes_the_service_has():
+    routes = {(m, r.path) for r in webhook_server.app.routes if hasattr(r, "methods") for m in r.methods}
+
+    assert ("GET", "/app/company/status") in routes and ("POST", "/app/company/run") in routes
+    assert "`/company/status?companyId=${companyId}`" in _card_source("company-model.ts")
+    assert "'POST', '/company/run'" in _card_source("usePicker.ts")
+
+
+def test_the_company_card_reads_the_fields_of_a_company_status_the_service_sends(monkeypatch):
+    who = _fakes(monkeypatch)
+
+    _, sent = webhook_server._app_company_status("500", who)
+
+    source = _card_source("company-model.ts")
+    assert _keys(_interface(source, "CompanyStatus")) == set(sent)
+    assert _keys(_interface(source, "CompanyInfo")) == set(sent["company"])
+    assert _keys(_interface(source, "BatchObjective")) == set(sent["objectives"][0])
+    assert re.findall(r"limits: \{ (\w+): number; (\w+):", _interface(source, "CompanyStatus"))[0] == tuple(sent["limits"])
+
+
+def test_the_company_card_reads_the_fields_of_a_batch_the_service_sends(monkeypatch):
+    who = _fakes(monkeypatch)
+
+    status, sent = webhook_server._app_company_start("500", ["1"], "find_email", who)
+
+    source = _card_source("company-model.ts")
+    assert status == 202 and _keys(_interface(source, "BatchResult")) == set(sent)
+    assert _keys(_interface(source, "BatchItem")) == set(sent["items"][0])
+
+
+def test_the_company_card_knows_the_item_statuses_the_service_writes():
+    declared = re.search(r"export type ItemStatus = ([^;]+);", _card_source("company-model.ts")).group(1)
+    card = set(re.findall(r"'([^']+)'", declared))
+    service = _source("webhook_server.py")
+    written = set(re.findall(r'_item\(\w+, \w+, "(\w+)"', service)) | set(re.findall(r'update\(status="(\w+)"', service)) | set(re.findall(r'\["status"\] = "(\w+)"', service))
+    written -= {"pending"}   # a placeholder while a request is planned; every one is started or failed before the answer goes out
+
+    assert card == {"started", "reused", "skipped", "failed"} and written <= card
+
+
+def test_the_company_card_limits_a_pick_as_the_service_does():
+    declared = int(re.search(r"DEFAULT_MAX_CONTACTS = (\d+);", _card_source("usePicker.ts")).group(1))
+
+    assert declared == webhook_server._APP_BATCH_MAX_CONTACTS
+
+
+def test_the_company_card_counts_the_most_runs_enrich_can_start_for_a_contact_as_the_service_plans_them():
+    import itertools
+
+    import contact_objectives
+
+    most = 0
+    for named, email, checked, mobile in itertools.product([True, False], repeat=4):
+        contact = {"firstname": "Pat" if named else "", "lastname": "Lee" if named else "", "email": "x@example.org" if email else "",
+                   "email_verification_result": "ok" if checked else "", "mobilephone": "405-555-0101" if mobile else ""}
+        most = max(most, len(contact_objectives.plan_for("enrich", contact)[0]))
+
+    assert most == 2
+    assert "objective === 'enrich' ? picked * 2 : picked" in _card_source("company-model.ts")
+
+
+# ── The company card finds people by job title ────────────────────────────────
+
+def _search_and_candidate(now):
+    """A finished search with one person kept, in the run store the fakes installed; the search's id."""
+    store = webhook_server._run_store()
+    store.create_run({"run_id": "f" * 32, "contact_id": "", "objective": "find_by_title", "titles": ["Medical Director"], "titles_key": "medical director",
+                      "requested_by_id": "77", "requested_by": "rep@example.org", "portal_id": "1", "company_id": "500", "status": "done", "created_at": now})
+    store.save_candidates("f" * 32, "500", [{"candidate_id": "a" * 12, "full_name": "Pat Lee", "title": "Medical Director", "linkedin_url": "", "updated_at": "", "linked_contact_id": ""}], now)
+    return "f" * 32
+
+
+def test_the_company_card_calls_the_title_routes_the_service_has():
+    routes = {(m, r.path) for r in webhook_server.app.routes if hasattr(r, "methods") for m in r.methods}
+
+    assert {("POST", "/app/company/find"), ("GET", "/app/company/candidates"), ("POST", "/app/company/add")} <= routes
+    hook = _card_source("useTitleSearch.ts")
+    assert "'POST', '/company/find'" in hook and "'POST', '/company/add'" in hook
+    assert "`/company/candidates?companyId=${companyId}&runId=${runId}`" in _card_source("company-model.ts")
+
+
+def test_the_company_card_names_the_runs_the_title_search_makes_as_the_service_does():
+    import company_titles
+
+    labels = dict(re.findall(r"(\w+): '([^']+)'", re.search(r"COMPANY_RUN_LABELS: Record<string, string> = \{([^}]+)\}", _card_source("contact-model.ts")).group(1)))
+
+    assert set(labels) == {company_titles.FIND_OBJECTIVE, company_titles.ADD_OBJECTIVE}
+    assert f"const FIND_OBJECTIVE = '{company_titles.FIND_OBJECTIVE}';" in _card_source("useTitleSearch.ts")
+
+
+def test_the_company_card_reads_the_fields_of_a_find_the_service_sends(monkeypatch):
+    who = _fakes(monkeypatch)
+
+    status, sent = webhook_server._app_find_start("500", ["Medical Director"], who)
+
+    assert status == 202 and _keys(_interface(_card_source("company-model.ts"), "FindResult")) == set(sent)
+
+
+def test_the_company_card_reads_the_fields_of_the_people_a_search_found(monkeypatch):
+    from datetime import datetime, timezone
+
+    who = _fakes(monkeypatch)
+    run_id = _search_and_candidate(datetime(2026, 10, 26, 16, tzinfo=timezone.utc))
+
+    status, sent = webhook_server._app_candidates("500", run_id)
+
+    source = _card_source("company-model.ts")
+    assert status == 200 and _keys(_interface(source, "CandidateList")) == set(sent)
+    assert _keys(_interface(source, "Candidate")) == set(sent["candidates"][0])
+
+
+def test_the_company_card_reads_the_fields_of_an_add_the_service_sends(monkeypatch):
+    from datetime import datetime, timezone
+
+    who = _fakes(monkeypatch)
+    run_id = _search_and_candidate(datetime(2026, 10, 26, 16, tzinfo=timezone.utc))
+
+    status, sent = webhook_server._app_add_start("500", run_id, ["a" * 12], who)
+
+    source = _card_source("company-model.ts")
+    assert status == 202 and _keys(_interface(source, "AddResult")) == set(sent)
+    assert _keys(_interface(source, "AddItem")) == set(sent["items"][0])
+
+
+def test_the_company_card_brings_back_a_search_for_as_long_as_the_service_hands_the_same_one_back():
+    declared = re.search(r"RESUME_WITHIN_MS = (\d+) \* (\d+) \* (\d+) \* (\d+);", _card_source("useTitleSearch.ts"))
+    ms = 1
+    for part in declared.groups():
+        ms *= int(part)
+
+    assert ms == webhook_server._APP_REUSE_WINDOW.total_seconds() * 1000
+
+
+def test_the_company_card_knows_the_statuses_and_outcomes_the_title_search_reports():
+    declared = re.search(r"status: ([^;]+);", re.search(r"export interface RunView \{(.*?)\n\}", _card_source("contact-model.ts"), re.S).group(1)).group(1)
+    statuses = set(re.findall(r'Outcome\("(\w+)"', _source("company_titles.py")))
+    outcomes = set(re.findall(r'Outcome\("\w+", "(\w+)"', _source("company_titles.py"))) - {"error"}
+    cases = set(re.findall(r"case '(\w+)':", _card_source("contact-model.ts")))
+
+    assert statuses <= set(re.findall(r"'([^']+)'", declared))
+    assert outcomes <= cases, f"the card does not name these outcomes: {sorted(outcomes - cases)}"

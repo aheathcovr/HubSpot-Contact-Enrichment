@@ -31,7 +31,7 @@ try {
     if (bundle.includes('React.createElement')) problems.push(`${entry}: the bundle uses React.createElement without importing React. Keep tsconfig.json ("jsx": "react-jsx") next to the cards.`);
     // What each card must call: the company card an app function, the contact card the enrichment service.
     const calls = {
-      'Enrichment.tsx': ['"enrichment"'],
+      'Enrichment.tsx': ['"enrichment"', 'hubspot-enrichment-kpqza7tiga-uc.a.run.app/app', '/company/status', '/company/run', '/company/find', '/company/add', '/company/candidates'],
       'ContactCheck.tsx': ['hubspot-enrichment-kpqza7tiga-uc.a.run.app/app', '/contact/status', '/contact/run'],
     }[entry];
     if (!calls) problems.push(`${entry}: no check is defined for this card in bundle-check.mjs.`);

@@ -47,6 +47,9 @@ export interface RunView {
   requestedBy: string;
   createdAt: string;
   finishedAt: string | null;
+  // Set for a run started from a company card; the contact card's own runs have neither.
+  companyId: string | null;
+  batchId: string | null;
 }
 
 export interface ContactStatus {
@@ -128,8 +131,10 @@ export function makeService(doFetch: FetchLike, base: string = SERVICE_URL): Ser
 export const runIsOpen = (run: RunView): boolean => run.status === 'queued' || run.status === 'running';
 
 const OBJECTIVE_LABELS: Record<string, string> = { find_email: 'Find email', find_mobile: 'Find mobile', verify_email: 'Verify email' };
+// The two runs the company card makes that start without a contact: a search by job title, and adding one person it found.
+const COMPANY_RUN_LABELS: Record<string, string> = { find_by_title: 'Find by job title', add_candidate: 'Add person' };
 
-export const objectiveLabel = (id: string): string => OBJECTIVE_LABELS[id] ?? id;
+export const objectiveLabel = (id: string): string => OBJECTIVE_LABELS[id] ?? COMPANY_RUN_LABELS[id] ?? id;
 
 export interface RunLook {
   label: string;
