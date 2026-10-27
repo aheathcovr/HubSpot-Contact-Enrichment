@@ -192,6 +192,22 @@ def test_recent_runs_are_this_contacts_newest_first(store):
     assert [r["run_id"] for r in got] == ["c", "b"]
 
 
+def test_a_companys_runs_are_those_started_from_it_newest_first(store):
+    store.create_run(_run("a", contact="1", company_id="500", created_at=T0))
+    store.create_run(_run("b", contact="2", company_id="500", created_at=T0 + timedelta(minutes=1)))
+    store.create_run(_run("c", contact="3", company_id="500", created_at=T0 + timedelta(minutes=2)))
+    store.create_run(_run("elsewhere", contact="4", company_id="600", created_at=T0 + timedelta(minutes=3)))
+    store.create_run(_run("from-the-contact-card", contact="5", created_at=T0 + timedelta(minutes=4)))
+
+    got = store.runs_for_company("500", limit=2)
+
+    assert [r["run_id"] for r in got] == ["c", "b"]
+
+
+def test_a_company_with_no_runs_has_none(store):
+    assert store.runs_for_company("500") == []
+
+
 def test_no_recent_runs_for_a_contact_with_none(store):
     assert store.recent_runs("42") == []
 
@@ -230,6 +246,45 @@ def test_the_newest_of_several_repeats_is_returned(store):
     store.create_run(_run("b", created_at=T0 + timedelta(minutes=5)))
 
     assert store.find_recent_run("42", "find_email", since=T0 - timedelta(hours=1))["run_id"] == "b"
+
+
+# ── A run that ends up with a contact, and the people a title search found ────
+
+def test_a_finished_run_can_say_which_contact_it_made(store):
+    store.create_run(_run(contact=""))
+    store.claim_run("r1", T0)
+
+    store.finish_run("r1", T0, status="done", outcome="found", message="Added.", wrote=["contact"], contact_id="901")
+
+    assert store.get_run("r1")["contact_id"] == "901"
+
+
+def test_a_finished_run_keeps_its_contact_when_it_does_not_say(store):
+    store.create_run(_run())
+    store.claim_run("r1", T0)
+
+    store.finish_run("r1", T0, status="done", outcome="found", message="Mobile number added.", wrote=["mobilephone"])
+
+    assert store.get_run("r1")["contact_id"] == "42"
+
+
+def test_the_people_a_title_search_found_can_be_read_back(store):
+    people = [{"candidate_id": "c1", "full_name": "Pat Lee", "title": "Medical Director"}]
+
+    store.save_candidates("r1", "500", people, T0)
+
+    got = store.get_candidates("r1")
+    assert got["run_id"] == "r1" and got["company_id"] == "500" and got["candidates"] == people
+
+
+def test_a_search_nobody_saved_people_for_has_none(store):
+    assert store.get_candidates("nope") is None
+
+
+def test_the_people_a_search_found_are_kept_for_two_days(store):
+    store.save_candidates("r1", "500", [], T0)
+
+    assert store.get_candidates("r1")["expire_at"] == T0 + timedelta(days=2)
 
 
 # ── The cap ───────────────────────────────────────────────────────────────────
@@ -334,8 +389,14 @@ def test_a_run_is_shown_to_the_card_with_camel_case_names_and_text_dates():
     assert shown == {
         "runId": "r1", "contactId": "42", "objective": "find_email", "status": "done", "outcome": "found",
         "message": "Mobile number added.", "wrote": ["mobilephone"], "requestedBy": "rep@example.org",
-        "createdAt": "2026-10-26T16:00:00Z", "finishedAt": "2026-10-26T16:00:09Z",
+        "createdAt": "2026-10-26T16:00:00Z", "finishedAt": "2026-10-26T16:00:09Z", "companyId": None, "batchId": None,
     }
+
+
+def test_a_run_started_from_a_company_is_shown_with_its_company_and_batch():
+    shown = rs.run_view(_run(company_id="500", batch_id="b" * 32))
+
+    assert shown["companyId"] == "500" and shown["batchId"] == "b" * 32
 
 
 def test_a_run_not_finished_has_no_finish_time_or_outcome():

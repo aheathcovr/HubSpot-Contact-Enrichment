@@ -186,6 +186,19 @@ def _credits_exhausted(api_key: str) -> bool:
         return True
     return False
 
+def search_unavailable_reason() -> "str | None":
+    """
+    Why a title search cannot be done right now, in words for a rep, or None when it can. The search itself answers
+    "nobody found" in both of these cases, which would read as a finding.
+    """
+    api_key = os.getenv("FULLENRICH_API_KEY", "").strip()
+    if not api_key:
+        return "FullEnrich is not set up on the service, so people cannot be searched for."
+    if _credits_exhausted(api_key):
+        return "FullEnrich has no credits left, so people cannot be searched for."
+    return None
+
+
 # US state name → abbreviation map for normalising FullEnrich region strings
 _STATE_ABBR: dict[str, str] = {
     "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",

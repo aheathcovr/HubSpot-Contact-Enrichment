@@ -1,10 +1,15 @@
 // Enrichment card: the view. Enrichment.tsx hands it HubSpot's context, actions and the runner for app functions;
 // the tests hand it fakes.
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Accordion, Button, Divider, EmptyState, ErrorState, Flex, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
+import { Accordion, Button, Checkbox, Divider, EmptyState, ErrorState, Flex, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
 import type { CrmContext, ExtensionPointApiActions, ServerlessRunnerParams } from '@hubspot/ui-extensions';
 import { COMPANY_TYPE_ID, FUNCTION_NAME, SENT_PROPERTIES, emailCheckTag, formatDay, groupContacts, messageOf, readResult, statusTag } from './model.ts';
 import type { ContactRow, RequestResult, StatusResult } from './model.ts';
+import type { Service } from './contact-model.ts';
+import { PickPanel } from './PickPanel.tsx';
+import { TitlePanel } from './TitlePanel.tsx';
+import { usePicker } from './usePicker.ts';
+import { useTitleSearch } from './useTitleSearch.ts';
 
 export type Runner = (name: string, options?: Omit<ServerlessRunnerParams, 'name'>) => Promise<unknown>;
 
@@ -16,15 +21,34 @@ export interface EnrichmentViewProps {
   // up after maxPolls asks. A run takes from a few seconds to a couple of minutes.
   pollEveryMs?: number;
   maxPolls?: number;
+  // The enrichment service, for picking contacts and starting runs for them. Without it the card does no picking.
+  service?: Service;
+  // The same, for the runs started from this card (milliseconds; 0 turns it off).
+  runPollEveryMs?: number;
+  runMaxPolls?: number;
+  now?: () => number;
 }
 
 type Load = 'first' | 'refresh' | 'poll';
 
-function ContactBlock({ contact }: { contact: ContactRow }) {
+// What a contact's row needs to be ticked: set when the card is picking contacts.
+interface Pick {
+  checked: boolean;
+  readOnly: boolean;
+  onChange: (checked: boolean) => void;
+}
+
+function ContactBlock({ contact, pick }: { contact: ContactRow; pick?: Pick }) {
   const check = emailCheckTag(contact.emailCheck);
   return (
     <Flex direction="column" gap="flush">
-      <Text format={{ fontWeight: 'bold' }}>{contact.name}</Text>
+      {pick ? (
+        <Checkbox name={`pick-${contact.id}`} checked={pick.checked} readOnly={pick.readOnly} onChange={(checked) => pick.onChange(checked)}>
+          {contact.name}
+        </Checkbox>
+      ) : (
+        <Text format={{ fontWeight: 'bold' }}>{contact.name}</Text>
+      )}
       {contact.title ? <Text variant="microcopy">{contact.title}</Text> : null}
       {contact.email ? (
         <Flex align="center" gap="xs">
@@ -37,7 +61,7 @@ function ContactBlock({ contact }: { contact: ContactRow }) {
   );
 }
 
-export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, maxPolls = 60 }: EnrichmentViewProps) {
+export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, maxPolls = 60, service, runPollEveryMs = 5000, runMaxPolls = 36, now = Date.now }: EnrichmentViewProps) {
   const objectId = String(context.crm.objectId);
   const objectTypeId = context.crm.objectTypeId;
   const isCompany = objectTypeId === COMPANY_TYPE_ID;
@@ -50,6 +74,11 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
   const [gaveUp, setGaveUp] = useState(false);
   // Counts the checks made while waiting, so the next one is scheduled whether or not the last one worked.
   const [pollTick, setPollTick] = useState(0);
+
+  const picker = usePicker({ service, actions, companyId: objectId, active: isCompany, contacts: data?.contacts ?? [], pollEveryMs: runPollEveryMs, maxPolls: runMaxPolls });
+  const titleSearch = useTitleSearch({
+    service, actions, companyId: objectId, status: picker.data, applyQuota: picker.setQuota, reloadStatus: picker.reload, pollEveryMs: runPollEveryMs, maxPolls: runMaxPolls, now,
+  });
 
   const hasData = useRef(false);
   const requestingNow = useRef(false);
@@ -116,7 +145,9 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
     polls.current = 0;
     setGaveUp(false);
     void load('refresh');
-  }, [load]);
+    picker.refresh();
+    titleSearch.refresh();
+  }, [load, picker.refresh, titleSearch.refresh]);
 
   const request = useCallback(async () => {
     if (requestingNow.current) return;
@@ -159,6 +190,11 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
   const tag = statusTag(company);
   const { enriched, others } = groupContacts(contacts);
   const note = message ?? (company.lastEnrichedOn ? `Last enriched ${formatDay(company.lastEnrichedOn)}.` : 'No enrichment run on record for this company.');
+  const names = Object.fromEntries(contacts.map((c) => [c.id, c.name]));
+  const pickFor = (c: ContactRow): Pick | undefined =>
+    picker.enabled && picker.data
+      ? { checked: picker.picked.includes(c.id), readOnly: picker.atLimit && !picker.picked.includes(c.id), onChange: (checked) => picker.toggle(c.id, checked) }
+      : undefined;
 
   return (
     <Flex direction="column" gap="sm">
@@ -178,7 +214,7 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
         <Flex direction="column" gap="sm">
           <Text format={{ fontWeight: 'bold' }}>{`Contacts the service enriched (${enriched.length})`}</Text>
           {enriched.map((c) => (
-            <ContactBlock key={c.id} contact={c} />
+            <ContactBlock key={c.id} contact={c} pick={pickFor(c)} />
           ))}
         </Flex>
       ) : null}
@@ -186,12 +222,14 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
         <Accordion title={`Other contacts (${others.length})`}>
           <Flex direction="column" gap="sm">
             {others.map((c) => (
-              <ContactBlock key={c.id} contact={c} />
+              <ContactBlock key={c.id} contact={c} pick={pickFor(c)} />
             ))}
           </Flex>
         </Accordion>
       ) : null}
       {moreContacts ? <Text variant="microcopy">Showing the first 100 contacts. This company has more.</Text> : null}
+      {picker.enabled ? <PickPanel picker={picker} names={names} nowMs={now()} /> : null}
+      {picker.enabled && picker.data ? <TitlePanel data={picker.data} titles={titleSearch} /> : null}
       <Button size="xs" variant="secondary" disabled={refreshing} onClick={refresh}>
         {refreshing ? 'Refreshing' : 'Refresh'}
       </Button>

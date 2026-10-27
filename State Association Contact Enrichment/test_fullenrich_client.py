@@ -315,3 +315,25 @@ def test_the_balance_is_checked_once_per_window_not_once_per_lookup(fake):
     fe.enrich_contact_info("John", "Roe", domain="facility.com")
 
     assert server.credit_gets == 1
+
+
+# ── Whether a title search can be done at all (the HubSpot app asks before it promises a result) ─────────────────
+
+def test_a_title_search_cannot_be_done_without_an_api_key(monkeypatch):
+    monkeypatch.delenv("FULLENRICH_API_KEY", raising=False)
+
+    assert fe.search_unavailable_reason() == "FullEnrich is not set up on the service, so people cannot be searched for."
+
+
+def test_a_title_search_cannot_be_done_when_the_credits_are_gone(monkeypatch):
+    monkeypatch.setenv("FULLENRICH_API_KEY", "test-key")
+    monkeypatch.setattr(fe, "_credits_exhausted", lambda api_key: True)
+
+    assert fe.search_unavailable_reason() == "FullEnrich has no credits left, so people cannot be searched for."
+
+
+def test_a_title_search_can_be_done_with_a_key_and_credits(monkeypatch):
+    monkeypatch.setenv("FULLENRICH_API_KEY", "test-key")
+    monkeypatch.setattr(fe, "_credits_exhausted", lambda api_key: False)
+
+    assert fe.search_unavailable_reason() is None

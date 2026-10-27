@@ -32,7 +32,7 @@ _INVALID = {"result": "invalid", "status": "INVALID", "quality": "bad"}
 
 _CONTACT = {
     "firstname": "Pat", "lastname": "Lee", "jobtitle": "Administrator", "email": "", "mobilephone": "", "phone": "",
-    "hs_linkedin_url": "https://www.linkedin.com/in/pat-lee", "email_verification_result": "", "email_verification_date": "",
+    "hs_linkedin_url": "https://www.linkedin.com/in/pat-lee-example", "email_verification_result": "", "email_verification_date": "",
 }
 _COMPANIES = {
     "500": {"name": "Elm Court Care Center", "hierarchy_type": _FACILITY, "website": _SITE, "hs_parent_company_id": "600"},
@@ -155,6 +155,78 @@ def test_a_contact_with_nothing_is_summarised_with_nulls():
     assert got == {"name": "No name", "title": None, "email": None, "mobile": None, "emailCheck": None, "emailCheckedOn": None}
 
 
+# ── What a choice means for one contact (the company card picks contacts) ─────
+
+def test_the_company_card_offers_the_three_objectives_and_enrich():
+    assert [(o[0], o[1]) for o in co.BATCH_OBJECTIVES] == [
+        ("find_email", "Find email"), ("find_mobile", "Find mobile"), ("verify_email", "Verify email"), ("enrich", "Enrich"),
+    ]
+    assert co.BATCH_OBJECTIVES[:3] == co.OBJECTIVES
+
+
+@pytest.mark.parametrize("objective, contact, expected", [
+    ("find_email", {}, ["find_email"]),
+    ("find_mobile", {}, ["find_mobile"]),
+    ("verify_email", {"email": "pat.lee@example.org"}, ["verify_email"]),
+])
+def test_a_named_objective_is_one_run_when_it_is_open_to_the_contact(objective, contact, expected):
+    runs, reason = co.plan_for(objective, {**_CONTACT, **contact})
+
+    assert runs == expected and reason is None
+
+
+@pytest.mark.parametrize("objective, contact, reason", [
+    ("find_email", {"email": "pat.lee@example.org"}, "Already has an email. Use Verify email."),
+    ("find_mobile", {"mobilephone": "405-555-0101"}, "Already has a mobile number."),
+    ("verify_email", {}, "No email to check."),
+    ("find_email", {"lastname": ""}, "Needs a first and last name."),
+])
+def test_a_named_objective_closed_to_the_contact_is_no_run_and_says_why(objective, contact, reason):
+    runs, got = co.plan_for(objective, {**_CONTACT, **contact})
+
+    assert runs == [] and got == reason
+
+
+def test_enrich_looks_for_what_is_missing():
+    runs, reason = co.plan_for("enrich", dict(_CONTACT))
+
+    assert runs == ["find_email", "find_mobile"] and reason is None
+
+
+def test_enrich_checks_an_email_that_has_never_been_checked_instead_of_looking_for_one():
+    runs, _ = co.plan_for("enrich", {**_CONTACT, "email": "pat.lee@example.org", "mobilephone": "405-555-0101"})
+
+    assert runs == ["verify_email"]
+
+
+def test_enrich_leaves_an_email_that_has_a_check_on_it_alone():
+    contact = {**_CONTACT, "email": "pat.lee@example.org", "email_verification_result": "ok"}
+
+    runs, _ = co.plan_for("enrich", contact)
+
+    assert runs == ["find_mobile"]
+
+
+def test_enrich_has_nothing_to_do_when_nothing_is_missing():
+    contact = {**_CONTACT, "email": "pat.lee@example.org", "email_verification_result": "ok", "mobilephone": "405-555-0101"}
+
+    runs, reason = co.plan_for("enrich", contact)
+
+    assert runs == [] and reason == "Nothing is missing."
+
+
+def test_enrich_cannot_look_anyone_up_without_a_name_but_can_still_check_an_email():
+    nameless = {**_CONTACT, "firstname": "", "lastname": ""}
+
+    assert co.plan_for("enrich", nameless) == ([], "Needs a first and last name.")
+    assert co.plan_for("enrich", {**nameless, "email": "pat.lee@example.org"}) == (["verify_email"], None)
+
+
+def test_an_objective_nobody_defined_is_a_bug():
+    with pytest.raises(ValueError):
+        co.plan_for("delete_contact", dict(_CONTACT))
+
+
 # ── Find email ────────────────────────────────────────────────────────────────
 
 def test_find_email_adds_a_work_email_at_the_facility_and_records_its_check():
@@ -172,7 +244,7 @@ def test_find_email_adds_a_work_email_at_the_facility_and_records_its_check():
 def test_find_email_asks_fullenrich_about_this_person_at_this_facility():
     _, v = _run("find_email", _hs(), fe=_fe(_ON_DOMAIN))
 
-    v.fe.assert_called_once_with("Pat", "Lee", company_name="Elm Court Care Center", domain=_DOMAIN, linkedin_url="https://www.linkedin.com/in/pat-lee")
+    v.fe.assert_called_once_with("Pat", "Lee", company_name="Elm Court Care Center", domain=_DOMAIN, linkedin_url="https://www.linkedin.com/in/pat-lee-example")
 
 
 def test_find_email_falls_back_to_seamless_when_fullenrich_finds_nothing():

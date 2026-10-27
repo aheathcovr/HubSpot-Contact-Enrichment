@@ -6,6 +6,9 @@ number (those are in the note the run leaves on the HubSpot contact), and it exp
 takes one place in the rep's quota for the UTC day; the quota is a counter per rep per day, taken inside a transaction
 so two requests made at once cannot both take the last place.
 
+A title search's candidates are kept apart from the run record, with a shorter expiry, because they are the one place
+this app stores people's names: the run record itself holds ids, statuses and short messages only.
+
 Two stores keep the same contract: MemoryRunStore (tests, local use, one process) and FirestoreRunStore (the service).
 """
 
@@ -16,8 +19,11 @@ from typing import Optional
 
 RUNS_COLLECTION = "app_runs"
 QUOTA_COLLECTION = "app_quota"
+CANDIDATES_COLLECTION = "app_candidates"
 RUN_TTL = timedelta(days=30)
 QUOTA_TTL = timedelta(days=2)
+# The people a title search found (names and titles) are kept only as long as a rep needs to choose among them.
+CANDIDATES_TTL = timedelta(days=2)
 # A contact's runs read to find the latest ones. A contact has a handful in 30 days; this is a safety limit.
 _RUNS_READ = 100
 
@@ -44,6 +50,8 @@ def run_view(record: dict) -> dict:
         "requestedBy": record.get("requested_by") or f"HubSpot user {record.get('requested_by_id', '')}",
         "createdAt": _text(record["created_at"]),
         "finishedAt": _text(record.get("finished_at")),
+        "companyId": record.get("company_id") or None,
+        "batchId": record.get("batch_id") or None,
     }
 
 
@@ -67,6 +75,7 @@ class MemoryRunStore:
         self._lock = threading.RLock()
         self._runs: dict[str, dict] = {}
         self._used: dict[str, int] = {}
+        self._candidates: dict[str, dict] = {}
 
     def create_run(self, record: dict) -> None:
         with self._lock:
@@ -85,13 +94,30 @@ class MemoryRunStore:
             run.update(status="running", started_at=now)
             return True
 
-    def finish_run(self, run_id: str, now: datetime, *, status: str, outcome: str, message: str, wrote: list) -> None:
+    def finish_run(self, run_id: str, now: datetime, *, status: str, outcome: str, message: str, wrote: list, contact_id: Optional[str] = None) -> None:
+        fields = {"status": status, "outcome": outcome, "message": message, "wrote": list(wrote), "finished_at": now}
+        if contact_id:
+            fields["contact_id"] = contact_id
         with self._lock:
-            self._runs[run_id].update(status=status, outcome=outcome, message=message, wrote=list(wrote), finished_at=now)
+            self._runs[run_id].update(fields)
+
+    def save_candidates(self, run_id: str, company_id: str, candidates: list, now: datetime) -> None:
+        with self._lock:
+            self._candidates[run_id] = {"run_id": run_id, "company_id": company_id, "candidates": list(candidates), "expire_at": now + CANDIDATES_TTL}
+
+    def get_candidates(self, run_id: str) -> Optional[dict]:
+        with self._lock:
+            found = self._candidates.get(run_id)
+            return dict(found) if found else None
 
     def recent_runs(self, contact_id: str, limit: int = 5) -> list[dict]:
         with self._lock:
             rows = [dict(r) for r in self._runs.values() if r["contact_id"] == contact_id]
+        return _newest_first(rows)[:limit]
+
+    def runs_for_company(self, company_id: str, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = [dict(r) for r in self._runs.values() if r.get("company_id") == company_id]
         return _newest_first(rows)[:limit]
 
     def find_recent_run(self, contact_id: str, objective: str, since: datetime) -> Optional[dict]:
@@ -163,17 +189,32 @@ class FirestoreRunStore:
 
         return self._tx(claim)(self._db().transaction())
 
-    def finish_run(self, run_id: str, now: datetime, *, status: str, outcome: str, message: str, wrote: list) -> None:
-        self._run_ref(run_id).update({"status": status, "outcome": outcome, "message": message, "wrote": list(wrote), "finished_at": now})
+    def finish_run(self, run_id: str, now: datetime, *, status: str, outcome: str, message: str, wrote: list, contact_id: Optional[str] = None) -> None:
+        fields = {"status": status, "outcome": outcome, "message": message, "wrote": list(wrote), "finished_at": now}
+        if contact_id:
+            fields["contact_id"] = contact_id
+        self._run_ref(run_id).update(fields)
 
-    def _runs_of(self, contact_id: str) -> list[dict]:
+    def save_candidates(self, run_id: str, company_id: str, candidates: list, now: datetime) -> None:
+        self._db().collection(CANDIDATES_COLLECTION).document(run_id).set(
+            {"run_id": run_id, "company_id": company_id, "candidates": list(candidates), "expire_at": now + CANDIDATES_TTL}
+        )
+
+    def get_candidates(self, run_id: str) -> Optional[dict]:
+        snap = self._db().collection(CANDIDATES_COLLECTION).document(run_id).get()
+        return snap.to_dict() if snap.exists else None
+
+    def _runs_where(self, field: str, value: str) -> list[dict]:
         from google.cloud.firestore_v1.base_query import FieldFilter
-        query = self._db().collection(RUNS_COLLECTION).where(filter=FieldFilter("contact_id", "==", contact_id)).limit(_RUNS_READ)
+        query = self._db().collection(RUNS_COLLECTION).where(filter=FieldFilter(field, "==", value)).limit(_RUNS_READ)
         return [snap.to_dict() for snap in query.stream()]
 
     def recent_runs(self, contact_id: str, limit: int = 5) -> list[dict]:
         # Read by contact only and ordered here: ordering in the query would need a composite index to be created.
-        return _newest_first(self._runs_of(contact_id))[:limit]
+        return _newest_first(self._runs_where("contact_id", contact_id))[:limit]
+
+    def runs_for_company(self, company_id: str, limit: int = 20) -> list[dict]:
+        return _newest_first(self._runs_where("company_id", company_id))[:limit]
 
     def find_recent_run(self, contact_id: str, objective: str, since: datetime) -> Optional[dict]:
         rows = [r for r in self.recent_runs(contact_id, limit=_RUNS_READ) if r["objective"] == objective and r["created_at"] >= since and r["status"] != "failed"]

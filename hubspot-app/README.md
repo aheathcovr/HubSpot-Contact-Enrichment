@@ -3,8 +3,11 @@
 A HubSpot developer project (platform 2026.03) with two cards and one app function. **It has not been uploaded to
 HubSpot.** Nothing here runs in HubSpot until someone approves an upload.
 
-- **Enrichment** (right sidebar of company records, phase 1). A rep sees when the company was last enriched, whether
-  a run is already waiting, and the contacts linked to it, with each email's check result. One button asks for a run.
+- **Enrichment** (right sidebar of company records). A rep sees when the company was last enriched, whether a run is
+  already waiting, and the contacts linked to it, with each email's check result. One button asks for a whole-company
+  run. Build 3 adds two more things: **tick contacts and choose what to do with them** (Find email, Find mobile, Verify
+  email, or Enrich, which fills what is missing), and **find people by job title** (a preview of who FullEnrich has,
+  then add the ones chosen). The design is in `DESIGN-company-card.md`.
 - **Contact check** (right sidebar of contact records, first slice of phase 2). A rep chooses what to check for one
   contact: **Find email**, **Find mobile** or **Verify email**. The card shows what the contact has, how many runs the
   rep has left today, and the recent runs on the contact. The design is in `DESIGN-contact-card.md`.
@@ -37,6 +40,12 @@ entry per build.
   3 minutes. The service does the looking and the writing with its own HubSpot token, under the company runs' rules:
   fill blanks only, never delete, no invalid email, a mobile only if Seamless says it is one. The app itself writes
   nothing for this card.
+- **The Enrichment card's picking and title search** call the enrichment service with `hubspot.fetch`, like the
+  Contact check card (`usePicker.ts`, `useTitleSearch.ts`, `company-model.ts` and the `/app/company/...` routes in
+  `webhook_server.py`, with `company_titles.py` and `contact_objectives.py` behind them). A pick queues one run per
+  contact. A title search writes nothing to HubSpot: it keeps the people it found for two days, and only adding one
+  does a write, through the step a company run uses for a person it found. The card reads the company's contacts
+  from the app function and the runs, quota and search results from the service.
 - The function reads the company and its contacts, and writes exactly one thing: `request_to_enrich` on that one
   company. It takes no property name or value from the card. It runs on HubSpot's servers with the app's own token; no
   keys are kept in this folder.
@@ -51,12 +60,16 @@ entry per build.
 | `src/app/cards/contact-check-hsmeta.json` | The Contact check card: sidebar of contact records |
 | `src/app/cards/Enrichment.tsx`, `EnrichmentView.tsx` | The Enrichment card |
 | `src/app/cards/ContactCheck.tsx`, `ContactCheckView.tsx` | The Contact check card |
+| `src/app/cards/company-model.ts` | The Enrichment card's picking and title search: what it asks the service and how it words the answers |
+| `src/app/cards/usePicker.ts`, `PickPanel.tsx` | Ticking contacts, choosing what to do, the runs on the company |
+| `src/app/cards/useTitleSearch.ts`, `TitlePanel.tsx` | Choosing titles, the search, the people found, adding them |
 | `src/app/cards/model.ts` | What the Enrichment card sends the function, and how an answer becomes words and tags |
 | `src/app/cards/contact-model.ts` | The Contact check card: how it calls the service, reads its answers and names a run |
 | `src/app/cards/tsconfig.json` | Keep it. Without it the build compiles the card wrongly and it crashes |
 | `src/app/functions/enrichment.js` | The app function: `status` and `request`. Holds the property names and the 30 days |
 | `test/` | Tests. Not uploaded |
 | `DESIGN-contact-card.md` | The design of the Contact check card and the `/app` endpoints, with the defaults chosen |
+| `DESIGN-company-card.md` | The design of picking contacts and finding people by job title, with the defaults chosen |
 | `../State Association Contact Enrichment/test_hubspot_app_contract.py` | Fails if the app and the service disagree on the property, its values, the 30 days, or the names the contact card relies on |
 
 ## Tests
@@ -72,7 +85,9 @@ entry per build.
 
 The service's own tests for the Contact check card are `test_hubspot_request_auth.py`, `test_app_run_store.py`,
 `test_contact_objectives.py`, `test_app_endpoints.py` and `test_hubspot_contact_for_app.py` in `State Association
-Contact Enrichment/`.
+Contact Enrichment/`; for the company card's picking and title search, `test_app_company_endpoints.py`,
+`test_app_title_endpoints.py` and `test_company_titles.py` (and a few more cases in the run store, objectives and
+FullEnrich tests).
 
 The service's own suite has the contract test above: `python3 -m pytest "State Association Contact Enrichment/test_hubspot_app_contract.py"`.
 
@@ -84,7 +99,9 @@ The service's own suite has the contract test above: `python3 -m pytest "State A
 2. `cd hubspot-app && hs project upload`. A "Project lint" warning about lint packages is expected.
 3. Approve the app's permissions (Connect App) in HubSpot. Until then the cards show a 403 message.
 4. Add the Enrichment card to the sidebar of company records, and the Contact check card to the sidebar of contact
-   records, in the page editor.
+   records, in the page editor. The Enrichment card's picking and title search need the service turned on as well
+   (see "To turn it on" in the two design notes); until then the card says picking is not available and the rest of it
+   works.
 5. Check them read only on one test company and one test contact first: open the cards, check they show the right
    dates, contacts and email. Request a run only on a company or contact the owner names.
 
@@ -116,6 +133,8 @@ Edit, run the tests, then upload again. Things to keep in step:
 - Only the first 100 linked contacts are read. A larger company says so.
 - Dates are in UTC, as the service writes them.
 - BounceBan's second opinion is not shown separately: the card shows the verification result the service saved.
-- The Contact check card does not offer "still works there", a general enrich, or the company objectives yet. A run
-  that is still going after 3 minutes is left to the rep to check with Refresh.
+- Nothing offers "still works there" yet, and a title search does not check that a person found still works at the
+  company. A run that is still going after 3 minutes is left to the rep to check with Refresh.
+- A search or a run spends one of the rep's 25 places a day, and anyone who can open a company can ask. A title search
+  is only as good as FullEnrich's coverage of the titles asked for; that has not been measured for custom titles.
 - Nothing here has run against a real HubSpot portal, and nothing has been deployed for the `/app` routes.

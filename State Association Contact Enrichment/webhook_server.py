@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 import app_run_store
+import company_titles
 import contact_objectives
 import hubspot_request_auth
 from hubspot_client import HubSpotError
@@ -579,6 +580,9 @@ _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _APP_DEFAULT_DAILY_CAP = 25
 _APP_REUSE_WINDOW = timedelta(hours=24)
 _APP_RECENT_RUNS = 5
+_APP_BATCH_MAX_CONTACTS = 10
+_APP_COMPANY_RUNS = 20
+_APP_COMPANY_ADD_RUNS = 100   # runs of a company read to find the latest add or earlier search
 
 
 def _utcnow() -> datetime:
@@ -624,9 +628,9 @@ def _quota(store, who, now: datetime) -> dict:
     return {"cap": cap, "used": used, "remaining": max(0, cap - used)}
 
 
-def _hubspot_failure(exc: HubSpotError) -> tuple:
+def _hubspot_failure(exc: HubSpotError, what: str = "contact") -> tuple:
     if exc.status_code == 404:
-        return 404, {"ok": False, "error": "HubSpot has no such contact."}
+        return 404, {"ok": False, "error": f"HubSpot has no such {what}."}
     logger.warning(f"HubSpot call for the app failed: {exc}")
     return 502, {"ok": False, "error": "HubSpot could not be reached. Try again in a moment."}
 
@@ -711,11 +715,17 @@ def _execute_app_run(run_id: str) -> str:
     run = store.get_run(run_id)
     requested_by = run.get("requested_by") or f"HubSpot user {run.get('requested_by_id', '')}"
     try:
-        outcome = contact_objectives.run_objective(run["objective"], run["contact_id"], hs=_hubspot(), requested_by=requested_by)
+        if run["objective"] == company_titles.FIND_OBJECTIVE:
+            outcome = company_titles.run_find_by_title(run, hs=_hubspot(), store=store, now=_utcnow())
+        elif run["objective"] == company_titles.ADD_OBJECTIVE:
+            outcome = company_titles.run_add_candidate(run, hs=_hubspot(), store=store)
+        else:
+            outcome = contact_objectives.run_objective(run["objective"], run["contact_id"], hs=_hubspot(), requested_by=requested_by)
     except Exception:
         logger.exception(f"App run {run_id} crashed")
         outcome = contact_objectives.Outcome("failed", "error", "Something went wrong. Nothing was changed. Try again.")
-    store.finish_run(run_id, _utcnow(), status=outcome.status, outcome=outcome.outcome, message=outcome.message, wrote=outcome.wrote)
+    store.finish_run(run_id, _utcnow(), status=outcome.status, outcome=outcome.outcome, message=outcome.message, wrote=outcome.wrote,
+                     contact_id=outcome.contact_id or None)
     logger.info(f"App run {run_id} ({run['objective']}) ended {outcome.status}/{outcome.outcome}")
     return "done"
 
@@ -752,6 +762,364 @@ async def handle_app_contact_run(request: Request) -> JSONResponse:
     if not isinstance(objective, str) or objective not in {o[0] for o in contact_objectives.OBJECTIVES}:
         return _app_error("objective must be find_email, find_mobile or verify_email.", 400)
     status, result = await run_in_threadpool(_app_start, contact_id, objective, who)
+    return JSONResponse(result, status_code=status)
+
+
+# ── HubSpot app: the company card ─────────────────────────────────────────────
+#
+# Two things from the company card, both made of the same runs the contact card makes (queued, done by the worker at
+# /app/run, shown by run_view):
+#
+#   picking contacts   a rep ticks contacts and chooses an objective. Each run is one contact and one of find_email,
+#                      find_mobile, verify_email. Enrich is only a plan for which of those a contact needs, so it is
+#                      never stored.
+#   finding by title   a rep sends job titles; a search is queued (it writes nothing to HubSpot) and the card reads the
+#                      people it found; the rep chooses some and one add is queued for each (company_titles.py).
+
+_CANDIDATE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _id_of(value) -> str:
+    """An id as digits-only text, or "" for anything else (numbers are what HubSpot gives; a bool is not an id)."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return ""
+    text = str(value).strip()
+    return text if _CONTACT_ID_RE.match(text) else ""
+
+
+def _cap_refusal(store, who, now: datetime, needed: int) -> dict:
+    quota = _quota(store, who, now)
+    if quota["remaining"] == 0:
+        return {"ok": False, "error": f"You have used all {quota['cap']} runs for today.", "quota": quota}
+    return {"ok": False, "error": f"This needs {needed} runs and you have {quota['remaining']} left today.", "quota": quota}
+
+
+def _take_places(store, who, now: datetime, count: int) -> bool:
+    """One place in the rep's cap for each run, all or none: if they do not all fit, the ones taken are given back."""
+    day, cap, taken = app_run_store.day_of(now), _daily_cap(), 0
+    for _ in range(count):
+        ok, _used = store.take_place(who.user_id, day, cap, now)
+        if not ok:
+            break
+        taken += 1
+    if taken < count:
+        for _ in range(taken):
+            store.give_back_place(who.user_id, day)
+        return False
+    return True
+
+
+def _queue_run(store, who, now: datetime, record: dict) -> dict:
+    """Create the run and queue it; the run as the card shows it. A run that cannot be queued is failed and gives its place back."""
+    run_id = uuid.uuid4().hex
+    store.create_run({
+        **record, "run_id": run_id, "requested_by_id": who.user_id, "requested_by": who.email, "portal_id": who.portal_id, "created_at": now,
+    })
+    try:
+        _enqueue_app_run(run_id)
+    except Exception:
+        logger.exception(f"Could not queue app run {run_id}")
+        store.give_back_place(who.user_id, app_run_store.day_of(now))
+        store.finish_run(run_id, _utcnow(), status="failed", outcome="error", message="The run could not be queued. Try again.", wrote=[])
+    return app_run_store.run_view(store.get_run(run_id))
+
+
+def _queue_entries(store, who, now: datetime, entries: list, what: str) -> tuple:
+    """
+    Queue the runs a request planned. An entry with a "record" is a run to start (it takes a place); the others are
+    already settled (reused, skipped or failed). 202 when anything started or was reused, else why nothing did.
+    """
+    to_start = [e for e in entries if "record" in e]
+    if not _take_places(store, who, now, len(to_start)):
+        return 429, _cap_refusal(store, who, now, len(to_start))
+    batch_id = uuid.uuid4().hex
+    for entry in to_start:
+        view = _queue_run(store, who, now, {**entry["record"], "batch_id": batch_id})
+        entry["item"]["run"] = view
+        if view["status"] == "failed":
+            entry["item"].update(status="failed", reason="The run could not be queued. Try again in a moment.")
+        else:
+            entry["item"]["status"] = "started"
+
+    items = [e["item"] for e in entries]
+    started = sum(1 for i in items if i["status"] == "started")
+    quota = _quota(store, who, now)
+    if started or any(i["status"] == "reused" for i in items):
+        return 202, {"ok": True, "batchId": batch_id, "items": items, "started": started, "quota": quota}
+    if any(i["status"] == "failed" for i in items):
+        return 502, {"ok": False, "error": "Nothing could be started. Try again in a moment.", "items": items, "quota": quota}
+    return 409, {"ok": False, "error": f"Nothing to start for these {what}.", "items": items, "quota": quota}
+
+
+def _read_json_object(body: bytes):
+    """(payload, None), or (None, the 400 to send) for a body that is not a JSON object."""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, _app_error("The request body is not JSON.", 400)
+    if not isinstance(payload, dict):
+        return None, _app_error("The request body must be an object.", 400)
+    return payload, None
+
+
+# ── Picking contacts ──────────────────────────────────────────────────────────
+
+def _app_company_status(company_id: str, who) -> tuple:
+    store, now = _run_store(), _utcnow()
+    try:
+        props = _hubspot().get_company_properties(company_id)
+    except HubSpotError as exc:
+        return _hubspot_failure(exc, "company")
+    kind = contact_objectives.company_kind(props.get("hierarchy_type", ""))
+    return 200, {
+        "ok": True,
+        "company": {"id": company_id, "name": props.get("name") or "", "kind": kind},
+        "objectives": [{"id": oid, "label": label, "spends": spends} for oid, label, spends in contact_objectives.BATCH_OBJECTIVES],
+        "titlePresets": company_titles.presets_for(kind),
+        "limits": {"maxContacts": _APP_BATCH_MAX_CONTACTS, "maxTitles": company_titles.MAX_TITLES},
+        "quota": _quota(store, who, now),
+        "runs": [app_run_store.run_view(r) for r in store.runs_for_company(company_id, _APP_COMPANY_RUNS)],
+    }
+
+
+def _item(contact_id: str, objective: str, status: str, reason=None, run=None) -> dict:
+    return {"contactId": contact_id, "objective": objective, "status": status, "reason": reason, "run": run}
+
+
+def _plan_company_runs(hs, store, company_id: str, contact_ids: list, objective: str, now: datetime) -> list:
+    """
+    One entry per run a request means, in the order the rep ticked: to start (it has a record), reused, skipped or
+    failed. Nothing is created here and no place is taken.
+    """
+    entries = []
+    for contact_id in contact_ids:
+        try:
+            if company_id not in [str(c) for c in hs.get_contact_company_ids(contact_id)]:
+                entries.append({"item": _item(contact_id, objective, "skipped", "Not linked to this company.")})
+                continue
+            contact = hs.get_contact_for_app(contact_id)
+        except HubSpotError as exc:
+            logger.warning(f"HubSpot could not be read for contact {contact_id} in a company run: {exc}")
+            entries.append({"item": _item(contact_id, objective, "failed", "HubSpot could not be read for this contact. Try again in a moment.")})
+            continue
+        steps, reason = contact_objectives.plan_for(objective, contact)
+        if not steps:
+            entries.append({"item": _item(contact_id, objective, "skipped", reason)})
+            continue
+        for step in steps:
+            repeat = store.find_recent_run(contact_id, step, now - _APP_REUSE_WINDOW)
+            if repeat is not None:
+                entries.append({"item": _item(contact_id, step, "reused", None, app_run_store.run_view(repeat))})
+            else:
+                entries.append({"item": _item(contact_id, step, "pending"), "record": {"contact_id": contact_id, "objective": step, "company_id": company_id}})
+    return entries
+
+
+def _app_company_start(company_id: str, contact_ids: list, objective: str, who) -> tuple:
+    store, now = _run_store(), _utcnow()
+    entries = _plan_company_runs(_hubspot(), store, company_id, contact_ids, objective, now)
+    return _queue_entries(store, who, now, entries, "contacts")
+
+
+# ── Finding by title ──────────────────────────────────────────────────────────
+
+def _search_of(store, company_id: str, run_id: str):
+    """The title search a request names, or None when there is no such search for this company."""
+    run = store.get_run(run_id)
+    if not run or run.get("company_id") != company_id or run.get("objective") != company_titles.FIND_OBJECTIVE:
+        return None
+    return run
+
+
+def _latest_adds(store, company_id: str, run_id: str) -> dict:
+    """Candidate id to the newest add run for it from this search (runs_for_company is newest first)."""
+    latest = {}
+    for run in store.runs_for_company(company_id, _APP_COMPANY_ADD_RUNS):
+        if run.get("objective") == company_titles.ADD_OBJECTIVE and run.get("source_run_id") == run_id:
+            latest.setdefault(run.get("candidate_id"), run)
+    return latest
+
+
+def _app_find_start(company_id: str, titles: list, who) -> tuple:
+    store, now = _run_store(), _utcnow()
+    try:
+        _hubspot().get_company_properties(company_id)
+    except HubSpotError as exc:
+        return _hubspot_failure(exc, "company")
+
+    # The same search within a day is the same run: nothing more is spent, and a double click or a retry by HubSpot finds it.
+    key = company_titles.titles_key(titles)
+    since = now - _APP_REUSE_WINDOW
+    repeat = next((r for r in store.runs_for_company(company_id, _APP_COMPANY_ADD_RUNS)
+                   if r.get("objective") == company_titles.FIND_OBJECTIVE and r.get("titles_key") == key and r["created_at"] >= since and r["status"] != "failed"), None)
+    if repeat is not None:
+        return 202, {"ok": True, "reused": True, "run": app_run_store.run_view(repeat), "quota": _quota(store, who, now)}
+
+    if not _take_places(store, who, now, 1):
+        return 429, _cap_refusal(store, who, now, 1)
+    view = _queue_run(store, who, now, {"contact_id": "", "objective": company_titles.FIND_OBJECTIVE, "titles": titles, "titles_key": key, "company_id": company_id})
+    quota = _quota(store, who, now)
+    if view["status"] == "failed":
+        return 502, {"ok": False, "error": "The search could not be queued. Try again in a moment.", "quota": quota}
+    return 202, {"ok": True, "reused": False, "run": view, "quota": quota}
+
+
+_GONE = {"ok": False, "error": company_titles.SEARCH_GONE}
+
+
+def _app_candidates(company_id: str, run_id: str) -> tuple:
+    store = _run_store()
+    run = _search_of(store, company_id, run_id)
+    if run is None:
+        return 404, {"ok": False, "error": "No such search."}
+    view = app_run_store.run_view(run)
+    if run["status"] != "done":
+        return 200, {"ok": True, "ready": False, "run": view, "candidates": []}
+    kept = store.get_candidates(run_id)
+    if kept is None or kept.get("company_id") != company_id:
+        return 410, dict(_GONE)
+    adds = _latest_adds(store, company_id, run_id)
+    return 200, {
+        "ok": True, "ready": True, "run": view,
+        "candidates": [
+            {
+                "candidateId": c["candidate_id"], "name": c["full_name"], "title": c.get("title") or None, "linkedinUrl": c.get("linkedin_url") or None,
+                "updatedAt": c.get("updated_at") or None, "linkedContactId": c.get("linked_contact_id") or None,
+                "added": app_run_store.run_view(adds[c["candidate_id"]]) if c["candidate_id"] in adds else None,
+            }
+            for c in kept.get("candidates", [])
+        ],
+    }
+
+
+def _add_item(candidate_id: str, status: str, reason=None, run=None) -> dict:
+    return {"candidateId": candidate_id, "objective": company_titles.ADD_OBJECTIVE, "status": status, "reason": reason, "run": run}
+
+
+def _app_add_start(company_id: str, run_id: str, candidate_ids: list, who) -> tuple:
+    store, now = _run_store(), _utcnow()
+    run = _search_of(store, company_id, run_id)
+    if run is None:
+        return 404, {"ok": False, "error": "No such search."}
+    if run["status"] != "done":
+        return 409, {"ok": False, "error": "The search has not finished."}
+    kept = store.get_candidates(run_id)
+    if kept is None or kept.get("company_id") != company_id:
+        return 410, dict(_GONE)
+
+    known = {c["candidate_id"] for c in kept.get("candidates", [])}
+    adds = _latest_adds(store, company_id, run_id)
+    entries = []
+    for candidate_id in candidate_ids:
+        if candidate_id not in known:
+            entries.append({"item": _add_item(candidate_id, "skipped", "Not in these search results.")})
+        elif candidate_id in adds and adds[candidate_id]["status"] != "failed":
+            entries.append({"item": _add_item(candidate_id, "reused", None, app_run_store.run_view(adds[candidate_id]))})
+        else:
+            entries.append({
+                "item": _add_item(candidate_id, "pending"),
+                "record": {"contact_id": "", "objective": company_titles.ADD_OBJECTIVE, "company_id": company_id, "source_run_id": run_id, "candidate_id": candidate_id},
+            })
+    return _queue_entries(store, who, now, entries, "people")
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/app/company/status")
+async def handle_app_company_status(request: Request) -> JSONResponse:
+    """What the company card needs beyond its contact list: the company's kind, what can be asked, the rep's quota and the runs."""
+    who, _, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    company_id = request.query_params.get("companyId", "").strip()
+    if not _CONTACT_ID_RE.match(company_id):
+        return _app_error("companyId must be the company's id, digits only.", 400)
+    status, payload = await run_in_threadpool(_app_company_status, company_id, who)
+    return JSONResponse(payload, status_code=status)
+
+
+@app.post("/app/company/run")
+async def handle_app_company_run(request: Request) -> JSONResponse:
+    """Accept runs for the contacts a rep picked on a company, and queue them. Answers at once; the card then asks for status."""
+    who, body, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    payload, bad = _read_json_object(body)
+    if bad is not None:
+        return bad
+    company_id = _id_of(payload.get("companyId"))
+    if not company_id:
+        return _app_error("companyId must be the company's id, digits only.", 400)
+    raw_ids = payload.get("contactIds")
+    if not isinstance(raw_ids, list) or not raw_ids or any(not _id_of(c) for c in raw_ids):
+        return _app_error("contactIds must be a list of contact ids, digits only.", 400)
+    contact_ids = list(dict.fromkeys(_id_of(c) for c in raw_ids))
+    if len(contact_ids) > _APP_BATCH_MAX_CONTACTS:
+        return _app_error(f"Pick at most {_APP_BATCH_MAX_CONTACTS} contacts at a time.", 400)
+    objective = payload.get("objective")
+    if not isinstance(objective, str) or objective not in {o[0] for o in contact_objectives.BATCH_OBJECTIVES}:
+        return _app_error("objective must be find_email, find_mobile, verify_email or enrich.", 400)
+    status, result = await run_in_threadpool(_app_company_start, company_id, contact_ids, objective, who)
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/app/company/find")
+async def handle_app_company_find(request: Request) -> JSONResponse:
+    """Queue a search for the people holding some job titles at a company. Writes nothing to HubSpot; the card then reads the people."""
+    who, body, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    payload, bad = _read_json_object(body)
+    if bad is not None:
+        return bad
+    company_id = _id_of(payload.get("companyId"))
+    if not company_id:
+        return _app_error("companyId must be the company's id, digits only.", 400)
+    titles, problem = company_titles.clean_titles(payload.get("titles"))
+    if problem:
+        return _app_error(problem, 400)
+    status, result = await run_in_threadpool(_app_find_start, company_id, titles, who)
+    return JSONResponse(result, status_code=status)
+
+
+@app.get("/app/company/candidates")
+async def handle_app_company_candidates(request: Request) -> JSONResponse:
+    """The people a finished search found, with how adding each is going."""
+    who, _, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    company_id = request.query_params.get("companyId", "").strip()
+    run_id = request.query_params.get("runId", "").strip()
+    if not _CONTACT_ID_RE.match(company_id):
+        return _app_error("companyId must be the company's id, digits only.", 400)
+    if not _RUN_ID_RE.match(run_id):
+        return _app_error("runId must be the search's id.", 400)
+    status, payload = await run_in_threadpool(_app_candidates, company_id, run_id)
+    return JSONResponse(payload, status_code=status)
+
+
+@app.post("/app/company/add")
+async def handle_app_company_add(request: Request) -> JSONResponse:
+    """Queue an add for each person a rep chose from a search's results."""
+    who, body, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    payload, bad = _read_json_object(body)
+    if bad is not None:
+        return bad
+    company_id = _id_of(payload.get("companyId"))
+    if not company_id:
+        return _app_error("companyId must be the company's id, digits only.", 400)
+    run_id = payload.get("runId")
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        return _app_error("runId must be the search's id.", 400)
+    raw = payload.get("candidateIds")
+    if not isinstance(raw, list) or not raw or any(not isinstance(c, str) or not _CANDIDATE_ID_RE.match(c) for c in raw):
+        return _app_error("candidateIds must be a list of the people's ids from the search.", 400)
+    candidate_ids = list(dict.fromkeys(raw))
+    if len(candidate_ids) > _APP_BATCH_MAX_CONTACTS:
+        return _app_error(f"Choose at most {_APP_BATCH_MAX_CONTACTS} people at a time.", 400)
+    status, result = await run_in_threadpool(_app_add_start, company_id, run_id, candidate_ids, who)
     return JSONResponse(result, status_code=status)
 
 
