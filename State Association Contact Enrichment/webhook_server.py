@@ -33,13 +33,20 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests as _http_requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
+
+import app_run_store
+import contact_objectives
+import hubspot_request_auth
+from hubspot_client import HubSpotError
 
 
 # ── Structured JSON logging (Cloud Logging compatible) ────────────────────────
@@ -385,6 +392,45 @@ def _enqueue_enrichment(company_id: str, event_key: str = "") -> None:
     logger.info(f"Enqueued Cloud Task {response.name} for company_id={company_id}")
 
 
+def _enqueue_app_run(run_id: str) -> None:
+    """
+    Create a Cloud Tasks HTTP task that delivers POST /app/run for one HubSpot app run.
+
+    Same queue, service account and OIDC audience as _enqueue_enrichment. The task is named after the run, so a second
+    enqueue of the same run is refused (AlreadyExists) instead of becoming a second task.
+    """
+    from google.api_core import exceptions as gexc
+    from google.cloud import tasks_v2
+    from google.protobuf import duration_pb2
+
+    project  = os.getenv("GCP_PROJECT_ID", "gen-lang-client-0844868008")
+    location = os.getenv("GCP_LOCATION", "us-central1")
+    queue    = os.getenv("CLOUD_TASKS_QUEUE", "hubspot-enrichment")
+    base_url = os.getenv("CLOUD_RUN_SERVICE_URL", "").rstrip("/")
+    sa_email = os.getenv("CLOUD_TASKS_SA_EMAIL", "")
+    if not base_url:
+        raise RuntimeError("CLOUD_RUN_SERVICE_URL is required for Cloud Tasks enqueue")
+    if not sa_email:
+        raise RuntimeError("CLOUD_TASKS_SA_EMAIL is required for Cloud Tasks enqueue")
+
+    client = _get_tasks_client()
+    task = {
+        "name": client.task_path(project, location, queue, f"app-run-{run_id}"),
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": f"{base_url}/app/run",
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"run_id": run_id}).encode(),
+            "oidc_token": {"service_account_email": sa_email, "audience": base_url},
+        },
+        "dispatch_deadline": duration_pb2.Duration(seconds=_DISPATCH_DEADLINE_SECONDS),
+    }
+    try:
+        client.create_task(request={"parent": client.queue_path(project, location, queue), "task": task})
+    except gexc.AlreadyExists:
+        logger.info(f"Cloud Task for app run {run_id} already queued")
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
@@ -520,3 +566,210 @@ async def handle_enrich(request: Request) -> JSONResponse:
     logger.info(f"Running enrichment for company_id={company_id}")
     await run_in_threadpool(_run_enrichment_safe, company_id)
     return JSONResponse({"status": "done", "company_id": company_id})
+
+
+# ── HubSpot app: the contact card ─────────────────────────────────────────────
+#
+# The card calls /app/contact/status and /app/contact/run with hubspot.fetch, which HubSpot signs (see
+# hubspot_request_auth). The run itself is a Cloud Task delivered to /app/run, like /enrich, so the card's call
+# returns at once. Nothing here is reachable until HUBSPOT_APP_CLIENT_SECRET is set: the endpoints answer 503.
+
+_CONTACT_ID_RE = re.compile(r"^\d{1,20}$")
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_APP_DEFAULT_DAILY_CAP = 25
+_APP_REUSE_WINDOW = timedelta(hours=24)
+_APP_RECENT_RUNS = 5
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+_hs_client = None
+_hs_client_lock = threading.Lock()
+
+
+def _hubspot():
+    """One HubSpot client for the process, built when first needed (it reads HUBSPOT_API_KEY)."""
+    global _hs_client
+    if _hs_client is None:
+        with _hs_client_lock:
+            if _hs_client is None:
+                from hubspot_client import HubSpotClient
+
+                _hs_client = HubSpotClient()
+    return _hs_client
+
+
+def _run_store():
+    return app_run_store.get_run_store()
+
+
+def _daily_cap() -> int:
+    """Runs a rep may start per UTC day: APP_DAILY_RUN_CAP, or 25 when it is unset or not a positive number."""
+    try:
+        cap = int(os.getenv("APP_DAILY_RUN_CAP", "").strip())
+    except ValueError:
+        return _APP_DEFAULT_DAILY_CAP
+    return cap if cap > 0 else _APP_DEFAULT_DAILY_CAP
+
+
+def _app_error(message: str, status: int, **extra) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message, **extra}, status_code=status)
+
+
+def _quota(store, who, now: datetime) -> dict:
+    cap = _daily_cap()
+    used = store.used_today(who.user_id, app_run_store.day_of(now))
+    return {"cap": cap, "used": used, "remaining": max(0, cap - used)}
+
+
+def _hubspot_failure(exc: HubSpotError) -> tuple:
+    if exc.status_code == 404:
+        return 404, {"ok": False, "error": "HubSpot has no such contact."}
+    logger.warning(f"HubSpot call for the app failed: {exc}")
+    return 502, {"ok": False, "error": "HubSpot could not be reached. Try again in a moment."}
+
+
+async def _authenticate_app_request(request: Request):
+    """(identity, body, None) for a request HubSpot signed, or (None, body, the refusal to send)."""
+    body = await request.body()
+    try:
+        who = hubspot_request_auth.authenticate(
+            secret=os.getenv("HUBSPOT_APP_CLIENT_SECRET", ""),
+            method=request.method,
+            url=str(request.url),
+            body=body,
+            signature=request.headers.get("X-HubSpot-Signature-v3"),
+            timestamp=request.headers.get("X-HubSpot-Request-Timestamp"),
+            expected_portal=os.getenv("HUBSPOT_PORTAL_ID", "").strip(),
+        )
+    except hubspot_request_auth.AuthError as exc:
+        if exc.status_code != 503:
+            logger.warning(f"/app request refused ({exc.status_code}): {exc.message}")
+        return None, body, _app_error(exc.message, exc.status_code)
+    return who, body, None
+
+
+def _app_status(contact_id: str, who) -> tuple:
+    store, now = _run_store(), _utcnow()
+    try:
+        contact = _hubspot().get_contact_for_app(contact_id)
+    except HubSpotError as exc:
+        return _hubspot_failure(exc)
+    return 200, {
+        "ok": True,
+        "contact": {"id": contact_id, **contact_objectives.contact_summary(contact)},
+        "objectives": contact_objectives.objectives_for(contact),
+        "quota": _quota(store, who, now),
+        "runs": [app_run_store.run_view(r) for r in store.recent_runs(contact_id, _APP_RECENT_RUNS)],
+    }
+
+
+def _app_start(contact_id: str, objective: str, who) -> tuple:
+    store, now = _run_store(), _utcnow()
+    try:
+        contact = _hubspot().get_contact_for_app(contact_id)
+    except HubSpotError as exc:
+        return _hubspot_failure(exc)
+    shown = next(o for o in contact_objectives.objectives_for(contact) if o["id"] == objective)
+    if not shown["available"]:
+        return 409, {"ok": False, "error": shown["reason"], "reason": shown["reason"]}
+
+    # The same thing asked of the same contact within a day is the same run: nothing more is spent, and a double
+    # click or a retry by HubSpot (it retries a 5xx once) finds the first run.
+    repeat = store.find_recent_run(contact_id, objective, now - _APP_REUSE_WINDOW)
+    if repeat is not None:
+        return 202, {"ok": True, "reused": True, "run": app_run_store.run_view(repeat), "quota": _quota(store, who, now)}
+
+    day = app_run_store.day_of(now)
+    taken, _ = store.take_place(who.user_id, day, _daily_cap(), now)
+    if not taken:
+        quota = _quota(store, who, now)
+        return 429, {"ok": False, "error": f"You have used all {quota['cap']} runs for today.", "quota": quota}
+
+    run_id = uuid.uuid4().hex
+    store.create_run({
+        "run_id": run_id, "contact_id": contact_id, "objective": objective, "requested_by_id": who.user_id,
+        "requested_by": who.email, "portal_id": who.portal_id, "created_at": now,
+    })
+    try:
+        _enqueue_app_run(run_id)
+    except Exception:
+        logger.exception(f"Could not queue app run {run_id}")
+        store.give_back_place(who.user_id, day)
+        store.finish_run(run_id, _utcnow(), status="failed", outcome="error", message="The run could not be queued. Try again.", wrote=[])
+        return 502, {"ok": False, "error": "The run could not be queued. Try again in a moment."}
+    return 202, {"ok": True, "reused": False, "run": app_run_store.run_view(store.get_run(run_id)), "quota": _quota(store, who, now)}
+
+
+def _execute_app_run(run_id: str) -> str:
+    """Do one queued run. "skipped" when it is not queued (done already, running, or not there)."""
+    store = _run_store()
+    if not store.claim_run(run_id, _utcnow()):
+        return "skipped"
+    run = store.get_run(run_id)
+    requested_by = run.get("requested_by") or f"HubSpot user {run.get('requested_by_id', '')}"
+    try:
+        outcome = contact_objectives.run_objective(run["objective"], run["contact_id"], hs=_hubspot(), requested_by=requested_by)
+    except Exception:
+        logger.exception(f"App run {run_id} crashed")
+        outcome = contact_objectives.Outcome("failed", "error", "Something went wrong. Nothing was changed. Try again.")
+    store.finish_run(run_id, _utcnow(), status=outcome.status, outcome=outcome.outcome, message=outcome.message, wrote=outcome.wrote)
+    logger.info(f"App run {run_id} ({run['objective']}) ended {outcome.status}/{outcome.outcome}")
+    return "done"
+
+
+@app.get("/app/contact/status")
+async def handle_app_contact_status(request: Request) -> JSONResponse:
+    """What a contact has, which objectives are open, the rep's runs left today, and the latest runs on the contact."""
+    who, _, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    contact_id = request.query_params.get("contactId", "").strip()
+    if not _CONTACT_ID_RE.match(contact_id):
+        return _app_error("contactId must be the contact's id, digits only.", 400)
+    status, payload = await run_in_threadpool(_app_status, contact_id, who)
+    return JSONResponse(payload, status_code=status)
+
+
+@app.post("/app/contact/run")
+async def handle_app_contact_run(request: Request) -> JSONResponse:
+    """Accept a run for one contact and one objective, and queue it. Answers at once; the card then asks for status."""
+    who, body, refused = await _authenticate_app_request(request)
+    if refused is not None:
+        return refused
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _app_error("The request body is not JSON.", 400)
+    if not isinstance(payload, dict):
+        return _app_error("The request body must be an object.", 400)
+    raw_id, objective = payload.get("contactId"), payload.get("objective")
+    contact_id = str(raw_id).strip() if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) else ""
+    if not _CONTACT_ID_RE.match(contact_id):
+        return _app_error("contactId must be the contact's id, digits only.", 400)
+    if not isinstance(objective, str) or objective not in {o[0] for o in contact_objectives.OBJECTIVES}:
+        return _app_error("objective must be find_email, find_mobile or verify_email.", 400)
+    status, result = await run_in_threadpool(_app_start, contact_id, objective, who)
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/app/run")
+async def handle_app_run(request: Request) -> JSONResponse:
+    """
+    Cloud Tasks delivery for one app run. Like /enrich it answers 200 whether the run worked or not, so Cloud Tasks
+    never retries paid work, and it accepts only Cloud Tasks' own OIDC token.
+    """
+    if not _verify_cloud_tasks_oidc(request):
+        logger.warning("/app/run rejected: missing or invalid Cloud Tasks OIDC token")
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    run_id = body.get("run_id") if isinstance(body, dict) else None
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        return JSONResponse({"error": "Invalid run_id"}, status_code=400)
+    result = await run_in_threadpool(_execute_app_run, run_id)
+    return JSONResponse({"status": result, "run_id": run_id})

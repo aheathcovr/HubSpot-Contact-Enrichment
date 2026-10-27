@@ -1,0 +1,11 @@
+{
+  "uid": "contact_check_card",
+  "type": "card",
+  "config": {
+    "name": "Contact check",
+    "description": "Choose what to check for this contact: find an email, find a mobile number, or verify the email it has. Shows the recent runs on the contact and how many runs you have left today.",
+    "location": "crm.record.sidebar",
+    "entrypoint": "/app/cards/ContactCheck.tsx",
+    "objectTypes": ["contacts"]
+  }
+}

@@ -297,6 +297,23 @@ class HubSpotClient:
             "most_recent_enrichment_date": p.get("most_recent_enrichment_date") or "",
         }
 
+    _APP_CONTACT_PROPERTIES = (
+        "firstname", "lastname", "jobtitle", "email", "mobilephone", "phone", "hs_linkedin_url",
+        "email_verification_result", "email_verification_date",
+    )
+
+    def get_contact_for_app(self, contact_id: str) -> dict:
+        """
+        What the HubSpot app's contact card shows and its objectives decide from: name, title, email and how it
+        checked out, mobile and phone, LinkedIn. Every value is text; a property with no value is "".
+        """
+        data = self._get(
+            f"/crm/v3/objects/contacts/{contact_id}",
+            params={"properties": ",".join(self._APP_CONTACT_PROPERTIES)},
+        )
+        p = data.get("properties") or {}
+        return {name: str(p.get(name) or "").strip() for name in self._APP_CONTACT_PROPERTIES}
+
     def get_contact_company_ids(self, contact_id: str) -> list[str]:
         """
         Every company the contact is associated with, as text ids (not only the primary one).

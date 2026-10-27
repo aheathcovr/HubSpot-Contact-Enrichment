@@ -15,6 +15,9 @@ google-cloud-storage==2.19.0
 # google-cloud-tasks 2.16.3 caps protobuf below 5, which is where the fix for the
 # protobuf advisory lives, so it moves together with the protobuf pin below.
 google-cloud-tasks==2.23.0
+# Run records and the per-person cap for the HubSpot app (app_run_store.FirestoreRunStore). 2.27.0 is the newest
+# release that resolves with the google-auth and protobuf pins in this file.
+google-cloud-firestore==2.27.0
 google-auth==2.37.0
 pandas==2.2.3
 pyarrow==26.0.0

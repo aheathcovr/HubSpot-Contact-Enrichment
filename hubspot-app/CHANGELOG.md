@@ -6,7 +6,22 @@ own commit on `main`, so `main` is what has been approved to upload. The tests a
 
 | Build | Uploaded | Commit | Tests | New permissions |
 | --- | --- | --- | --- | --- |
-| 1 | Not uploaded | this branch | 137 JavaScript, 7 contract | First install: companies read and write, contacts read |
+| 2 | Not uploaded | this branch | 218 JavaScript, 13 contract | None (one permitted fetch URL: the service's `/app/`) |
+| 1 | Merged as #21, not uploaded | `dbe8d3b` | 137 JavaScript, 7 contract | First install: companies read and write, contacts read |
+
+## Build 2: Contact check card, first slice
+
+- The Contact check card in the sidebar of contact records: Find email, Find mobile and Verify email for one contact,
+  what the contact has, the rep's runs left today, and the recent runs on the contact with who asked.
+- The card calls the enrichment service with `hubspot.fetch`. The app gains one permitted URL, the service's `/app/`;
+  no new scopes. The design is `DESIGN-contact-card.md`.
+- The service gains `/app/contact/status`, `/app/contact/run` and `/app/run`: HubSpot's request signature and the
+  rep's identity (`hubspot_request_auth.py`), run records and a 25-a-day cap per rep in Firestore
+  (`app_run_store.py`), and the three objectives under the company runs' rules (`contact_objectives.py`). They answer
+  503 until `HUBSPOT_APP_CLIENT_SECRET` is set.
+- `setup_firestore.sh` gains TTL policies for `app_runs` and `app_quota` (dry run by default; not applied).
+- Checked: the service pieces against fakes of HubSpot, the vendors, Cloud Tasks and Firestore, and the card with
+  HubSpot's test renderer. Not checked: a real portal, real Firestore, or a deployed build.
 
 ## Build 1: Enrichment card, phase 1
 
