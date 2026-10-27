@@ -18,7 +18,7 @@ try {
   symlinkSync(here('./node_modules'), join(work, 'node_modules'), 'dir');
 
   const metas = readdirSync(cards).filter((f) => f.endsWith('-hsmeta.json'));
-  if (metas.length < 1) problems.push('Expected the card config, found none.');
+  if (metas.length < 2) problems.push(`Expected the two card configs, found ${metas.length}.`);
   for (const file of metas) {
     const meta = JSON.parse(readFileSync(join(cards, file), 'utf8'));
     const entry = meta.config.entrypoint.replace('/app/cards/', '');
@@ -29,7 +29,13 @@ try {
     await buildSingleExtension({ file: entry, outputDir: out, root: work, minify: true, logLevel: 'warn', codeCheckingPluginEnabled: true });
     const bundle = readFileSync(join(out, entry.replace(/\.tsx$/, '.js')), 'utf8');
     if (bundle.includes('React.createElement')) problems.push(`${entry}: the bundle uses React.createElement without importing React. Keep tsconfig.json ("jsx": "react-jsx") next to the cards.`);
-    if (!bundle.includes('"enrichment"')) problems.push(`${entry}: the bundle does not call the enrichment function.`);
+    // What each card must call: the company card an app function, the contact card the enrichment service.
+    const calls = {
+      'Enrichment.tsx': ['"enrichment"'],
+      'ContactCheck.tsx': ['hubspot-enrichment-kpqza7tiga-uc.a.run.app/app', '/contact/status', '/contact/run'],
+    }[entry];
+    if (!calls) problems.push(`${entry}: no check is defined for this card in bundle-check.mjs.`);
+    else for (const needle of calls) if (!bundle.includes(needle)) problems.push(`${entry}: the bundle does not call ${needle}.`);
     if (!problems.length) console.log(`Card bundle OK: ${entry} (${meta.config.location}), ${(bundle.length / 1024).toFixed(1)} KB`);
   }
 } finally {

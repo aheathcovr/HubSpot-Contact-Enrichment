@@ -19,7 +19,10 @@
 #      database here and it will hold only job records (ids and statuses), so the
 #      role is granted on the project; there is nothing else for it to reach.
 #   4. a TTL policy on fullenrich_jobs.expire_at, so finished jobs delete
-#      themselves (the service sets expire_at 30 days out).
+#      themselves (the service sets expire_at 30 days out), and the same policy on
+#      the HubSpot app's two collections: app_runs (a record per run a rep asked
+#      for, ids and statuses, 30 days) and app_quota (a counter per rep per day,
+#      2 days). Those records hold no email addresses or phone numbers.
 #
 # Not part of this script, each needing its own go-ahead: the separate finish queue,
 # min-instances, and switching the service over to the webhook path.
@@ -42,6 +45,7 @@ PROJECT_ID="${PROJECT_ID:-gen-lang-client-0844868008}"
 LOCATION="${LOCATION:-us-central1}"      # the Cloud Run region
 DATABASE="(default)"
 COLLECTION="fullenrich_jobs"
+APP_COLLECTIONS=("app_runs" "app_quota")   # the HubSpot app (hubspot-app/); same TTL field
 TTL_FIELD="expire_at"
 RUNTIME_SA="hubspot-enrichment-runtime@${PROJECT_ID}.iam.gserviceaccount.com"
 APPLY="${APPLY:-0}"
@@ -105,16 +109,18 @@ run gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
       --role="roles/datastore.user" \
       --condition=None --quiet --format=none
 
-# ── 4. Finished jobs delete themselves ────────────────────────────────────────
-echo "--- TTL on ${COLLECTION}.${TTL_FIELD}"
-if gcloud firestore fields ttls list --database="${DATABASE}" --project="${PROJECT_ID}" \
-     --format="value(name)" 2>/dev/null | grep -q "/collectionGroups/${COLLECTION}/fields/${TTL_FIELD}"; then
-  echo "    Already set."
-else
-  run gcloud firestore fields ttls update "${TTL_FIELD}" \
-        --collection-group="${COLLECTION}" --enable-ttl \
-        --database="${DATABASE}" --project="${PROJECT_ID}"
-fi
+# ── 4. Finished jobs and runs delete themselves ───────────────────────────────
+for collection in "${COLLECTION}" "${APP_COLLECTIONS[@]}"; do
+  echo "--- TTL on ${collection}.${TTL_FIELD}"
+  if gcloud firestore fields ttls list --database="${DATABASE}" --project="${PROJECT_ID}" \
+       --format="value(name)" 2>/dev/null | grep -q "/collectionGroups/${collection}/fields/${TTL_FIELD}"; then
+    echo "    Already set."
+  else
+    run gcloud firestore fields ttls update "${TTL_FIELD}" \
+          --collection-group="${collection}" --enable-ttl \
+          --database="${DATABASE}" --project="${PROJECT_ID}"
+  fi
+done
 
 # ── Read back what is now in place ────────────────────────────────────────────
 if [[ "${APPLY}" == "1" ]]; then
