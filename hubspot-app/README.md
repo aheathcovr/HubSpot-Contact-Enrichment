@@ -33,14 +33,16 @@ entry per build.
   `most_recent_enrichment_date`) come first, newest first, then the rest by last name. The email check is
   MillionVerifier's own word for the address (`ok`, `catch_all`, `unknown`, `invalid`, ...), shown as Good, Risky,
   Unknown, Invalid and so on.
-- **The Contact check card** calls the enrichment service with `hubspot.fetch`, not an app function. HubSpot signs each
-  request and adds who is asking; the service (`hubspot_request_auth.py`, `contact_objectives.py`, `app_run_store.py`
-  and the `/app` routes in `webhook_server.py`) checks the signature, takes a place in the rep's daily cap, queues a
-  Cloud Task and answers at once. The card then asks for the status every 5 seconds while a run is going, for up to
+- **The Contact check card** calls the enrichment service through the app's `service` function (`service.js`), not
+  `hubspot.fetch`: a static-auth app has no client secret, so HubSpot cannot sign a fetch. The function says who is
+  asking from HubSpot's own context, forwards only the seven requests the cards make, and signs each with a secret it
+  shares with the service; the service (`app_request_auth.py`, `contact_objectives.py`, `app_run_store.py` and the
+  `/app` routes in `webhook_server.py`) checks the signature, takes a place in the rep's daily cap, queues a Cloud
+  Task and answers at once. The card then asks for the status every 5 seconds while a run is going, for up to
   3 minutes. The service does the looking and the writing with its own HubSpot token, under the company runs' rules:
   fill blanks only, never delete, no invalid email, a mobile only if Seamless says it is one. The app itself writes
   nothing for this card.
-- **The Enrichment card's picking and title search** call the enrichment service with `hubspot.fetch`, like the
+- **The Enrichment card's picking and title search** call the enrichment service through the same function, like the
   Contact check card (`usePicker.ts`, `useTitleSearch.ts`, `company-model.ts` and the `/app/company/...` routes in
   `webhook_server.py`, with `company_titles.py` and `contact_objectives.py` behind them). A pick queues one run per
   contact. A title search writes nothing to HubSpot: it keeps the people it found for two days, and only adding one
@@ -55,11 +57,13 @@ entry per build.
 | File | What it is |
 | --- | --- |
 | `hsproject.json` | Developer project, platform 2026.03 |
-| `src/app/app-hsmeta.json` | The app: private, static auth. Scopes: companies read and write (the flag), contacts read. One permitted fetch URL: the enrichment service's `/app/` |
+| `src/app/app-hsmeta.json` | The app: private, static auth. Scopes: companies read and write (the flag), contacts read. No permitted fetch URLs: the cards reach the service through the service function |
 | `src/app/cards/enrichment-hsmeta.json` | The Enrichment card: sidebar of company records |
 | `src/app/cards/contact-check-hsmeta.json` | The Contact check card: sidebar of contact records |
 | `src/app/cards/Enrichment.tsx`, `EnrichmentView.tsx` | The Enrichment card |
 | `src/app/cards/ContactCheck.tsx`, `ContactCheckView.tsx` | The Contact check card |
+| `src/app/functions/service.js`, `service-hsmeta.json` | The service function: carries the cards' requests to the enrichment service, says who is asking from HubSpot's context and signs them with `APP_REQUEST_SECRET`. Holds the service's address and the seven requests it forwards |
+| `../setup_app_secret.sh` | Makes `APP_REQUEST_SECRET` (dry run by default): Secret Manager for the service, your clipboard for `hs secret add`. Never prints the value |
 | `src/app/cards/company-model.ts` | The Enrichment card's picking and title search: what it asks the service and how it words the answers |
 | `src/app/cards/usePicker.ts`, `PickPanel.tsx` | Ticking contacts, choosing what to do, the runs on the company |
 | `src/app/cards/useTitleSearch.ts`, `TitlePanel.tsx` | Choosing titles, the search, the people found, adding them |
@@ -77,15 +81,16 @@ entry per build.
 `cd hubspot-app/test && npm install && npm run check` runs:
 
 - a type check of the card against HubSpot's component types,
-- the function against an in-memory HubSpot (every endpoint it calls; reads, the one write, paging, and HubSpot's
-  refusals), both cards' logic, the app's permissions and permitted URL, and both cards rendered with HubSpot's test
+- the enrichment function against an in-memory HubSpot (every endpoint it calls; reads, the one write, paging, and
+  HubSpot's refusals), the service function (which requests go through, who is asking, the signature, the sender),
+  both cards' logic, the app's permissions and functions, and both cards rendered with HubSpot's test
   renderer and a fake function or fake service (loading, requesting, waiting and checking again, giving up, refusals,
   errors, contacts, the daily cap),
 - a build of each card with HubSpot's own card build, checking the bundle.
 
-The service's own tests for the Contact check card are `test_hubspot_request_auth.py`, `test_app_run_store.py`,
-`test_contact_objectives.py`, `test_app_endpoints.py` and `test_hubspot_contact_for_app.py` in `State Association
-Contact Enrichment/`; for the company card's picking and title search, `test_app_company_endpoints.py`,
+The service's own tests for the Contact check card are `test_app_request_auth.py`, `test_app_run_store.py`,
+`test_contact_objectives.py`, `test_app_endpoints.py`, `test_hubspot_contact_for_app.py` and `test_setup_app_secret.py`
+in `State Association Contact Enrichment/`; for the company card's picking and title search, `test_app_company_endpoints.py`,
 `test_app_title_endpoints.py` and `test_company_titles.py` (and a few more cases in the run store, objectives and
 FullEnrich tests).
 
@@ -96,7 +101,9 @@ The service's own suite has the contract test above: `python3 -m pytest "State A
 **Do not upload without the owner's approval.** When it is approved:
 
 1. Run the checks above.
-2. `cd hubspot-app && hs project upload`. A "Project lint" warning about lint packages is expected.
+2. Add the function's secret first, in each account (`../setup_app_secret.sh` copies it for you; see
+   `DESIGN-contact-card.md`), then upload from a path with no hidden folder in it (the CLI skips `.claude/`): `hs
+   project upload --account <id>`. A "Project lint" warning about lint packages is expected.
 3. Approve the app's permissions (Connect App) in HubSpot. Until then the cards show a 403 message.
 4. Add the Enrichment card to the sidebar of company records, and the Contact check card to the sidebar of contact
    records, in the page editor. The Enrichment card's picking and title search need the service turned on as well
@@ -106,10 +113,10 @@ The service's own suite has the contract test above: `python3 -m pytest "State A
    dates, contacts and email. Request a run only on a company or contact the owner names.
 
 For the Contact check card to work, the service must be turned on for it (see "To turn it on" in
-`DESIGN-contact-card.md`): a deployed build that has the `/app` routes, the app's client secret as
-`HUBSPOT_APP_CLIENT_SECRET`, and the two Firestore TTL policies. Until the secret is set the `/app` routes answer 503
-and the card says the service is not set up. It is not yet confirmed that a private app with static auth can send
-signed requests; that needs a check in the portal.
+`DESIGN-contact-card.md`): a deployed build that has the `/app` routes, the shared secret as `APP_REQUEST_SECRET` (in
+Secret Manager and as the function's HubSpot secret), and the Firestore TTL policies. Until the secret is set the `/app`
+routes answer 503 and the card says the service is not set up. Not yet confirmed in a real portal: that the service
+function can call out to the service and be accepted. That is only proven after a deploy.
 
 ## Change it
 
@@ -119,12 +126,14 @@ Edit, run the tests, then upload again. Things to keep in step:
   `REFRESH_DAYS` in `enrichment.js` (the contract test says when).
 - A new email check word from the verifier: `CHECKS` in `model.ts`.
 - A new permission: `app-hsmeta.json` and the permissions test in `test/config.test.ts`.
+- A request the cards make, added or removed: `ROUTES` in `service.js` and the service's `/app` routes (the contract test
+  says when). The service's address: `SERVICE_BASE` in `service.js`.
 
 ## Limits
 
 - Anyone who can open a company, view-only seats included, can ask for a run. A run spends vendor credits. The
   function acts with the app's access, not the user's, and does not record who asked. (The Contact check card is
-  different: the service knows who asked from HubSpot's signed request, caps each rep at 25 runs a day and names the
+  different: the service function passes on who asked from HubSpot's own context and signs it, the service caps each rep at 25 runs a day and names the
   rep on the run and on the contact's note.)
 - Two reps pressing the button in the same second can both pass the check. HubSpot only calls the webhook when the
   property changes, so the second press does not start a second run.

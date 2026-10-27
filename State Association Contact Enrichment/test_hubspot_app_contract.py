@@ -108,6 +108,14 @@ def _source(name):
         return f.read()
 
 
+def _json(name):
+    """One of the app function's config files (hubspot-app/src/app/functions/)."""
+    import json
+
+    with open(os.path.join(_HERE, "..", "hubspot-app", "src", "app", "functions", name), encoding="utf-8") as f:
+        return json.load(f)
+
+
 def test_the_contact_card_offers_the_objectives_the_service_runs():
     import contact_objectives
 
@@ -131,7 +139,7 @@ def test_the_contact_card_calls_routes_the_service_has():
 
     assert ("GET", "/app/contact/status") in routes and ("POST", "/app/contact/run") in routes
     assert "'GET', `/contact/status?contactId=" in view and "'POST', '/contact/run'" in view
-    assert re.search(r"SERVICE_URL = '[^']+/app';", _card_source("contact-model.ts"))
+    assert re.search(r"SERVICE_FUNCTION = '([^']+)';", _card_source("contact-model.ts")).group(1) == _json("service-hsmeta.json")["uid"]
 
 
 def test_the_contact_card_reads_the_run_fields_the_service_sends():
@@ -180,7 +188,7 @@ def _fakes(monkeypatch):
     from unittest.mock import MagicMock
 
     import app_run_store
-    import hubspot_request_auth
+    import app_request_auth
 
     hs = MagicMock()
     hs.get_company_properties.return_value = {"name": "Elm Court Care Center", "hierarchy_type": "Individual Facility / Child"}
@@ -191,7 +199,7 @@ def _fakes(monkeypatch):
     monkeypatch.setattr(webhook_server, "_run_store", lambda: store)
     monkeypatch.setattr(webhook_server, "_enqueue_app_run", lambda run_id: None)
     monkeypatch.setattr(webhook_server, "_utcnow", lambda: datetime(2026, 10, 26, 16, tzinfo=timezone.utc))
-    return hubspot_request_auth.Identity(user_id="77", email="rep@example.org", portal_id="1", app_id="2")
+    return app_request_auth.Identity(user_id="77", email="rep@example.org", portal_id="1", app_id="2")
 
 
 def test_the_company_card_offers_the_objectives_the_service_plans():
@@ -343,3 +351,121 @@ def test_the_company_card_knows_the_statuses_and_outcomes_the_title_search_repor
 
     assert statuses <= set(re.findall(r"'([^']+)'", declared))
     assert outcomes <= cases, f"the card does not name these outcomes: {sorted(outcomes - cases)}"
+
+
+# ── The cards reach the service through the service function ──────────────────
+#
+# A static-auth app has no client secret, so HubSpot signs nothing and a card cannot call the service itself. The cards
+# call hubspot-app/src/app/functions/service.js, which says who is asking from HubSpot's context and signs the request
+# with a secret it shares with the service. These tests tie the function to the service: the routes it forwards, the
+# headers and secret it signs with, and (with Node, when it is installed) that a request the real function builds is
+# accepted by the real check and cannot be altered.
+
+_SERVICE_JS = os.path.join(_HERE, "..", "hubspot-app", "src", "app", "functions", "service.js")
+
+
+def _service_js():
+    with open(_SERVICE_JS, encoding="utf-8") as f:
+        return f.read()
+
+
+def _function_routes():
+    return [(m, p, [k for k in re.findall(r"'([^']+)'", q)]) for m, p, q in
+            re.findall(r"\{ method: '(\w+)', path: '([^']+)', query: \[([^\]]*)\] \}", _service_js())]
+
+
+def test_the_service_function_forwards_exactly_the_routes_the_service_serves_to_the_app():
+    forwarded = {(m, "/app" + p) for m, p, _ in _function_routes()}
+    served = {(m, r.path) for r in webhook_server.app.routes if hasattr(r, "methods") and r.path.startswith("/app/") for m in r.methods}
+
+    assert re.search(r"APP_PREFIX = '(/app)';", _service_js())
+    # /app/run is the Cloud Tasks delivery of a queued run: it takes the queue's token, not a rep's request, and is not forwarded.
+    assert forwarded == served - {("POST", "/app/run")}
+
+
+def test_the_service_function_passes_the_query_keys_the_service_reads_and_none_that_say_who_is_asking():
+    keys = {k for _, _, ks in _function_routes() for k in ks}
+    read = set(re.findall(r'request\.query_params\.get\("(\w+)"', _source("webhook_server.py")))
+    who = {"userId", "userEmail", "portalId", "appId"}
+
+    assert keys == read - who and not keys & who
+
+
+def test_the_cards_call_exactly_the_paths_the_service_function_forwards():
+    sources = "".join(_card_source(n) for n in ("ContactCheckView.tsx", "usePicker.ts", "useTitleSearch.ts", "company-model.ts"))
+    called = set(re.findall(r"/(?:contact|company)/(?:status|run|find|candidates|add)\b", sources))
+
+    assert called == {p for _, p, _ in _function_routes()}
+
+
+def test_the_service_function_signs_with_the_headers_and_secret_the_service_reads():
+    import app_request_auth
+
+    js = _service_js()
+    assert re.search(r"SIGNATURE_HEADER = '([^']+)';", js).group(1) == app_request_auth.SIGNATURE_HEADER
+    assert re.search(r"TIMESTAMP_HEADER = '([^']+)';", js).group(1) == app_request_auth.TIMESTAMP_HEADER
+    secret = _json("service-hsmeta.json")["config"]["secretKeys"]
+    assert secret == ["APP_REQUEST_SECRET"] and f'os.getenv("{secret[0]}"' in _source("webhook_server.py")
+    assert "process.env.APP_REQUEST_SECRET" in js
+
+
+def test_the_service_function_calls_the_service_over_https_without_a_trailing_slash():
+    base = re.search(r"SERVICE_BASE = '([^']+)';", _service_js()).group(1)
+
+    assert base.startswith("https://") and not base.endswith("/") and "?" not in base
+
+
+def _real_call(request_js, who_js='{ userId: "77", email: "o\'neil+rep@example.org", portalId: "1234" }'):
+    """What the real function builds for a request, run by Node: {method, url, body, headers}."""
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is not installed, so the real function cannot be run here")
+    script = f"const fn = require({json.dumps(os.path.abspath(_SERVICE_JS))}); " \
+             f"const call = fn._internals.buildCall({who_js}, {request_js}, 'test-app-secret', 1700000000000); " \
+             "process.stdout.write(JSON.stringify(call));"
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(out.stdout)
+
+
+def _check(call, *, secret="test-app-secret"):
+    import app_request_auth as auth
+
+    return auth.authenticate(
+        secret=secret, method=call["method"], url=call["url"], body=call["body"].encode("utf-8"),
+        signature=call["headers"][auth.SIGNATURE_HEADER], timestamp=call["headers"][auth.TIMESTAMP_HEADER], now_ms=1700000000000,
+    )
+
+
+_POST = "{ ok: true, method: 'POST', path: '/contact/run', query: [], body: { contactId: '42', objective: 'find_email' } }"
+_GET = "{ ok: true, method: 'GET', path: '/company/candidates', query: [['companyId', '500'], ['runId', 'f'.repeat(32)]], body: undefined }"
+
+
+def test_a_request_the_real_function_builds_is_accepted_by_the_real_check_and_says_who_asked():
+    for request in (_POST, _GET):
+        who = _check(_real_call(request))
+
+        assert (who.user_id, who.email, who.portal_id) == ("77", "o'neil+rep@example.org", "1234")
+
+
+def test_a_request_the_real_function_builds_is_refused_once_who_asked_or_what_was_asked_is_changed():
+    import app_request_auth as auth
+    import pytest
+
+    call = _real_call(_POST)
+    for altered in (
+        {**call, "url": call["url"].replace("userId=77", "userId=1")},
+        {**call, "url": call["url"].replace("/contact/run", "/company/run")},
+        {**call, "body": call["body"].replace("find_email", "verify_email")},
+        {**call, "method": "GET"},
+    ):
+        with pytest.raises(auth.AuthError) as refused:
+            _check(altered)
+        assert refused.value.status_code == 401
+    with pytest.raises(auth.AuthError):
+        _check(call, secret="another-secret")

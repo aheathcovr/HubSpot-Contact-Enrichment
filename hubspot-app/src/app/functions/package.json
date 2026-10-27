@@ -2,6 +2,6 @@
   "name": "covr-enrichment-function",
   "version": "1.0.0",
   "private": true,
-  "description": "Reads a company's enrichment status and sets Request to enrich for the Enrichment card. No dependencies: it calls the HubSpot API with Node's https module.",
+  "description": "The app's functions: one reads a company's enrichment status and sets Request to enrich for the Enrichment card, the other carries the cards' requests to the enrichment service. No dependencies: they use Node's https and crypto modules.",
   "dependencies": {}
 }

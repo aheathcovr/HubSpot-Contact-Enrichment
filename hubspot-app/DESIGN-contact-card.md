@@ -1,7 +1,8 @@
 # Contact card, first slice: design
 
-Status: built test-first on branch `feat/contact-card-first-slice`. **Not uploaded to HubSpot and not deployed.** The
-service endpoints answer 503 until the app's client secret is configured (see "To turn it on").
+Status: built test-first and merged. **Not uploaded to HubSpot and not deployed.** The service endpoints answer 503
+until the shared secret `APP_REQUEST_SECRET` is configured (see "To turn it on"). Since Build 4 the card reaches the
+service through the app's service function, not `hubspot.fetch` (see "Authentication and identity").
 
 ## What this slice does
 
@@ -50,9 +51,10 @@ The card also shows what the contact has, how many runs the rep has left today, 
 ## Flow
 
 ```
-card -- hubspot.fetch (signed) --> GET  /app/contact/status?contactId=...   what the contact has, quota, recent runs
-card -- hubspot.fetch (signed) --> POST /app/contact/run                    accepts a run, queues a Cloud Task
-Cloud Tasks (Google-signed) ------> POST /app/run                           does the work, updates the run record
+card -- hubspot.serverless --> service function (adds who is asking from HubSpot's context, signs)
+         service function -- https --> GET  /app/contact/status?contactId=...   what the contact has, quota, recent runs
+         service function -- https --> POST /app/contact/run                    accepts a run, queues a Cloud Task
+Cloud Tasks (Google-signed) ---------> POST /app/run                           does the work, updates the run record
 card polls /app/contact/status every 5 s while a run is queued or running
 ```
 
@@ -85,17 +87,39 @@ whether it worked or not, so Cloud Tasks never retries paid work.
 
 ## Authentication and identity
 
-HubSpot signs every `hubspot.fetch` request (`X-HubSpot-Signature-v3`, HMAC-SHA256 of method + URI + body + timestamp
-with the app's client secret, base64) and adds `userId`, `userEmail`, `portalId` and `appId` to the query string. The
-signature covers the URI, so those values cannot be forged. The service:
+**Why not `hubspot.fetch`.** HubSpot signs a card's fetch with the app's client secret. A static-auth app has none (its
+page in HubSpot has no Auth tab; found 2026-10-26, and HubSpot's function reference says OAuth apps cannot use the
+2026.03 functions this app needs), so a fetch would reach the service unsigned and the service could not tell who asked.
 
-1. Fails closed (503) when `HUBSPOT_APP_CLIENT_SECRET` is not set.
-2. Rejects (401) a missing, stale (over 5 minutes) or wrong signature. The URI is compared with the characters HubSpot
-   lists decoded (`%40` as `@` and so on), which the webhook's check does not need.
+**What it does instead.** The card calls the app's `service` function (`functions/service.js`) with `{ method, path, body }`.
+HubSpot puts the user and the portal in the function's context on its own server, and card parameters cannot override
+them (HubSpot's docs say to authorize on `portalId` and `user.userId`, as the service does, because the email can be
+missing). The function:
+
+1. Forwards only the seven requests the cards make (`ROUTES`), with only the query keys each takes. Anything else, and
+   any query key that says who is asking, is refused. It is not a way to reach the rest of the service.
+2. Adds `userId`, `userEmail` (when HubSpot gives one) and `portalId` to the query from HubSpot's context.
+3. Signs method + address + body + timestamp with the shared secret `APP_REQUEST_SECRET`, using HubSpot's v3 scheme
+   (base64 HMAC-SHA256; the characters HubSpot lists decoded before signing), and sends it in `X-Covr-App-Signature` and
+   `X-Covr-App-Timestamp`.
+4. Returns the service's answer as `{ status, json }`, or its own refusal in the same shape (503 not set up, 401 HubSpot
+   did not say who is asking, 400 not a request the app makes, 504 or 502 the service did not answer). It never
+   returns, logs or sends the secret.
+
+The service (`app_request_auth.py`, used by `webhook_server.py`):
+
+1. Fails closed (503) when `APP_REQUEST_SECRET` is not set.
+2. Rejects (401) a missing, stale (over 5 minutes) or wrong signature. The address checked is the one the caller used,
+   built from the Host header and the scheme Cloud Run's front end reports, so it needs no setting.
 3. Rejects (403) a request for another portal when `HUBSPOT_PORTAL_ID` is set.
 4. Takes the rep's identity from the signed query, never from the body.
 
-`/app/run` is not signed by HubSpot; like `/enrich` it accepts only Google-signed Cloud Tasks requests.
+The scheme is HubSpot's own, so its published example checks both implementations, and four golden signatures made by
+the service's code are pinned in the function's tests too (see "Tests"). A leaked secret would let someone act as any
+user, so it lives in two places only: Secret Manager and the function's HubSpot secret. `setup_app_secret.sh` makes it
+without ever printing it.
+
+`/app/run` is not signed by the function; like `/enrich` it accepts only Google-signed Cloud Tasks requests.
 
 ## Run records and the cap
 
@@ -115,17 +139,25 @@ both take the last place. `setup_firestore.sh` gains the two TTL policies (dry r
 
 ## To turn it on (needs the owner; nothing here has been done)
 
-1. Find out whether the private app can send signed requests, and get its client secret. If it cannot, the fallback is
-   to route the call through the app function with a shared secret.
-2. Create the secret `HUBSPOT_APP_CLIENT_SECRET` (the owner pastes it), let the runtime account read it, add it to
-   `cloudbuild.yaml` (`--set-secrets`) and `setup_runtime_service_account.sh`. Until then the endpoints answer 503.
-3. Apply `setup_firestore.sh` for the two TTL policies.
+1. Make the shared secret: `./setup_app_secret.sh` is a dry run; with `APPLY=1` it creates
+   the secret in Secret Manager, lets the service's runtime account read it, and copies the value to your clipboard for
+   `hs secret add APP_REQUEST_SECRET --account <id>` (a hidden prompt; paste, then press Enter to clear the clipboard).
+   Repeat the paste for each HubSpot account the app goes to (`COPY_EXISTING=1`). Never replaced if it exists.
+2. Add `--set-secrets=APP_REQUEST_SECRET=APP_REQUEST_SECRET:latest` to `cloudbuild.yaml`, only once the secret exists
+   (a deploy cannot start without it). Until then the endpoints answer 503.
+3. Apply `setup_firestore.sh` for the TTL policies.
 4. Deploy a build from main and move traffic to it. The new endpoints exist only in a build that has this code.
-5. Upload the app (approval required), add the card to contact records, check it read only on one test contact.
+5. Upload the app, after `hs secret add`, with approval; add the card to contact records, and check it read only on one
+   test contact.
 
 ## Tests
 
-- Service: `test_hubspot_request_auth.py`, `test_app_run_store.py`, `test_contact_objectives.py`,
-  `test_app_endpoints.py`, `test_hubspot_contact_for_app.py`, and the contact-card parts of `test_hubspot_app_contract.py`. Vendors, HubSpot and Cloud Tasks are faked; Firestore has an in-memory twin with the same
-  contract.
-- App: the card against a fake service client, the model, and the config (the one permitted URL).
+- Service: `test_app_request_auth.py`, `test_app_run_store.py`, `test_contact_objectives.py`,
+  `test_app_endpoints.py`, `test_hubspot_contact_for_app.py`, `test_setup_app_secret.py` (the secret script, against
+  fake `gcloud` and clipboard commands), and the contact-card and service-function parts of
+  `test_hubspot_app_contract.py`. Vendors, HubSpot and Cloud Tasks are faked; Firestore has an in-memory twin with the
+  same contract. The contract tests also run the real function in Node and check that the service accepts what it
+  builds and refuses it once who asked or what was asked is changed.
+- App: the card against a fake service, the model, the service function (`service-function.test.ts`: which requests
+  go through, who is asking, the signature, and the sender against a local server), and the config (no permitted URLs;
+  the function and the secret it names).

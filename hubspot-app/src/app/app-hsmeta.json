@@ -3,7 +3,7 @@
   "type": "app",
   "config": {
     "name": "Covr Enrichment",
-    "description": "Adds the Enrichment card to company records and the Contact check card to contact records. The Enrichment card asks for an enrichment run on a company and shows when it was last enriched and its contacts. The Contact check card lets a rep find an email, find a mobile number or verify an email for one contact. The work happens in Covr's enrichment service, which HubSpot signs each request to.",
+    "description": "Adds the Enrichment card to company records and the Contact check card to contact records. The Enrichment card asks for an enrichment run on a company and shows when it was last enriched and its contacts. The Contact check card lets a rep find an email, find a mobile number or verify an email for one contact. The work happens in Covr's enrichment service, which the app reaches through its own function.",
     "distribution": "private",
     "auth": {
       "type": "static",
@@ -17,9 +17,7 @@
       "conditionallyRequiredScopes": []
     },
     "permittedUrls": {
-      "fetch": [
-        "https://hubspot-enrichment-kpqza7tiga-uc.a.run.app/app/"
-      ],
+      "fetch": [],
       "iframe": [],
       "img": []
     }

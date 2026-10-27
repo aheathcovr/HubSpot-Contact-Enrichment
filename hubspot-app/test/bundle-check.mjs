@@ -29,11 +29,13 @@ try {
     await buildSingleExtension({ file: entry, outputDir: out, root: work, minify: true, logLevel: 'warn', codeCheckingPluginEnabled: true });
     const bundle = readFileSync(join(out, entry.replace(/\.tsx$/, '.js')), 'utf8');
     if (bundle.includes('React.createElement')) problems.push(`${entry}: the bundle uses React.createElement without importing React. Keep tsconfig.json ("jsx": "react-jsx") next to the cards.`);
-    // What each card must call: the company card an app function, the contact card the enrichment service.
+    // What each card must call: the enrichment function for the company's own status, and the service function for
+    // everything that reaches the enrichment service. The service's address is not in a card: only the function knows it.
     const calls = {
-      'Enrichment.tsx': ['"enrichment"', 'hubspot-enrichment-kpqza7tiga-uc.a.run.app/app', '/company/status', '/company/run', '/company/find', '/company/add', '/company/candidates'],
-      'ContactCheck.tsx': ['hubspot-enrichment-kpqza7tiga-uc.a.run.app/app', '/contact/status', '/contact/run'],
+      'Enrichment.tsx': ['"enrichment"', '"service"', '/company/status', '/company/run', '/company/find', '/company/add', '/company/candidates'],
+      'ContactCheck.tsx': ['"service"', '/contact/status', '/contact/run'],
     }[entry];
+    for (const needle of ['run.app', 'hubspot.fetch']) if (bundle.includes(needle)) problems.push(`${entry}: the bundle mentions ${needle}; the cards reach the service through the service function.`);
     if (!calls) problems.push(`${entry}: no check is defined for this card in bundle-check.mjs.`);
     else for (const needle of calls) if (!bundle.includes(needle)) problems.push(`${entry}: the bundle does not call ${needle}.`);
     if (!problems.length) console.log(`Card bundle OK: ${entry} (${meta.config.location}), ${(bundle.length / 1024).toFixed(1)} KB`);

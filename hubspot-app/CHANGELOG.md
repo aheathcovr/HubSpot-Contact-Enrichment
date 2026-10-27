@@ -6,9 +6,29 @@ own commit on `main`, so `main` is what has been approved to upload. The tests a
 
 | Build | Uploaded | Commit | Tests | New permissions |
 | --- | --- | --- | --- | --- |
-| 3 | Not uploaded | this branch | 323 JavaScript, 27 contract | None (the same permitted fetch URL) |
+| 4 | Not uploaded | this branch | 422 JavaScript, 34 contract | None. Removes the permitted fetch URL; adds a function secret, `APP_REQUEST_SECRET` |
+| 3 | Merged as #23, not uploaded | `c518009` | 323 JavaScript, 27 contract | None (the same permitted fetch URL) |
 | 2 | Test account only (HubSpot build #2; build #1 failed to package) | `363af0b` | 218 JavaScript, 13 contract | None (one permitted fetch URL: the service's `/app/`) |
 | 1 | Merged as #21, not uploaded | `dbe8d3b` | 137 JavaScript, 7 contract | First install: companies read and write, contacts read |
+
+## Build 4: the cards reach the service through an app function
+
+- A static-auth app has no client secret (its page has no Auth tab), so HubSpot cannot sign a card's `hubspot.fetch` and
+  Builds 2 and 3, which called the service that way, could not have worked. The cards now call a new app function,
+  `service`, which says who is asking from HubSpot's own context (the user and the portal, set by HubSpot and not
+  overridable by a card), forwards only the seven requests the cards make, and signs each with a secret it shares with
+  the service. The cards' views and logic did not change, only the transport.
+- The service checks that signature (HubSpot's v3 scheme, so its published example checks both ends) in
+  `app_request_auth.py` (renamed from `hubspot_request_auth.py`), with `X-Covr-App-Signature` and
+  `X-Covr-App-Timestamp`. The secret is `APP_REQUEST_SECRET` (was `HUBSPOT_APP_CLIENT_SECRET`, which cannot exist). The
+  address it checks is the one the caller used, so no setting is needed.
+- `setup_app_secret.sh` (dry run by default, not run) makes the secret: Secret Manager for the service, your clipboard
+  for HubSpot's hidden `hs secret add` prompt. It never prints the value or replaces an existing secret.
+- The app no longer asks for any permitted fetch URL.
+- Checked: the function against fakes and a local server, the signature against HubSpot's published example and four
+  values the service's code made, and the real function run in Node against the real check (accepted when untouched,
+  refused once who asked or what was asked is changed). Not checked: the function calling the service from a real
+  HubSpot portal, which needs a deploy, the secret and an upload.
 
 ## Build 3: Company card, pick contacts and find by job title
 

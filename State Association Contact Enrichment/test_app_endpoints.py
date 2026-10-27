@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import app_run_store
 import contact_objectives
-import hubspot_request_auth as auth
+import app_request_auth as auth
 import webhook_server
 from hubspot_client import HubSpotError
 
@@ -40,7 +40,7 @@ _CONTACT = {
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("HUBSPOT_WEBHOOK_SECRET", "unused-by-these-tests")   # the server will not start without it
-    monkeypatch.setenv("HUBSPOT_APP_CLIENT_SECRET", _SECRET)
+    monkeypatch.setenv("APP_REQUEST_SECRET", _SECRET)
     monkeypatch.delenv("HUBSPOT_PORTAL_ID", raising=False)
     monkeypatch.delenv("APP_DAILY_RUN_CAP", raising=False)
     webhook_server._tasks_client = None
@@ -79,8 +79,8 @@ def _clock(monkeypatch):
 def _headers(method, url, body=b"", secret=_SECRET, ts=None):
     timestamp = str(int(time.time() * 1000)) if ts is None else str(ts)
     return {
-        "X-HubSpot-Signature-v3": auth.compute_signature_v3(secret, method, url, body, timestamp),
-        "X-HubSpot-Request-Timestamp": timestamp,
+        auth.SIGNATURE_HEADER: auth.compute_signature_v3(secret, method, url, body, timestamp),
+        auth.TIMESTAMP_HEADER: timestamp,
         "Content-Type": "application/json",
     }
 
@@ -120,6 +120,52 @@ def test_a_request_signed_with_the_wrong_secret_is_refused(client, store, hs, qu
     assert response.status_code == 401 and queued == []
 
 
+def test_a_request_signed_the_way_hubspot_signs_is_not_accepted(client, store, hs, queued):
+    path = f"/app/contact/status?contactId=42&{_USER}"
+    stamp = str(int(time.time() * 1000))
+    headers = {
+        "X-HubSpot-Signature-v3": auth.compute_signature_v3(_SECRET, "GET", "http://testserver" + path, b"", stamp),
+        "X-HubSpot-Request-Timestamp": stamp,
+    }
+
+    response = client.get(path, headers=headers)
+
+    assert response.status_code == 401 and response.json()["error"] == "Missing signature."
+
+
+def test_the_address_checked_is_the_one_the_caller_used_as_the_front_end_reports_it(client, store, hs):
+    path = f"/app/contact/status?contactId=42&{_USER}"
+    arriving = {"Host": "svc.example.run.app", "X-Forwarded-Proto": "https"}
+
+    signed_for_the_address_used = client.get(path, headers={**_headers("GET", "https://svc.example.run.app" + path), **arriving})
+    signed_for_the_test_server = client.get(path, headers={**_headers("GET", "http://testserver" + path), **arriving})
+    signed_for_another_host = client.get(path, headers={**_headers("GET", "https://other.example.run.app" + path), **arriving})
+
+    assert signed_for_the_address_used.status_code == 200
+    assert signed_for_the_test_server.status_code == 401
+    assert signed_for_another_host.status_code == 401
+
+
+def test_the_first_of_several_forwarded_schemes_is_the_one_used(client, store, hs):
+    path = f"/app/contact/status?contactId=42&{_USER}"
+    arriving = {"Host": "svc.example.run.app", "X-Forwarded-Proto": "https, http"}
+
+    assert client.get(path, headers={**_headers("GET", "https://svc.example.run.app" + path), **arriving}).status_code == 200
+
+
+def test_the_forwarded_scheme_is_read_in_any_case(client, store, hs):
+    path = f"/app/contact/status?contactId=42&{_USER}"
+    arriving = {"Host": "svc.example.run.app", "X-Forwarded-Proto": "HTTPS"}
+
+    assert client.get(path, headers={**_headers("GET", "https://svc.example.run.app" + path), **arriving}).status_code == 200
+
+
+def test_without_a_forwarded_scheme_the_address_is_taken_as_received(client, store, hs):
+    path = f"/app/contact/status?contactId=42&{_USER}"
+
+    assert client.get(path, headers=_headers("GET", "http://testserver" + path)).status_code == 200
+
+
 def test_a_stale_signature_is_refused(client, store, hs):
     response = _get_status(client, ts=int(time.time() * 1000) - 10 * 60 * 1000)
 
@@ -137,8 +183,8 @@ def test_changing_who_asked_after_signing_is_refused(client, store, hs, queued):
 
 
 @pytest.mark.parametrize("call", ["status", "start"])
-def test_a_service_with_no_client_secret_answers_503(client, store, hs, queued, monkeypatch, call):
-    monkeypatch.delenv("HUBSPOT_APP_CLIENT_SECRET")
+def test_a_service_with_no_request_secret_answers_503(client, store, hs, queued, monkeypatch, call):
+    monkeypatch.delenv("APP_REQUEST_SECRET")
 
     response = _get_status(client) if call == "status" else _go(client)
 

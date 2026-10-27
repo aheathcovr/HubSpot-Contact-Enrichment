@@ -1,13 +1,16 @@
 """
-Who is asking: checking a request that HubSpot's hubspot.fetch signed.
+Who is asking: checking a request the HubSpot app's function signed.
 
-HubSpot signs each fetch from an app card (X-HubSpot-Signature-v3: base64 HMAC-SHA256, with the app's client
-secret, of method + URI + body + timestamp) and adds userId, userEmail, portalId and appId to the query string.
-Because the URI is part of what is signed, the rep's identity in the query cannot be forged. These tests check the
-signature against HubSpot's own published example, then every way a request can be refused.
+A static-auth app has no client secret, so HubSpot cannot sign the fetches of its cards. The app's function does it
+instead (hubspot-app/src/app/functions/service.js): it takes who is asking from HubSpot's own context (the user and the
+portal, which card parameters cannot override), adds them to the query string, and signs method + URI + body +
+timestamp with a secret it shares with this service, using HubSpot's v3 scheme (base64 HMAC-SHA256). Because the URI
+is part of what is signed, who is asking cannot be changed without the secret. These tests check the signature against
+HubSpot's own published example and against golden values the function's tests pin too, then every way a request can
+be refused.
 
 Run with:
-    python3 -m pytest "State Association Contact Enrichment/test_hubspot_request_auth.py" -v
+    python3 -m pytest "State Association Contact Enrichment/test_app_request_auth.py" -v
 """
 
 import os
@@ -18,9 +21,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import hubspot_request_auth as auth
+import app_request_auth as auth
 
-SECRET = "test-client-secret"
+SECRET = "test-app-secret"
 BASE = "https://svc.example.run.app/app/contact/status"
 
 
@@ -185,3 +188,29 @@ def test_the_expected_portal_is_accepted():
 def test_the_signature_is_checked_before_the_portal():
     """Nothing in an unsigned request is trusted, not even to say it is from the wrong portal."""
     _refused(_signed(signer="other"), 401, expected_portal="9999")
+
+
+# ── What the function and this service must agree on ──────────────────────────
+
+def test_the_two_headers_are_named_for_this_app_not_for_hubspot():
+    assert auth.SIGNATURE_HEADER == "X-Covr-App-Signature" and auth.TIMESTAMP_HEADER == "X-Covr-App-Timestamp"
+
+
+# Signatures the function's own tests (hubspot-app/test/service-function.test.ts) pin too: if either side changes how it
+# signs, one of the two files fails. The values were made by compute_signature_v3 below.
+_APP = "https://hubspot-enrichment-kpqza7tiga-uc.a.run.app/app"
+GOLDEN = [
+    ("GET", _APP + "/contact/status?contactId=42&userId=77&userEmail=rep%40example.org&portalId=1234", b"", "1700000000000",
+     "QIOhblxs8Xd/ytWw1n9ZS2KIAr8PwE2xHYCdCZs5afI="),
+    ("POST", _APP + "/contact/run?userId=77&userEmail=o%27neil%2Brep%40example.org&portalId=1234",
+     b'{"contactId":"42","objective":"find_email"}', "1700000000001", "tEegZgpE9Gm7X4vCloAlSJPNe/eXBE7nf1ZCaBOl3D0="),
+    ("GET", _APP + "/company/status?a=%3A%2F%3F%40%21%24%27%28%29%2A%2C%3B&b=%253A%2520&companyId=500", b"", "1700000000002",
+     "Vk764+fKfD1RFSlVu2LB8WX7UWQr4VVExvsqebu8vA4="),
+    ("POST", _APP + "/company/find?userId=77&portalId=1234", '{"companyId":"500","titles":["Médical Director"]}'.encode("utf-8"), "1700000000003",
+     "jz1lr+DVn8/WZF6UYsQDVtMysojZWSxO9UH6wQlnmkQ="),
+]
+
+
+@pytest.mark.parametrize("method, url, body, timestamp, expected", GOLDEN)
+def test_the_signatures_the_function_must_make_are_these(method, url, body, timestamp, expected):
+    assert auth.compute_signature_v3("test-app-secret", method, url, body, timestamp) == expected

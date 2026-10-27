@@ -1,0 +1,8 @@
+{
+  "uid": "service",
+  "type": "app-function",
+  "config": {
+    "entrypoint": "/app/functions/service.js",
+    "secretKeys": ["APP_REQUEST_SECRET"]
+  }
+}
