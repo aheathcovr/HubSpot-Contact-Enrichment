@@ -63,6 +63,7 @@ entry per build.
 | `src/app/cards/Enrichment.tsx`, `EnrichmentView.tsx` | The Enrichment card |
 | `src/app/cards/ContactCheck.tsx`, `ContactCheckView.tsx` | The Contact check card |
 | `src/app/functions/service.js`, `service-hsmeta.json` | The service function: carries the cards' requests to the enrichment service, says who is asking from HubSpot's context and signs them with `APP_REQUEST_SECRET`. Holds the service's address and the seven requests it forwards |
+| `scripts/stage-upload.mjs` | Uploads the app to an account from a staged copy of the committed files (see "Ship it"). Dry run by default; `--account` is always required. Tested in `test/stage-upload.test.mjs`, which cannot reach HubSpot (the `hs` it sees is a stub) |
 | `../setup_app_secret.sh` | Makes `APP_REQUEST_SECRET` (dry run by default): Secret Manager for the service, your clipboard for `hs secret add`. Never prints the value |
 | `src/app/cards/company-model.ts` | The Enrichment card's picking and title search: what it asks the service and how it words the answers |
 | `src/app/cards/usePicker.ts`, `PickPanel.tsx` | Ticking contacts, choosing what to do, the runs on the company |
@@ -100,16 +101,29 @@ The service's own suite has the contract test above: `python3 -m pytest "State A
 
 **Do not upload without the owner's approval.** When it is approved:
 
-1. Run the checks above.
+1. Run the checks above, and commit what you mean to upload.
 2. Add the function's secret first, in each account (`../setup_app_secret.sh` copies it for you; see
-   `DESIGN-contact-card.md`), then upload from a path with no hidden folder in it (the CLI skips `.claude/`): `hs
-   project upload --account <id>`. A "Project lint" warning about lint packages is expected.
-3. Approve the app's permissions (Connect App) in HubSpot. Until then the cards show a 403 message.
-4. Add the Enrichment card to the sidebar of company records, and the Contact check card to the sidebar of contact
-   records, in the page editor. The Enrichment card's picking and title search need the service turned on as well
-   (see "To turn it on" in the two design notes); until then the card says picking is not available and the rest of it
-   works.
-5. Check them read only on one test company and one test contact first: open the cards, check they show the right
+   `DESIGN-contact-card.md`).
+3. Upload through the staged copy, from the repository root. The CLI skips any path with a hidden folder in it (a
+   worktree under `.claude/` zips nothing), so the script uploads a copy of exactly the files git tracks under
+   `hsproject.json` and `src/`. It needs `--account` (there is no default; the CLI's own default is Covr_HubSpot), is a
+   dry run until the account is typed a second time, and refuses to apply when what ships is not committed or the
+   account does not hold `APP_REQUEST_SECRET`:
+   ```bash
+   node hubspot-app/scripts/stage-upload.mjs --account <id>
+   node hubspot-app/scripts/stage-upload.mjs --account <id> --apply --confirm <id>
+   ```
+   HubSpot asks the first time whether to create the project in the account; answer in the terminal. A "Project lint"
+   warning about lint packages is expected. The service takes `/app` requests from Covr_HubSpot (24434722) only, so
+   the cards work in that account and are refused anywhere else; the script says so for any other account.
+4. Install the app: `hs project install-app --account <id>` (a Super Admin approves its scopes), then `hs project
+   app-install-status --account <id>`. Uploading alone shows nothing: a static-auth app's cards stay hidden until it is
+   installed. Until its scopes are approved the cards show a 403 message.
+5. Add the Enrichment card to the sidebar of company records, and the Contact check card to the sidebar of contact
+   records (Settings > Objects > Companies or Contacts > Record customization), on a view for a few people first. The
+   Enrichment card's picking and title search need the service turned on as well (see "To turn it on" in the two
+   design notes); until then the card says picking is not available and the rest of it works.
+6. Check them read only on one test company and one test contact first: open the cards, check they show the right
    dates, contacts and email. Request a run only on a company or contact the owner names.
 
 For the Contact check card to work, the service must be turned on for it (see "To turn it on" in
