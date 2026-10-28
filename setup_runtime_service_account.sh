@@ -48,7 +48,8 @@ BUILD_SA="hubspot-enrichment-build@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # Must match the --set-secrets list in cloudbuild.yaml (test_deploy_config.py checks it). Every
 # push to main deploys with that list, so each secret must exist before this runs, including
-# BOUNCEBAN_API_KEY and SEAMLESS_API_KEY: without its secret the deploy fails.
+# BOUNCEBAN_API_KEY, SEAMLESS_API_KEY and APP_REQUEST_SECRET (made by setup_app_secret.sh): without
+# its secret the deploy fails.
 SECRETS=(
   HUBSPOT_API_KEY
   OPENROUTER_API_KEY
@@ -57,6 +58,7 @@ SECRETS=(
   HUBSPOT_WEBHOOK_SECRET
   BOUNCEBAN_API_KEY
   SEAMLESS_API_KEY
+  APP_REQUEST_SECRET
 )
 
 # Datasets the matcher reads: HubSpot_Airbyte_Self_Hosted (the current HubSpot
