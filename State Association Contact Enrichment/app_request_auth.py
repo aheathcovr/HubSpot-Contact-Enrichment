@@ -1,14 +1,21 @@
 """
-Who is asking: checking a request that HubSpot's hubspot.fetch signed.
+Who is asking: checking a request the HubSpot app's function signed.
 
-An app card calls this service with hubspot.fetch. HubSpot signs the request with the app's client secret
-(X-HubSpot-Signature-v3 and X-HubSpot-Request-Timestamp) and adds userId, userEmail, portalId and appId to the
-query string. The signature covers the URI, so a rep's identity in the query cannot be forged without the secret.
+The app's cards cannot call this service with hubspot.fetch: a static-auth app has no client secret, so HubSpot has
+nothing to sign a fetch with (and OAuth apps cannot use the functions the app needs). So a card calls the app's
+function (hubspot-app/src/app/functions/service.js) and the function calls this service. It takes who is asking from
+HubSpot's own context (the user and the portal, set by HubSpot on its server; card parameters cannot override them),
+adds them to the query as userId, userEmail and portalId, and signs the request with a secret it shares with this
+service (APP_REQUEST_SECRET here; the function's secret of the same name). The signature covers the URI, so who is
+asking cannot be changed without the secret.
 
-The v3 signature is the base64 HMAC-SHA256, keyed with the client secret, of
+The scheme is HubSpot's own v3 signature, so there is one published example to check an implementation against:
+the base64 HMAC-SHA256, keyed with the secret, of
     method + URI + body + timestamp
 where the URI has these URL-encoded characters decoded first: %3A %2F %3F %40 %21 %24 %27 %28 %29 %2A %2C %3B.
-A request older than five minutes is refused. (The webhook's own check does not decode: its URL has no query.)
+It travels in X-Covr-App-Signature and X-Covr-App-Timestamp (not HubSpot's header names: HubSpot signs nothing
+here). A request older than five minutes is refused. (The webhook's own check is a different one, with HubSpot's
+secret; its URL has no query and nothing is decoded.)
 
 No HubSpot, no web framework, no clock of its own in here beyond time.time(), so every case is testable.
 """
@@ -20,13 +27,15 @@ import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
-# HubSpot's published list of what is decoded in the URI before it is signed.
+# HubSpot's published list of what is decoded in the URI before it is signed (the function does the same).
 _DECODED = {
     "%3A": ":", "%2F": "/", "%3F": "?", "%40": "@", "%21": "!", "%24": "$",
     "%27": "'", "%28": "(", "%29": ")", "%2A": "*", "%2C": ",", "%3B": ";",
 }
 
 MAX_AGE_MS = 5 * 60 * 1000
+SIGNATURE_HEADER = "X-Covr-App-Signature"
+TIMESTAMP_HEADER = "X-Covr-App-Timestamp"
 
 
 class AuthError(Exception):

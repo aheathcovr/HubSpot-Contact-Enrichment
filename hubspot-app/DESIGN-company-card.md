@@ -45,8 +45,9 @@ They are the company runs' rules, not new ones:
 
 ## Endpoints
 
-All are signed by HubSpot (`hubspot_request_auth.py`); the rep is the one the signed query names. Until
-`HUBSPOT_APP_CLIENT_SECRET` is set they answer 503.
+All reach the service through the app's service function, which signs them (`app_request_auth.py`; see "Authentication
+and identity" in `DESIGN-contact-card.md`); the rep is the one the signed query names. Until `APP_REQUEST_SECRET` is
+set they answer 503.
 
 | Route | Body or query | Answer |
 | --- | --- | --- |

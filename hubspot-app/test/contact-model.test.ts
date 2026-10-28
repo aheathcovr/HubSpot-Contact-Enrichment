@@ -1,7 +1,7 @@
 // The contact card's logic without HubSpot: reading the service's answers, naming runs, and calling the service.
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  SERVICE_URL,
+  SERVICE_FUNCTION,
   ServiceError,
   agoText,
   makeService,
@@ -29,8 +29,8 @@ const run = (over: Partial<RunView> = {}): RunView => ({
 });
 
 describe('where the card calls', () => {
-  it('is the service, under /app', () => {
-    expect(SERVICE_URL).toBe('https://hubspot-enrichment-kpqza7tiga-uc.a.run.app/app');
+  it('is the app function that carries its requests to the service', () => {
+    expect(SERVICE_FUNCTION).toBe('service');
   });
 });
 
@@ -176,49 +176,85 @@ describe('dates are UTC, whatever zone the browser is in', () => {
 });
 
 describe('calling the service', () => {
-  const replying = (status: number, body: unknown, calls: unknown[] = []) =>
-    (async (url: string, options: Record<string, unknown>) => {
-      calls.push({ url, options });
-      return { status, json: async () => body };
+  // A fake hubspot.serverless: it records what it was called with and answers as the test says.
+  const answering = (answer: unknown, calls: unknown[] = []) =>
+    (async (name: string, options: Record<string, unknown>) => {
+      calls.push({ name, options });
+      return answer;
     }) as never;
 
-  it('asks for the path under the service, with the method and a timeout', async () => {
+  it('calls the service function with the method and the path, and nothing else for a get', async () => {
     const calls: unknown[] = [];
-    const service = makeService(replying(200, { ok: true }, calls));
+    const service = makeService(answering({ status: 200, json: { ok: true } }, calls));
 
     const reply = await service('GET', '/contact/status?contactId=42');
 
     expect(reply).toEqual({ status: 200, json: { ok: true } });
-    expect(calls).toEqual([{ url: `${SERVICE_URL}/contact/status?contactId=42`, options: { method: 'GET', timeout: 20000 } }]);
+    expect(calls).toEqual([{ name: 'service', options: { parameters: { method: 'GET', path: '/contact/status?contactId=42' } } }]);
   });
 
-  it('sends a body as an object, which is what hubspot.fetch takes', async () => {
+  it('sends a body as an object with the method and the path', async () => {
     const calls: { options: Record<string, unknown> }[] = [];
-    const service = makeService(replying(202, { ok: true }, calls));
+    const service = makeService(answering({ status: 202, json: { ok: true } }, calls));
 
     await service('POST', '/contact/run', { contactId: '42', objective: 'find_email' });
 
-    expect(calls[0].options).toEqual({ method: 'POST', timeout: 20000, body: { contactId: '42', objective: 'find_email' } });
+    expect(calls[0].options).toEqual({ parameters: { method: 'POST', path: '/contact/run', body: { contactId: '42', objective: 'find_email' } } });
   });
 
   it('sends no body at all on a get', async () => {
-    const calls: { options: Record<string, unknown> }[] = [];
-    const service = makeService(replying(200, { ok: true }, calls));
+    const calls: { options: { parameters: Record<string, unknown> } }[] = [];
+    const service = makeService(answering({ status: 200, json: { ok: true } }, calls));
 
     await service('GET', '/contact/status?contactId=42');
 
-    expect('body' in calls[0].options).toBe(false);
+    expect('body' in calls[0].options.parameters).toBe(false);
   });
 
-  it('gives a null body when the answer is not JSON', async () => {
-    const service = makeService((async () => ({ status: 502, json: async () => { throw new SyntaxError('Unexpected token <'); } })) as never);
+  it('sends nothing that says who is asking: HubSpot tells the function that', async () => {
+    const calls: { options: { parameters: Record<string, unknown> } }[] = [];
+    const service = makeService(answering({ status: 200, json: null }, calls));
+
+    await service('POST', '/contact/run', { contactId: '42', objective: 'find_email' });
+
+    expect(Object.keys(calls[0].options.parameters).sort()).toEqual(['body', 'method', 'path']);
+  });
+
+  it("hands back the function's refusal, which has the same shape as the service's", async () => {
+    const service = makeService(answering({ status: 503, json: { ok: false, error: 'The app is not set up to reach the enrichment service. Ask an admin.' } }));
+
+    expect(await service('GET', '/x')).toEqual({ status: 503, json: { ok: false, error: 'The app is not set up to reach the enrichment service. Ask an admin.' } });
+  });
+
+  it('keeps a null body when the service answered with something that was not JSON', async () => {
+    const service = makeService(answering({ status: 502, json: null }));
 
     expect(await service('GET', '/x')).toEqual({ status: 502, json: null });
   });
 
-  it('lets a network failure through for the card to report', async () => {
-    const service = makeService((async () => { throw new Error('Network down'); }) as never);
+  it('gives a null body, not no body, when the function sent none', async () => {
+    const service = makeService(answering({ status: 204 }));
 
-    await expect(service('GET', '/x')).rejects.toThrow('Network down');
+    expect(await service('GET', '/x')).toEqual({ status: 204, json: null });
+  });
+
+  it.each([
+    ['nothing', undefined],
+    ['null', null],
+    ['text', 'ok'],
+    ['a list', [200, {}]],
+    ['an answer with no status', { json: { ok: true } }],
+    ['a status that is not a number', { status: '200', json: {} }],
+    ['a status that is not a whole number', { status: 200.5, json: {} }],
+  ])('refuses %s as an answer, in words', async (_why, answer) => {
+    const service = makeService(answering(answer));
+
+    await expect(service('GET', '/x')).rejects.toThrow('The app sent back something the card could not read.');
+  });
+
+  it('lets a failure of the call itself through for the card to report', async () => {
+    const service = makeService((async () => { throw new Error('Function execution timed out'); }) as never);
+
+    await expect(service('GET', '/x')).rejects.toThrow('Function execution timed out');
   });
 });

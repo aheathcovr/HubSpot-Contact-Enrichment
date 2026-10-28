@@ -1,14 +1,15 @@
 // Contact card: how it talks to the enrichment service and how it puts what comes back into words. No HubSpot in this
 // file, so the tests run it without HubSpot. The shapes mirror what the service sends (webhook_server.py,
 // app_run_store.run_view, contact_objectives).
+import type { ServerlessRunnerParams } from '@hubspot/ui-extensions';
 import type { TagVariant } from './model.ts';
 
-// Where hubspot.fetch calls. It must sit under an entry of permittedUrls.fetch in app-hsmeta.json (a test checks).
-export const SERVICE_URL = 'https://hubspot-enrichment-kpqza7tiga-uc.a.run.app/app';
+// The app function the cards call to reach the service (the uid in functions/service-hsmeta.json; a test checks). A
+// card cannot call the service itself: a static-auth app has no client secret for HubSpot to sign a fetch with, so
+// the function makes the call, says who is asking from HubSpot's own context, and signs it.
+export const SERVICE_FUNCTION = 'service';
 // HubSpot's object type id for contacts.
 export const CONTACT_TYPE_ID = '0-1';
-// A fetch waits this long. HubSpot's default is 15 seconds; the service answers a start or a status at once.
-const TIMEOUT_MS = 20000;
 
 export type ObjectiveId = 'find_email' | 'find_mobile' | 'verify_email';
 
@@ -74,10 +75,8 @@ export interface ServiceReply {
 
 export type Service = (method: 'GET' | 'POST', path: string, body?: Record<string, unknown>) => Promise<ServiceReply>;
 
-export type FetchLike = (
-  url: string,
-  options: { method: 'GET' | 'POST'; timeout: number; body?: Record<string, unknown> },
-) => Promise<{ status: number; json(): Promise<unknown> }>;
+// hubspot.serverless, as far as the cards use it: a function's name and its parameters, and what it returns.
+export type FunctionRunner = (name: string, options: Omit<ServerlessRunnerParams, 'name'>) => Promise<unknown>;
 
 // What the service refused, with its HTTP status and, for the daily cap, the rep's quota.
 export class ServiceError extends Error {
@@ -115,16 +114,18 @@ export function readReply<T>(reply: ServiceReply): T {
   return body as T;
 }
 
-export function makeService(doFetch: FetchLike, base: string = SERVICE_URL): Service {
+// What the service function returns: the service's own answer, or its own refusal in the same shape, as { status, json }.
+function readFunctionAnswer(answer: unknown): ServiceReply {
+  if (!isObject(answer) || typeof answer.status !== 'number' || !Number.isInteger(answer.status)) {
+    throw new ServiceError('The app sent back something the card could not read.', 0);
+  }
+  return { status: answer.status, json: answer.json ?? null };
+}
+
+export function makeService(run: FunctionRunner): Service {
   return async (method, path, body) => {
-    const response = await doFetch(`${base}${path}`, body === undefined ? { method, timeout: TIMEOUT_MS } : { method, timeout: TIMEOUT_MS, body });
-    let json: unknown = null;
-    try {
-      json = await response.json();
-    } catch {
-      json = null;
-    }
-    return { status: response.status, json };
+    const parameters = body === undefined ? { method, path } : { method, path, body };
+    return readFunctionAnswer(await run(SERVICE_FUNCTION, { parameters: parameters as ServerlessRunnerParams['parameters'] }));
   };
 }
 

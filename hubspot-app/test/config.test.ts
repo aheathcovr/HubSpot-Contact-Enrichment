@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { COMPANY_TYPE_ID, FUNCTION_NAME } from '../src/app/cards/model.ts';
-import { CONTACT_TYPE_ID, SERVICE_URL } from '../src/app/cards/contact-model.ts';
+import { CONTACT_TYPE_ID, SERVICE_FUNCTION } from '../src/app/cards/contact-model.ts';
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const json = (p: string) => JSON.parse(readFileSync(here(p), 'utf8'));
@@ -13,6 +13,7 @@ const app = json('../src/app/app-hsmeta.json');
 const card = json('../src/app/cards/enrichment-hsmeta.json');
 const contactCard = json('../src/app/cards/contact-check-hsmeta.json');
 const fn = json('../src/app/functions/enrichment-hsmeta.json');
+const serviceFn = json('../src/app/functions/service-hsmeta.json');
 const project = json('../hsproject.json');
 
 describe('the app', () => {
@@ -37,14 +38,8 @@ describe('the app', () => {
     expect(app.config.auth.requiredScopes).not.toContain('crm.objects.contacts.write');
   });
 
-  it('reaches the enrichment service and nothing else', () => {
-    expect(app.config.permittedUrls).toEqual({ fetch: ['https://hubspot-enrichment-kpqza7tiga-uc.a.run.app/app/'], iframe: [], img: [] });
-  });
-
-  it('calls only addresses it is permitted to', () => {
-    const permitted: string[] = app.config.permittedUrls.fetch;
-    expect(permitted.some((prefix) => `${SERVICE_URL}/contact/status`.startsWith(prefix))).toBe(true);
-    expect(permitted.every((prefix) => prefix.startsWith('https://'))).toBe(true);
+  it('lets its cards fetch nothing: they reach the enrichment service through a function, which HubSpot signs no fetch for', () => {
+    expect(app.config.permittedUrls).toEqual({ fetch: [], iframe: [], img: [] });
   });
 
   it('is one project on the platform version the rollout app uses', () => {
@@ -96,5 +91,20 @@ describe('the function', () => {
 
   it('has no dependencies to install', () => {
     expect(json('../src/app/functions/package.json').dependencies).toEqual({});
+  });
+});
+
+describe('the service function', () => {
+  it('is the one the cards call, and is wired to the secret it signs with', () => {
+    expect(serviceFn.type).toBe('app-function');
+    expect(serviceFn.uid).toBe(SERVICE_FUNCTION);
+    expect(serviceFn.config.entrypoint).toBe('/app/functions/service.js');
+    expect(existsSync(here('../src/app/functions/service.js'))).toBe(true);
+    expect(serviceFn.config.secretKeys).toEqual(['APP_REQUEST_SECRET']);
+  });
+
+  it('is not the enrichment function, and shares nothing but the folder', () => {
+    expect(serviceFn.uid).not.toBe(fn.uid);
+    expect(serviceFn.config.entrypoint).not.toBe(fn.config.entrypoint);
   });
 });

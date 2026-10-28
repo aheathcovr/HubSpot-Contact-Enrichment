@@ -46,7 +46,7 @@ from starlette.concurrency import run_in_threadpool
 import app_run_store
 import company_titles
 import contact_objectives
-import hubspot_request_auth
+import app_request_auth
 from hubspot_client import HubSpotError
 
 
@@ -571,9 +571,9 @@ async def handle_enrich(request: Request) -> JSONResponse:
 
 # ── HubSpot app: the contact card ─────────────────────────────────────────────
 #
-# The card calls /app/contact/status and /app/contact/run with hubspot.fetch, which HubSpot signs (see
-# hubspot_request_auth). The run itself is a Cloud Task delivered to /app/run, like /enrich, so the card's call
-# returns at once. Nothing here is reachable until HUBSPOT_APP_CLIENT_SECRET is set: the endpoints answer 503.
+# The card calls /app/contact/status and /app/contact/run through the app's function, which signs each call (see
+# app_request_auth). The run itself is a Cloud Task delivered to /app/run, like /enrich, so the card's call returns at
+# once. Nothing here is reachable until APP_REQUEST_SECRET is set: the endpoints answer 503.
 
 _CONTACT_ID_RE = re.compile(r"^\d{1,20}$")
 _RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -635,20 +635,33 @@ def _hubspot_failure(exc: HubSpotError, what: str = "contact") -> tuple:
     return 502, {"ok": False, "error": "HubSpot could not be reached. Try again in a moment."}
 
 
+def _signed_url(request: Request) -> str:
+    """
+    The address a request was signed for: the one the caller used. Cloud Run's front end reports the scheme in
+    X-Forwarded-Proto (the first, when several) and the host in Host (which is what request.url shows); the path and
+    query are as received. The scheme the server itself sees behind that proxy is not used. Nothing here is trusted: a caller who changes any of it
+    only changes the address the signature has to cover, and without the secret it cannot sign another.
+    """
+    scheme = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip().lower()
+    host = request.url.netloc   # built from the Host header
+    query = request.url.query
+    return f"{scheme}://{host}{request.url.path}" + (f"?{query}" if query else "")
+
+
 async def _authenticate_app_request(request: Request):
-    """(identity, body, None) for a request HubSpot signed, or (None, body, the refusal to send)."""
+    """(identity, body, None) for a request the app's function signed, or (None, body, the refusal to send)."""
     body = await request.body()
     try:
-        who = hubspot_request_auth.authenticate(
-            secret=os.getenv("HUBSPOT_APP_CLIENT_SECRET", ""),
+        who = app_request_auth.authenticate(
+            secret=os.getenv("APP_REQUEST_SECRET", ""),
             method=request.method,
-            url=str(request.url),
+            url=_signed_url(request),
             body=body,
-            signature=request.headers.get("X-HubSpot-Signature-v3"),
-            timestamp=request.headers.get("X-HubSpot-Request-Timestamp"),
+            signature=request.headers.get(app_request_auth.SIGNATURE_HEADER),
+            timestamp=request.headers.get(app_request_auth.TIMESTAMP_HEADER),
             expected_portal=os.getenv("HUBSPOT_PORTAL_ID", "").strip(),
         )
-    except hubspot_request_auth.AuthError as exc:
+    except app_request_auth.AuthError as exc:
         if exc.status_code != 503:
             logger.warning(f"/app request refused ({exc.status_code}): {exc.message}")
         return None, body, _app_error(exc.message, exc.status_code)
