@@ -36,6 +36,7 @@ MAX_TITLE_LENGTH = 80
 _LINKED_READ = 100
 _NOTHING_CHANGED = "Something went wrong. Nothing was changed. Try again."
 SEARCH_GONE = "Those search results are no longer available. Search again."
+NEEDS_COMPANY_TYPE = "Set this company's Company Type to Facility or Corporation first, then search again."
 
 FIND_OBJECTIVE = "find_by_title"
 ADD_OBJECTIVE = "add_candidate"

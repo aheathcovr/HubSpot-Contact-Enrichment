@@ -154,6 +154,65 @@ describe('status of a company', () => {
 
 // ── Status: the contacts ──────────────────────────────────────────────────────
 
+// ── A company with no usable Company Type ────────────────────────────────────
+//
+// The service researches a facility's leaders and a corporation's executives differently, so a company that is neither
+// (blank, or Partner, Staffing Agency or Other) is asked for its type first. Without that the first run did nothing and
+// still stamped the enrichment date, and the rep could not ask again for 30 days.
+
+describe('a company with no usable Company Type', () => {
+  it.each([[null], [''], ['   '], ['Partner'], ['Staffing Agency'], ['Staffing Agency2']])('asks for the type before anything else when it is %j', async (type) => {
+    const r = await status(hubWith({ hierarchy_type: type }));
+
+    expect(r).toMatchObject({ ok: true, canRequest: false, reason: 'no_company_type', company: { kind: 'other' } });
+  });
+
+  it('words a blank type and another type differently', async () => {
+    const blank = await status(hubWith({ hierarchy_type: null }));
+    const partner = await status(hubWith({ hierarchy_type: 'Partner' }));
+
+    expect(blank.message).toMatch(/no Company Type/);
+    expect(blank.message).toMatch(/Facility or Corporation/);
+    expect(partner.message).toMatch(/Facility and Corporation companies only/);
+    expect(partner.message).not.toMatch(/no Company Type/);
+  });
+
+  it('asks for the type even when the company was enriched in the last 30 days', async () => {
+    const r = await status(hubWith({ hierarchy_type: null, revops_enrichment_date: ms(2026, 10, 26) }));
+
+    expect(r.reason).toBe('no_company_type');
+    expect(r.company).toMatchObject({ lastEnrichedOn: '2026-10-26', nextEligibleOn: '2026-11-25' });
+  });
+
+  it('still says a requested run is waiting, whatever the type', async () => {
+    const r = await status(hubWith({ hierarchy_type: null, request_to_enrich: 'true' }));
+
+    expect(r).toMatchObject({ canRequest: false, reason: 'already_requested' });
+  });
+
+  it.each([[FACILITY], [CORPORATION]])('does not ask a %s company for a type', async (type) => {
+    const r = await status(hubWith({ hierarchy_type: type }));
+
+    expect(r).toMatchObject({ canRequest: true, reason: null, message: null });
+  });
+
+  it('reads the type the way the service does, ignoring spaces around it', async () => {
+    const r = await status(hubWith({ hierarchy_type: ` ${FACILITY} ` }));
+
+    expect(r).toMatchObject({ canRequest: true, reason: null, company: { kind: 'facility' } });
+  });
+
+  it('refuses a request without writing anything, and says to set the type', async () => {
+    const hub = hubWith({ hierarchy_type: null });
+
+    const r = await request(hub);
+
+    expect(r).toMatchObject({ ok: false, reason: 'no_company_type' });
+    expect(r.error).toMatch(/Company Type/);
+    expect(hub.writes()).toEqual([]);
+  });
+});
+
 describe('contacts of a company', () => {
   it('lists them with their email check', async () => {
     const hub = hubWith({}, [

@@ -124,10 +124,14 @@ def test_the_check_is_cached_so_it_runs_once_per_window_not_once_per_enrichment(
 
 def test_a_stale_mirror_is_reported_in_the_company_note():
     hs = MagicMock()
-    hs.get_company_properties.return_value = {"name": "Valley View", "hierarchy_type": "Something Else"}
+    # A facility, so the run does go on to research (a company with another type is only asked for its type, with no
+    # research and so no mirror check); the research steps themselves are not what this test is about.
+    hs.get_company_properties.return_value = {"name": "Valley View", "hierarchy_type": ep.CHILD_HIERARCHY_TYPE}
     with patch.object(ep, "_get_hubspot_client", return_value=hs), \
          patch.object(ep, "_get_bigquery_client", return_value=MagicMock()), \
-         patch.object(ep, "check_hubspot_mirror_freshness", return_value=596.0):
+         patch.object(ep, "check_hubspot_mirror_freshness", return_value=596.0), \
+         patch.object(ep, "find_facilities_missing_leadership", return_value=MagicMock()), \
+         patch.object(ep, "_run_workflow1_single_facility", return_value=[]):
         ep.run_enrichment("12345")
 
     note = hs.create_note_on_company.call_args.args[1]

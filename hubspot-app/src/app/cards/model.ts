@@ -8,7 +8,7 @@ export const SENT_PROPERTIES = ['hs_object_id'];
 // HubSpot's object type id for companies.
 export const COMPANY_TYPE_ID = '0-2';
 
-export type Reason = 'already_requested' | 'recently_enriched' | null;
+export type Reason = 'already_requested' | 'recently_enriched' | 'no_company_type' | null;
 export type TagVariant = 'default' | 'warning' | 'success' | 'error' | 'info';
 
 export interface CompanySummary {
@@ -86,6 +86,11 @@ export interface TagLook {
 
 // The service leaves a company alone for 30 days after a run; a run that old or older is shown as old, not as recent.
 const RECENT_DAYS = 30;
+
+// Company Type (hierarchy_type): the property a company has to have set to a facility or a corporation before the
+// service can research it. The card shows HubSpot's own editor for it when it is not.
+export const COMPANY_TYPE_PROPERTY = 'hierarchy_type';
+export const TYPE_NEEDED_TAG: TagLook = { label: 'Company Type needed', variant: 'warning' };
 
 export function statusTag(company: CompanySummary): TagLook {
   if (company.requested) return { label: 'Run requested', variant: 'warning' };

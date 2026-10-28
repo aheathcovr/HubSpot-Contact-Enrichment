@@ -998,9 +998,12 @@ def _latest_adds(store, company_id: str, run_id: str) -> dict:
 def _app_find_start(company_id: str, titles: list, who) -> tuple:
     store, now = _run_store(), _utcnow()
     try:
-        _hubspot().get_company_properties(company_id)
+        props = _hubspot().get_company_properties(company_id)
     except HubSpotError as exc:
         return _hubspot_failure(exc, "company")
+    # The right titles depend on whether this is a facility or a corporation, so a blank or other type has none to search.
+    if contact_objectives.company_kind(props.get("hierarchy_type", "")) == "other":
+        return 409, {"ok": False, "error": company_titles.NEEDS_COMPANY_TYPE}
 
     # The same search within a day is the same run: nothing more is spent, and a double click or a retry by HubSpot finds it.
     key = company_titles.titles_key(titles)

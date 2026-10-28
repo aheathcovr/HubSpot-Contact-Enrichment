@@ -9,6 +9,8 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: /^@hubspot\/ui-extensions$/, replacement: here('./node_modules/@hubspot/ui-extensions') },
+      // The cards import HubSpot's CRM components from this subpath, which they would not find from their own folder.
+      { find: /^@hubspot\/ui-extensions\/crm$/, replacement: here('./node_modules/@hubspot/ui-extensions/dist/crm/index.js') },
       { find: /^react(\/.*)?$/, replacement: here('./node_modules/react') + '$1' },
     ],
   },
