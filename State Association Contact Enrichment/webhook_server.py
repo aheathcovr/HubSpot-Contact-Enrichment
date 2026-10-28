@@ -45,6 +45,7 @@ from starlette.concurrency import run_in_threadpool
 
 import app_run_store
 import company_titles
+import enrichment_claim
 import contact_objectives
 import app_request_auth
 from hubspot_client import HubSpotError
@@ -564,9 +565,50 @@ async def handle_enrich(request: Request) -> JSONResponse:
         logger.warning(f"/enrich received invalid company_id: {company_id!r}")
         return JSONResponse({"error": "Invalid company_id"}, status_code=400)
 
+    # One run per company at a time (see enrichment_claim). Cloud Tasks names the task it is delivering; a retry of
+    # that same task holds the claim already, any other task for the company is a duplicate and does nothing. The
+    # duplicate is answered 200: a non-2xx would have Cloud Tasks deliver it again, five times.
+    owner = request.headers.get("X-CloudTasks-TaskName", "").strip() or uuid.uuid4().hex
+    claimed = await run_in_threadpool(_claim_company, company_id, owner)
+    if claimed is False:
+        logger.info(
+            f"/enrich skipped: an enrichment of company_id={company_id} is already running",
+            extra={"json_fields": {"company_id": company_id, "task": owner}},
+        )
+        return JSONResponse({"status": "skipped", "reason": "already_running", "company_id": company_id})
+
     logger.info(f"Running enrichment for company_id={company_id}")
-    await run_in_threadpool(_run_enrichment_safe, company_id)
+    try:
+        await run_in_threadpool(_run_enrichment_safe, company_id)
+    finally:
+        if claimed:
+            await run_in_threadpool(_release_company, company_id, owner)
     return JSONResponse({"status": "done", "company_id": company_id})
+
+
+def _claim_company(company_id: str, owner: str):
+    """
+    True when this run took the company, False when another run holds it, None when the claim store could not say.
+
+    None runs the enrichment anyway: a Firestore outage must not stop every enrichment, and a duplicate run costs
+    credits but breaks nothing, which a stuck company does.
+    """
+    try:
+        return enrichment_claim.get_claim_store().claim(company_id, owner, _utcnow())
+    except Exception as exc:
+        logger.error(
+            f"Could not take the enrichment claim for company_id={company_id}; running without it: {exc}",
+            extra={"json_fields": {"alert": "enrichment_claim_unavailable", "company_id": company_id}},
+        )
+        return None
+
+
+def _release_company(company_id: str, owner: str) -> None:
+    """Give the company back; a failure only means the lease lapses on its own."""
+    try:
+        enrichment_claim.get_claim_store().release(company_id, owner)
+    except Exception as exc:
+        logger.warning(f"Could not release the enrichment claim for company_id={company_id}: {exc}")
 
 
 # ── HubSpot app: the contact card ─────────────────────────────────────────────

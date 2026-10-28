@@ -93,7 +93,11 @@ fi
 # a minute. Four concurrent runs fill one instance (--concurrency=4); two a second is
 # plenty for a human-triggered flow. Run again with different numbers to change them:
 #   MAX_CONCURRENT_DISPATCHES=6 MAX_DISPATCHES_PER_SECOND=3 ./setup_cloud_tasks.sh
-MAX_CONCURRENT_DISPATCHES="${MAX_CONCURRENT_DISPATCHES:-4}"
+# 2026-10-28: the queue was found at the Cloud Tasks defaults, and eight companies
+# triggered together (four of them corporations, which search FullEnrich for 20+ titles
+# each) drew 429s on dozens of searches, so three came back empty. Two at a time keeps
+# the searches under FullEnrich's rate limit; raise it only with the 429s in view.
+MAX_CONCURRENT_DISPATCHES="${MAX_CONCURRENT_DISPATCHES:-2}"
 MAX_DISPATCHES_PER_SECOND="${MAX_DISPATCHES_PER_SECOND:-2}"
 echo "--- Setting dispatch limits (${MAX_CONCURRENT_DISPATCHES} concurrent, ${MAX_DISPATCHES_PER_SECOND}/s)..."
 gcloud tasks queues update "${QUEUE_NAME}" \
