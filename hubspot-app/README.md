@@ -115,7 +115,8 @@ The service's own suite has the contract test above: `python3 -m pytest "State A
 For the Contact check card to work, the service must be turned on for it (see "To turn it on" in
 `DESIGN-contact-card.md`): a deployed build that has the `/app` routes, the shared secret as `APP_REQUEST_SECRET` (in
 Secret Manager and as the function's HubSpot secret), and the Firestore TTL policies. Until the secret is set the `/app`
-routes answer 503 and the card says the service is not set up. Not yet confirmed in a real portal: that the service
+routes answer 503 and the card says the service is not set up. The service accepts only the portal named in
+`HUBSPOT_PORTAL_ID` (the deploy sets it to Covr_HubSpot, 24434722), so the app works in that account only. Not yet confirmed in a real portal: that the service
 function can call out to the service and be accepted. That is only proven after a deploy.
 
 ## Change it

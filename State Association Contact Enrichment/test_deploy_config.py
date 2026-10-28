@@ -28,7 +28,7 @@ _ENV_READ = re.compile(
 
 
 def _is_secret_name(name: str) -> bool:
-    return name.endswith("_API_KEY") or name.endswith("_WEBHOOK_SECRET")
+    return name.endswith("_API_KEY") or name.endswith("_SECRET")
 
 
 def _secrets_read_by_the_code() -> set[str]:
@@ -55,6 +55,20 @@ def _secrets_mounted_by_the_deploy() -> dict[str, str]:
                     env, _, ref = pair.partition("=")
                     mounted[env.strip()] = ref.split(":")[0].strip()
     return mounted
+
+
+def _env_vars_set_by_the_deploy() -> dict[str, str]:
+    """environment variable -> value, from every --set-env-vars / --update-env-vars in cloudbuild.yaml."""
+    config = yaml.safe_load((ROOT / "cloudbuild.yaml").read_text())
+    set_by_the_deploy: dict[str, str] = {}
+    for step in config["steps"]:
+        for arg in step.get("args", []):
+            flag, _, value = str(arg).partition("=")
+            if flag in ("--set-env-vars", "--update-env-vars"):
+                for pair in value.split(","):
+                    env, _, setting = pair.partition("=")
+                    set_by_the_deploy[env.strip()] = setting.strip()
+    return set_by_the_deploy
 
 
 def _bash_array(script: str, name: str):
@@ -93,3 +107,20 @@ def test_a_secret_the_deploy_mounts_is_not_left_in_the_optional_list():
 @pytest.mark.parametrize("secret", ["BOUNCEBAN_API_KEY", "SEAMLESS_API_KEY"])
 def test_the_vendor_keys_that_were_lost_on_2026_10_25_are_mounted(secret):
     assert _secrets_mounted_by_the_deploy().get(secret) == secret
+
+
+def test_the_secret_the_apps_function_signs_with_is_mounted():
+    # The app's cards reach /app/... through a function that signs each request with this secret; the service refuses
+    # (503) every one of them until it has it, and each merge's deploy would take it away again if it were not listed.
+    assert _secrets_mounted_by_the_deploy().get("APP_REQUEST_SECRET") == "APP_REQUEST_SECRET"
+
+
+def test_the_service_only_takes_app_requests_from_the_portal_it_enriches():
+    # With HUBSPOT_PORTAL_ID unset the service accepts a signed request from any HubSpot account that holds the secret,
+    # and then looks the record ids up in the one portal its own token belongs to: Covr_HubSpot, 24434722.
+    assert _env_vars_set_by_the_deploy().get("HUBSPOT_PORTAL_ID") == "24434722"
+
+
+def test_the_env_var_scan_sees_the_settings_the_deploy_already_makes():
+    # Guards the scan itself, as test_the_code_reads_some_secrets does for the secrets.
+    assert _env_vars_set_by_the_deploy().get("CLOUD_TASKS_QUEUE") == "hubspot-enrichment"

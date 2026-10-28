@@ -111,7 +111,9 @@ The service (`app_request_auth.py`, used by `webhook_server.py`):
 1. Fails closed (503) when `APP_REQUEST_SECRET` is not set.
 2. Rejects (401) a missing, stale (over 5 minutes) or wrong signature. The address checked is the one the caller used,
    built from the Host header and the scheme Cloud Run's front end reports, so it needs no setting.
-3. Rejects (403) a request for another portal when `HUBSPOT_PORTAL_ID` is set.
+3. Rejects (403) a request for another portal when `HUBSPOT_PORTAL_ID` is set. The deploy sets it to Covr_HubSpot
+   (24434722), the portal the service's own HubSpot token belongs to, so a card in any other account (the test account
+   included) is refused rather than having its record ids looked up in Covr_HubSpot.
 4. Takes the rep's identity from the signed query, never from the body.
 
 The scheme is HubSpot's own, so its published example checks both implementations, and four golden signatures made by
@@ -143,8 +145,9 @@ both take the last place. `setup_firestore.sh` gains the two TTL policies (dry r
    the secret in Secret Manager, lets the service's runtime account read it, and copies the value to your clipboard for
    `hs secret add APP_REQUEST_SECRET --account <id>` (a hidden prompt; paste, then press Enter to clear the clipboard).
    Repeat the paste for each HubSpot account the app goes to (`COPY_EXISTING=1`). Never replaced if it exists.
-2. Add `--set-secrets=APP_REQUEST_SECRET=APP_REQUEST_SECRET:latest` to `cloudbuild.yaml`, only once the secret exists
-   (a deploy cannot start without it). Until then the endpoints answer 503.
+2. `cloudbuild.yaml` mounts `APP_REQUEST_SECRET` and sets `HUBSPOT_PORTAL_ID=24434722`, so merge the change that does
+   it only once the secret exists (a deploy cannot start without it). Until the secret is mounted the endpoints
+   answer 503.
 3. Apply `setup_firestore.sh` for the TTL policies.
 4. Deploy a build from main and move traffic to it. The new endpoints exist only in a build that has this code.
 5. Upload the app, after `hs secret add`, with approval; add the card to contact records, and check it read only on one
