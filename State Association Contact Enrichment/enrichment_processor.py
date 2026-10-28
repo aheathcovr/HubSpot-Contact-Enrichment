@@ -2286,6 +2286,51 @@ def _build_note(
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
+def _build_unclassified_note(company_name: str, hierarchy_type: str) -> str:
+    """The note for a company whose Company Type is blank or not one the service enriches: what is wrong and what to do."""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if hierarchy_type:
+        why = "This company's Company Type is not Facility or Corporation, the two types the service enriches."
+        todo = (
+            "If it is a facility or an operator, change its Company Type to <b>Facility</b> or <b>Corporation</b> and "
+            "request enrichment again. If it is neither, there is nothing for the service to do."
+        )
+    else:
+        why = (
+            "This company has no Company Type, so the service cannot tell whether to look for a facility's leaders "
+            "or a corporation's executives."
+        )
+        todo = "Set its <b>Company Type</b> to <b>Facility</b> or <b>Corporation</b>, then request enrichment again."
+    return (
+        f"<b>RevOps Contact Enrichment &middot; {html.escape(company_name)}</b><br>"
+        f"<b>Run date:</b> {now_str}<br><br>"
+        f"<b>No research was done.</b> {why}<br><br>"
+        f"<b>What to do:</b> {todo} The enrichment date was left alone, so the request can be made again straight away."
+    )
+
+
+def _decline_unclassified_company(hs, company_id: str, company_name: str, hierarchy_type: str) -> None:
+    """
+    End a run for a company the service cannot classify: write the note that asks for its type and reset the request
+    so the HubSpot workflow can fire again. The enrichment date is NOT stamped: nothing was enriched, and the 30-day
+    guard (and the HubSpot card) would otherwise refuse the next request for a month.
+    """
+    logger.warning(
+        f"Company {company_id} has hierarchy_type={hierarchy_type!r}; expected '{CHILD_HIERARCHY_TYPE}' or "
+        f"'{CORP_HIERARCHY_TYPE}'. No research done."
+    )
+    try:
+        hs.create_note_on_company(company_id, _build_unclassified_note(company_name, hierarchy_type))
+    except HubSpotError as exc:
+        logger.error(f"Failed to create note on company {company_id}: {exc}")
+    for attempt in range(2):
+        try:
+            hs.update_company(company_id, {"request_to_enrich": "false"})
+            return
+        except HubSpotError as exc:
+            logger.error(f"Failed to reset request_to_enrich on company {company_id} (attempt {attempt + 1}): {exc}")
+
+
 def run_enrichment(company_id: str) -> None:
     """
     Full enrichment run for a single HubSpot company record.
@@ -2319,6 +2364,12 @@ def run_enrichment(company_id: str) -> None:
         f"Company: {company_name} | hierarchy_type={hierarchy_type} | "
         f"definitive_healthcare_id={definitive_id_raw}"
     )
+
+    # ── Step 1b: a company the service cannot classify is asked for its type ─
+    # Before the 30-day guard, so a company stamped by the old behaviour is still told why nothing ran.
+    if hierarchy_type not in (CHILD_HIERARCHY_TYPE, CORP_HIERARCHY_TYPE):
+        _decline_unclassified_company(hs, company_id, company_name, hierarchy_type)
+        return
 
     # ── Step 2: 30-day guard ──────────────────────────────────────────────────
     # HubSpot date-picker properties are stored/returned as "YYYY-MM-DD" strings
@@ -2524,15 +2575,6 @@ def run_enrichment(company_id: str) -> None:
             logger.info(f"W2 FullEnrich supplement added {fe_added} new contact(s)")
         else:
             logger.info("W2 FullEnrich supplement: no additional contacts found")
-
-    else:
-        msg = (
-            f"Unknown hierarchy_type='{hierarchy_type}'. "
-            f"Expected '{CHILD_HIERARCHY_TYPE}' or '{CORP_HIERARCHY_TYPE}'."
-        )
-        logger.warning(msg)
-        errors.append(msg)
-        workflow_label = f"Unknown hierarchy type: {hierarchy_type}"
 
     # ── Step 5: Process results → create/associate contacts in HubSpot ───────
     # Each result's HubSpot writes + FullEnrich/MillionVerifier calls are

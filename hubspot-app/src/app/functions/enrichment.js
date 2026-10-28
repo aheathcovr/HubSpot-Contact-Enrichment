@@ -78,11 +78,21 @@ function ago(daysSince, on) {
 
 const isRequested = (value) => TRIGGER_VALUES.includes(String(value === null || value === undefined ? '' : value).trim().toLowerCase());
 
+// Read the way the service reads it (enrichment_processor.py strips, then compares), so the card and the service agree.
+const typeText = (type) => String(type === null || type === undefined ? '' : type).trim();
+
 function kindOf(type) {
-  if (type === FACILITY_TYPE) return 'facility';
-  if (type === CORPORATION_TYPE) return 'corporation';
+  const text = typeText(type);
+  if (text === FACILITY_TYPE) return 'facility';
+  if (text === CORPORATION_TYPE) return 'corporation';
   return 'other';
 }
+
+// A company that is neither is asked for its type before anything else: the service researches a facility's leaders and
+// a corporation's executives differently, and would only write a note saying it could not tell which this is. The words
+// say "below" and "Refresh" because the card shows Company Type's own editor under them.
+const NO_TYPE_MESSAGE = 'This company has no Company Type. The service researches a facility and a corporation differently, so choose Facility or Corporation below, then press Refresh.';
+const OTHER_TYPE_MESSAGE = 'The service enriches Facility and Corporation companies only. If this company is one of those, change its Company Type below, then press Refresh.';
 
 // Where a company stands, and whether a request would be skipped, and why.
 function summarize(id, props, now) {
@@ -102,6 +112,10 @@ function summarize(id, props, now) {
   };
   if (requested) {
     return { company, reason: 'already_requested', message: 'A run is already requested for this company. The service starts it within moments and clears the request when it is done.' };
+  }
+  // Before the 30-day rule: a company stamped as enriched by a run that did nothing still has to be told why.
+  if (company.kind === 'other') {
+    return { company, reason: 'no_company_type', message: typeText(props.hierarchy_type) === '' ? NO_TYPE_MESSAGE : OTHER_TYPE_MESSAGE };
   }
   if (daysSince !== null && daysSince < REFRESH_DAYS) {
     return {

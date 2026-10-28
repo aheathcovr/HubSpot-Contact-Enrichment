@@ -116,6 +116,27 @@ def test_a_search_is_queued_for_the_titles_with_the_company_and_the_rep(client, 
     assert record["requested_by_id"] == "77" and record["requested_by"] == "rep@example.org" and queued == [body["run"]["runId"]]
 
 
+@pytest.mark.parametrize("hierarchy_type", ["", "Partner", "Staffing Agency"])
+def test_a_search_is_refused_for_a_company_with_no_usable_type_and_costs_nothing(client, store, hs, queued, hierarchy_type):
+    # The service researches facilities and corporations differently; a blank or other Company Type has no right search.
+    hs.get_company_properties.return_value = {"name": "Maple Grove Care", "hierarchy_type": hierarchy_type}
+
+    response = _find(client)
+
+    assert response.status_code == 409 and response.json()["ok"] is False
+    assert "Company Type" in response.json()["error"] and "Facility" in response.json()["error"]
+    assert queued == []
+    # No place was taken: the next search, on a company with a type, is the rep's first of the day.
+    hs.get_company_properties.return_value = {"name": "Elm Court Care Center", "hierarchy_type": _FACILITY}
+    assert _find(client).json()["quota"]["used"] == 1
+
+
+def test_a_search_is_still_queued_for_a_corporation(client, store, hs, queued):
+    hs.get_company_properties.return_value = {"name": "Elm Operator", "hierarchy_type": "Corporation / Operator"}
+
+    assert _find(client).status_code == 202
+
+
 def test_the_titles_are_cleaned_before_they_are_kept(client, store, hs, queued):
     body = _find(client, titles=("  Medical   Director ", "medical director", "")).json()
 

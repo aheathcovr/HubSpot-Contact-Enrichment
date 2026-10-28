@@ -1,9 +1,12 @@
 // Renders the Enrichment card with HubSpot's test renderer and a fake app function.
 import { describe, expect, it } from 'vitest';
-import { Accordion, Button, EmptyState, ErrorState, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
+import { Accordion, Button, Checkbox, EmptyState, ErrorState, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
+import { CrmPropertyList } from '@hubspot/ui-extensions/crm';
 import { createRenderer } from '@hubspot/ui-extensions/testing';
 import { EnrichmentView, type Runner } from '../src/app/cards/EnrichmentView.tsx';
 import type { CompanySummary, ContactRow } from '../src/app/cards/model.ts';
+import type { Service } from '../src/app/cards/contact-model.ts';
+import { fakeService } from './company-fakes.tsx';
 import { COMPANIES, COMPANY_ID } from './fixtures.ts';
 
 const company = (over: Partial<CompanySummary> = {}): CompanySummary => ({
@@ -84,11 +87,11 @@ function fakeRun(opts: { status?: (n: number) => unknown; request?: () => unknow
   return { run, calls, release, actions: () => calls.map((c) => c.options.parameters?.action) };
 }
 
-function setup(run: Runner, opts: { objectTypeId?: string; pollEveryMs?: number; maxPolls?: number } = {}) {
+function setup(run: Runner, opts: { objectTypeId?: string; pollEveryMs?: number; maxPolls?: number; service?: Service } = {}) {
   const r = createRenderer('crm.record.sidebar');
   r.mocks.context.crm.objectId = Number(COMPANY_ID);
   r.mocks.context.crm.objectTypeId = opts.objectTypeId ?? COMPANIES;
-  r.render(<EnrichmentView context={r.mocks.context} actions={r.mocks.actions} run={run} pollEveryMs={opts.pollEveryMs ?? 0} maxPolls={opts.maxPolls} />);
+  r.render(<EnrichmentView context={r.mocks.context} actions={r.mocks.actions} run={run} pollEveryMs={opts.pollEveryMs ?? 0} maxPolls={opts.maxPolls} service={opts.service} runPollEveryMs={0} />);
   return r;
 }
 
@@ -366,5 +369,73 @@ describe('Enrichment card: contacts', () => {
 
     await r.waitFor(() => expect(tags(r)).toEqual([['Enriched 5 days ago', 'success']]));
     expect(texts(r)).toContain('Contacts could not be read: The app is missing a permission for reading the contacts (403).');
+  });
+});
+
+// A company that is neither a facility nor a corporation is asked for its Company Type before anything else: the card
+// says so, shows HubSpot's own editor for that one property, and holds back the request and the contact tools until the
+// rep has set it and pressed Refresh.
+const NO_TYPE = {
+  company: company({ kind: 'other' }),
+  canRequest: false,
+  reason: 'no_company_type',
+  message: 'This company has no Company Type. The service researches a facility and a corporation differently, so choose Facility or Corporation below, then press Refresh.',
+};
+
+describe('Enrichment card: a company with no Company Type', () => {
+  it('asks for the type: a tag, the reason, a request button that cannot be pressed, and HubSpot\'s editor for the property', async () => {
+    const r = setup(fakeRun({ status: () => statusResult(NO_TYPE) }).run);
+
+    await r.waitFor(() => expect(tags(r)).toEqual([['Company Type needed', 'warning']]));
+    expect(button(r, 'Request enrichment').props.disabled).toBe(true);
+    expect(texts(r)).toContain(NO_TYPE.message);
+    expect(r.findAll(CrmPropertyList)).toHaveLength(1);
+    expect(r.find(CrmPropertyList).props.properties).toEqual(['hierarchy_type']);
+  });
+
+  it('shows the same prompt over a recent enrichment date, which a run that did nothing may have left', async () => {
+    const stamped = { ...NO_TYPE, company: company({ kind: 'other', lastEnrichedOn: '2026-10-26', daysSince: 0, nextEligibleOn: '2026-11-25' }) };
+    const r = setup(fakeRun({ status: () => statusResult(stamped) }).run);
+
+    await r.waitFor(() => expect(tags(r)).toEqual([['Company Type needed', 'warning']]));
+    expect(r.findAll(CrmPropertyList)).toHaveLength(1);
+  });
+
+  it('shows no editor for a company that has a type', async () => {
+    const r = setup(fakeRun().run);
+
+    await r.waitFor(() => expect(tags(r)).toEqual([['Not enriched yet', 'default']]));
+    expect(r.findAll(CrmPropertyList)).toHaveLength(0);
+  });
+
+  it('lets the rep go on once the type is set: Refresh reads the status again and the prompt goes', async () => {
+    let n = 0;
+    const r = setup(fakeRun({ status: () => (++n === 1 ? statusResult(NO_TYPE) : statusResult()) }).run);
+    await r.waitFor(() => expect(tags(r)).toEqual([['Company Type needed', 'warning']]));
+
+    button(r, 'Refresh').trigger('onClick');
+
+    await r.waitFor(() => expect(tags(r)).toEqual([['Not enriched yet', 'default']]));
+    expect(r.findAll(CrmPropertyList)).toHaveLength(0);
+    expect(button(r, 'Request enrichment').props.disabled).toBe(false);
+  });
+
+  it('holds back the contact tools while the type is missing, and shows them once it is set', async () => {
+    const withContacts = (over: Record<string, unknown>) => statusResult({ contacts: [{ id: '1', name: 'Pat Lee', title: null, email: null, emailCheck: null, emailCheckedOn: null, enrichedOn: null }], ...over });
+    let n = 0;
+    const f = fakeService();
+    const r = setup(fakeRun({ status: () => withContacts(++n === 1 ? NO_TYPE : {}) }).run, { service: f.service });
+    await r.waitFor(() => expect(tags(r)).toEqual([['Company Type needed', 'warning']]));
+
+    expect(r.findAll(Checkbox)).toHaveLength(0);
+    expect(texts(r)).not.toContain('Enrich contacts you choose');
+    expect(texts(r)).not.toContain('Find people by job title');
+    expect(texts(r)).toContain('Pat Lee');
+
+    button(r, 'Refresh').trigger('onClick');
+
+    await r.waitFor(() => expect(texts(r)).toContain('Enrich contacts you choose'));
+    expect(texts(r)).toContain('Find people by job title');
+    expect(r.findAll(Checkbox)).toHaveLength(1);
   });
 });

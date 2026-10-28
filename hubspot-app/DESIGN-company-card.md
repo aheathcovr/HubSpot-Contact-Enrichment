@@ -58,7 +58,7 @@ set they answer 503.
 | `POST /app/company/add` | `{companyId, runId, candidateIds}` | 202 `{batchId, items, started, quota}` |
 
 Refusals: 400 for an ill-formed request, 404 for a company or search that is not there (or not this company's), 409
-when nothing could be started or the search is not finished, 410 for expired results, 429 when the cap would be
+when nothing could be started, the search is not finished, or (for a search) the company has no usable Company Type, 410 for expired results, 429 when the cap would be
 passed, 502 when HubSpot or the queue is down.
 
 ## Defaults chosen (easy to change)
@@ -79,6 +79,7 @@ passed, 502 when HubSpot or the queue is down.
 
 | What happened | What the rep sees |
 | --- | --- |
+| The company's Company Type is blank, or is not Facility or Corporation | The card says so and shows HubSpot's own editor for Company Type; the request and the contact tools wait until the rep sets it and presses Refresh. A request that slips through (a workflow, an import) gets a note asking for the type, no research, and its enrichment date is left alone |
 | The service is not set up (no secret) | "Picking contacts is not available" and the rest of the card works |
 | No FullEnrich key, or no credits | The search run fails with that reason in words |
 | Nobody found | "No one found for these titles at this company." |

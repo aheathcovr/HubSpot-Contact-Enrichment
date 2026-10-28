@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Accordion, Button, Checkbox, Divider, EmptyState, ErrorState, Flex, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
 import type { CrmContext, ExtensionPointApiActions, ServerlessRunnerParams } from '@hubspot/ui-extensions';
-import { COMPANY_TYPE_ID, FUNCTION_NAME, SENT_PROPERTIES, emailCheckTag, formatDay, groupContacts, messageOf, readResult, statusTag } from './model.ts';
+import { CrmPropertyList } from '@hubspot/ui-extensions/crm';
+import { COMPANY_TYPE_ID, COMPANY_TYPE_PROPERTY, FUNCTION_NAME, SENT_PROPERTIES, TYPE_NEEDED_TAG, emailCheckTag, formatDay, groupContacts, messageOf, readResult, statusTag } from './model.ts';
 import type { ContactRow, RequestResult, StatusResult } from './model.ts';
 import type { Service } from './contact-model.ts';
 import { PickPanel } from './PickPanel.tsx';
@@ -187,12 +188,14 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
   }
 
   const { company, canRequest, message, contacts, moreContacts, contactsError } = data;
-  const tag = statusTag(company);
+  // A company that is neither a facility nor a corporation is asked for its type first, ahead of anything else.
+  const needsType = data.reason === 'no_company_type';
+  const tag = needsType ? TYPE_NEEDED_TAG : statusTag(company);
   const { enriched, others } = groupContacts(contacts);
   const note = message ?? (company.lastEnrichedOn ? `Last enriched ${formatDay(company.lastEnrichedOn)}.` : 'No enrichment run on record for this company.');
   const names = Object.fromEntries(contacts.map((c) => [c.id, c.name]));
   const pickFor = (c: ContactRow): Pick | undefined =>
-    picker.enabled && picker.data
+    picker.enabled && picker.data && !needsType
       ? { checked: picker.picked.includes(c.id), readOnly: picker.atLimit && !picker.picked.includes(c.id), onChange: (checked) => picker.toggle(c.id, checked) }
       : undefined;
 
@@ -202,6 +205,7 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
         <Tag variant={tag.variant}>{tag.label}</Tag>
       </Flex>
       <Text>{note}</Text>
+      {needsType ? <CrmPropertyList properties={[COMPANY_TYPE_PROPERTY]} /> : null}
       {gaveUp && company.requested ? <Text>Still waiting for the run to finish. Press Refresh to check again.</Text> : null}
       <Button variant="primary" disabled={!canRequest || requesting} onClick={() => void request()}>
         {requesting ? 'Requesting' : 'Request enrichment'}
@@ -228,8 +232,8 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
         </Accordion>
       ) : null}
       {moreContacts ? <Text variant="microcopy">Showing the first 100 contacts. This company has more.</Text> : null}
-      {picker.enabled ? <PickPanel picker={picker} names={names} nowMs={now()} /> : null}
-      {picker.enabled && picker.data ? <TitlePanel data={picker.data} titles={titleSearch} /> : null}
+      {picker.enabled && !needsType ? <PickPanel picker={picker} names={names} nowMs={now()} /> : null}
+      {picker.enabled && picker.data && !needsType ? <TitlePanel data={picker.data} titles={titleSearch} /> : null}
       <Button size="xs" variant="secondary" disabled={refreshing} onClick={refresh}>
         {refreshing ? 'Refreshing' : 'Refresh'}
       </Button>
