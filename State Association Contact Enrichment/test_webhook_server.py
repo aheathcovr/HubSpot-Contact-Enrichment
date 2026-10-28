@@ -32,6 +32,7 @@ from google.api_core import exceptions as gexc
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import enrichment_claim
 import webhook_server
 
 _SECRET = "test-webhook-secret"
@@ -73,6 +74,12 @@ def _fresh_tasks_client():
     webhook_server._tasks_client = None
     yield
     webhook_server._tasks_client = None
+
+
+@pytest.fixture(autouse=True)
+def _memory_claims(monkeypatch):
+    """/enrich takes a claim on the company; the tests keep it in memory instead of Firestore."""
+    monkeypatch.setattr(enrichment_claim, "_store", enrichment_claim.MemoryClaimStore())
 
 
 @pytest.fixture
@@ -189,6 +196,75 @@ def test_enrich_rejects_a_company_id_that_is_not_digits(client, monkeypatch):
 
     assert response.status_code == 400
     assert ran == []
+
+
+def test_a_second_task_for_a_company_already_running_does_nothing(client, monkeypatch):
+    ran: list[str] = []
+    monkeypatch.setattr(webhook_server, "_verify_cloud_tasks_oidc", lambda request: True)
+    monkeypatch.setattr(webhook_server, "_run_enrichment_safe", ran.append)
+    enrichment_claim.get_claim_store().claim("12345", "task-a", webhook_server._utcnow())
+
+    response = client.post("/enrich", json={"company_id": "12345"}, headers={"X-CloudTasks-TaskName": "task-b"})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "skipped", "reason": "already_running", "company_id": "12345"}
+    assert ran == []
+
+
+def test_cloud_tasks_retrying_the_task_that_holds_the_company_is_let_back_in(client, monkeypatch):
+    ran: list[str] = []
+    monkeypatch.setattr(webhook_server, "_verify_cloud_tasks_oidc", lambda request: True)
+    monkeypatch.setattr(webhook_server, "_run_enrichment_safe", ran.append)
+    enrichment_claim.get_claim_store().claim("12345", "task-a", webhook_server._utcnow())
+
+    response = client.post("/enrich", json={"company_id": "12345"}, headers={"X-CloudTasks-TaskName": "task-a"})
+
+    assert response.json()["status"] == "done"
+    assert ran == ["12345"]
+
+
+def test_a_company_is_given_back_when_its_run_ends_so_the_next_trigger_can_run(client, monkeypatch):
+    ran: list[str] = []
+    monkeypatch.setattr(webhook_server, "_verify_cloud_tasks_oidc", lambda request: True)
+    monkeypatch.setattr(webhook_server, "_run_enrichment_safe", ran.append)
+
+    client.post("/enrich", json={"company_id": "12345"}, headers={"X-CloudTasks-TaskName": "task-a"})
+    client.post("/enrich", json={"company_id": "12345"}, headers={"X-CloudTasks-TaskName": "task-b"})
+
+    assert ran == ["12345", "12345"]
+
+
+def test_a_company_is_given_back_even_when_its_run_raises(client, monkeypatch):
+    def boom(company_id):
+        raise RuntimeError("the run died")
+
+    monkeypatch.setattr(webhook_server, "_verify_cloud_tasks_oidc", lambda request: True)
+    monkeypatch.setattr(webhook_server, "_run_enrichment_safe", boom)
+
+    with pytest.raises(RuntimeError):
+        client.post("/enrich", json={"company_id": "12345"}, headers={"X-CloudTasks-TaskName": "task-a"})
+
+    assert enrichment_claim.get_claim_store().claim("12345", "task-b", webhook_server._utcnow()) is True
+
+
+def test_enrichment_still_runs_when_the_claim_store_is_down(client, monkeypatch):
+    ran: list[str] = []
+
+    class Down:
+        def claim(self, *a):
+            raise RuntimeError("firestore unavailable")
+
+        def release(self, *a):
+            raise AssertionError("nothing was claimed, so nothing is released")
+
+    monkeypatch.setattr(webhook_server, "_verify_cloud_tasks_oidc", lambda request: True)
+    monkeypatch.setattr(webhook_server, "_run_enrichment_safe", ran.append)
+    monkeypatch.setattr(enrichment_claim, "_store", Down())
+
+    response = client.post("/enrich", json={"company_id": "12345"})
+
+    assert response.json()["status"] == "done"
+    assert ran == ["12345"]
 
 
 # ── OIDC token check ──────────────────────────────────────────────────────────
