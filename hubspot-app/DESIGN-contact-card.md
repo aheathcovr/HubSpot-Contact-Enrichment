@@ -150,8 +150,9 @@ both take the last place. `setup_firestore.sh` gains the two TTL policies (dry r
    answer 503.
 3. Apply `setup_firestore.sh` for the TTL policies.
 4. Deploy a build from main and move traffic to it. The new endpoints exist only in a build that has this code.
-5. Upload the app, after `hs secret add`, with approval; add the card to contact records, and check it read only on one
-   test contact.
+5. Upload the app, after `hs secret add`, with approval, through `scripts/stage-upload.mjs` (see "Ship it" in
+   `README.md`); install it with `hs project install-app`; add the card to contact records on a view for a few people,
+   and check it read only on one test contact.
 
 ## Tests
 
