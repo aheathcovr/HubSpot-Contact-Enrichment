@@ -47,6 +47,7 @@ import app_run_store
 import company_titles
 import enrichment_claim
 import contact_objectives
+import run_trail
 import app_request_auth
 from hubspot_client import HubSpotError
 
@@ -769,16 +770,21 @@ def _execute_app_run(run_id: str) -> str:
         return "skipped"
     run = store.get_run(run_id)
     requested_by = run.get("requested_by") or f"HubSpot user {run.get('requested_by_id', '')}"
-    try:
-        if run["objective"] == company_titles.FIND_OBJECTIVE:
-            outcome = company_titles.run_find_by_title(run, hs=_hubspot(), store=store, now=_utcnow())
-        elif run["objective"] == company_titles.ADD_OBJECTIVE:
-            outcome = company_titles.run_add_candidate(run, hs=_hubspot(), store=store)
-        else:
-            outcome = contact_objectives.run_objective(run["objective"], run["contact_id"], hs=_hubspot(), requested_by=requested_by)
-    except Exception:
-        logger.exception(f"App run {run_id} crashed")
-        outcome = contact_objectives.Outcome("failed", "error", "Something went wrong. Nothing was changed. Try again.")
+    # What the vendors say back is stored on the run as it comes (run_trail.py), so a card that asks again a moment
+    # later sees it. A step that cannot be stored is skipped; it never fails the run.
+    with run_trail.recording(lambda step: store.append_step(run_id, step)):
+        try:
+            if run["objective"] == company_titles.FIND_OBJECTIVE:
+                outcome = company_titles.run_find_by_title(run, hs=_hubspot(), store=store, now=_utcnow())
+            elif run["objective"] == company_titles.ADD_OBJECTIVE:
+                outcome = company_titles.run_add_candidate(run, hs=_hubspot(), store=store)
+            else:
+                outcome = contact_objectives.run_objective(run["objective"], run["contact_id"], hs=_hubspot(), requested_by=requested_by)
+        except Exception:
+            logger.exception(f"App run {run_id} crashed")
+            # Where it stopped, and nothing of the error: its text can carry an address or a name.
+            run_trail.note("service", "The run stopped on an unexpected error. Nothing was changed.", "failed")
+            outcome = contact_objectives.Outcome("failed", "error", "Something went wrong. Nothing was changed. Try again.")
     store.finish_run(run_id, _utcnow(), status=outcome.status, outcome=outcome.outcome, message=outcome.message, wrote=outcome.wrote,
                      contact_id=outcome.contact_id or None)
     logger.info(f"App run {run_id} ({run['objective']}) ended {outcome.status}/{outcome.outcome}")

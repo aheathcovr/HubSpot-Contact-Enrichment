@@ -30,6 +30,7 @@ from email_verifier import verify_email_millionverifier
 from fullenrich_client import enrich_contact_info
 from hubspot_client import HubSpotError
 from identity_gate import bare_domain
+import run_trail
 from seamless_client import lookup_person as seamless_lookup
 
 logger = logging.getLogger(__name__)
@@ -228,12 +229,19 @@ def _note(hs, contact_id: str, objective: str, requested_by: str, lines: list[st
         logger.warning("Could not save the note for the %s run on contact %s: %s", objective, contact_id, exc)
 
 
+def _unanswered(vendor: str) -> int:
+    """How often this run could not ask a vendor: the call failed, or the vendor is not set up or is paused."""
+    return run_trail.count("failed", vendor) + run_trail.count("skipped", vendor)
+
+
 def _needs(contact: dict, hs, contact_id: str) -> "tuple[Optional[Outcome], Optional[_Company]]":
     """For a run that looks someone up: a skip if the contact cannot be looked up, else the company to check against."""
     if not _has_name(contact):
+        run_trail.note("service", "Not looked up: this contact needs a first and last name.", "skipped")
         return Outcome("done", "skipped", _NEEDS_A_NAME), None
     company = _company(hs, contact_id)
     if company is None:
+        run_trail.note("service", "Not looked up: this contact is not linked to a company, so there is nobody to check an answer against.", "skipped")
         return Outcome("done", "skipped", "This contact is not linked to a company, so there is nobody to check an answer against."), None
     return None, company
 
@@ -242,11 +250,13 @@ def _needs(contact: dict, hs, contact_id: str) -> "tuple[Optional[Outcome], Opti
 
 def _find_email(hs, contact_id: str, contact: dict, requested_by: str) -> Outcome:
     if contact.get("email"):
+        run_trail.note("service", "Already has an email, so nothing was looked up.", "skipped")
         return Outcome("done", "skipped", "Already has an email. Nothing was looked up.")
     skip, company = _needs(contact, hs, contact_id)
     if skip:
         return skip
     first, last = contact["firstname"], contact["lastname"]
+    run_trail.note("service", f"Looking for an email for this contact at {company.name}{f' ({company.domain})' if company.domain else ''}.")
     lines: list[str] = []
     held = invalid = moved = False
 
@@ -257,26 +267,33 @@ def _find_email(hs, contact_id: str, contact: dict, requested_by: str) -> Outcom
             return None
         if not _belongs(email, company.domain, company.name, company.operator):
             held = True
+            run_trail.note("service", f"An address from {source} is not at the facility's or its operator's domain, so it was held (see the note on the contact).")
             lines.append(f"<b>Held, not added:</b> {source} found {_esc(email)}, which is not at this facility's or its operator's domain.<br>")
             return None
         ev = verify_email_millionverifier(email)
         if ev.get("status") == "INVALID":
             invalid = True
+            run_trail.note("service", f"The address {source} found failed the check, so it was not added.")
             lines.append(f"<b>Not added:</b> {source} found {_esc(email)} but MillionVerifier says it is invalid.<br>")
             return None
         props = {"email": email, **_verification_props(ev)}
         refused = _write_blank(hs, contact_id, "email", props, "HubSpot would not save it. Another contact may already have this address.")
         if refused is not None:
+            run_trail.note("hubspot", "HubSpot would not save the address. Another contact may already have it.", "failed")
             lines.append(f"<b>Not added:</b> {source} found {_esc(email)} but HubSpot would not save it.<br>")
             return refused
+        run_trail.note("hubspot", "Added the email to the contact.", "ok")
         lines.append(f"<b>Email added:</b> {_esc(email)} (from {source}; MillionVerifier says {_esc(_phrase(ev.get('result', '')))}).<br>")
         checked = f"MillionVerifier says it is {_phrase(ev.get('result', ''))}." if props.keys() - {"email"} else "It could not be checked."
         return Outcome("done", "found", f"Email added. {checked}", list(props))
 
     fe = enrich_contact_info(first, last, company_name=company.name, domain=company.domain, linkedin_url=contact.get("hs_linkedin_url", "")) or {}
+    fe_unasked = _unanswered("fullenrich") > 0
     result = consider("FullEnrich", (fe.get("email") or "").strip())
+    sl_unasked = False
     if result is None:
         sl = seamless_lookup(first, last, domain=company.domain, company=company.name, operator_name=company.operator, title=contact.get("jobtitle", ""))
+        sl_unasked = _unanswered("seamless") > 0
         if sl and sl.get("moved"):
             moved = True
             lines.append(f"<b>Seamless:</b> shows this person at {_esc(sl.get('company') or 'another organization')}. Nothing was used.<br>")
@@ -289,6 +306,13 @@ def _find_email(hs, contact_id: str, contact: dict, requested_by: str) -> Outcom
             result = Outcome("done", "not_written", "Found an email, but it checked as invalid, so it was not added.")
         elif moved:
             result = Outcome("done", "moved", "Seamless shows this person at another organization, so nothing was used. The note on this contact says where.")
+        elif fe_unasked and sl_unasked:
+            # Neither vendor was asked, so this is not a finding: nothing is written, not even a note saying nothing was found.
+            return Outcome("failed", "error", "FullEnrich and Seamless could not be asked, so nothing was looked up. See What happened. Try again later.")
+        elif fe_unasked or sl_unasked:
+            answered, unasked = ("Seamless", "FullEnrich") if fe_unasked else ("FullEnrich", "Seamless")
+            lines.append(f"<b>No email found.</b> {answered} had nothing usable. {unasked} could not be asked.<br>")
+            result = Outcome("done", "not_found", f"No email found. {answered} had nothing usable. {unasked} could not be asked: see What happened.")
         else:
             lines.append("<b>No email found.</b> FullEnrich and Seamless had nothing usable.<br>")
             result = Outcome("done", "not_found", "No email found. FullEnrich and Seamless had nothing usable.")
@@ -299,13 +323,18 @@ def _find_email(hs, contact_id: str, contact: dict, requested_by: str) -> Outcom
 
 def _find_mobile(hs, contact_id: str, contact: dict, requested_by: str) -> Outcome:
     if contact.get("mobilephone"):
+        run_trail.note("service", "Already has a mobile number, so nothing was looked up.", "skipped")
         return Outcome("done", "skipped", "Already has a mobile number. Nothing was looked up.")
     skip, company = _needs(contact, hs, contact_id)
     if skip:
         return skip
+    run_trail.note("service", f"Looking for a mobile number for this contact at {company.name}{f' ({company.domain})' if company.domain else ''}.")
     sl = seamless_lookup(contact["firstname"], contact["lastname"], domain=company.domain, company=company.name,
                          operator_name=company.operator, title=contact.get("jobtitle", ""))
     lines: list[str] = []
+    if not sl and _unanswered("seamless"):
+        # Seamless was not asked, so "no number" would be a finding nobody made. Nothing is written.
+        return Outcome("failed", "error", "Seamless could not be asked: see What happened. Try again later.")
     if not sl:
         lines.append("<b>No number.</b> Seamless could not be asked, or had nothing for this person.<br>")
         result = Outcome("done", "not_found", "Seamless could not be asked, or had nothing for this person.")
@@ -320,9 +349,11 @@ def _find_mobile(hs, contact_id: str, contact: dict, requested_by: str) -> Outco
                 lines.append(f"<b>Not added:</b> Seamless found {_esc(sl['phone'])} but HubSpot would not save it.<br>")
                 result = refused
             else:
+                run_trail.note("hubspot", "Added the mobile number to the contact.", "ok")
                 lines.append(f"<b>Mobile added:</b> {_esc(sl['phone'])} (from Seamless, confidence {_esc(sl.get('phone_confidence') or 'not given')}).<br>")
                 result = Outcome("done", "found", "Mobile number added.", ["mobilephone"])
         else:
+            run_trail.note("service", f"Seamless found a {kind or 'direct'} line, not a mobile, so it was not added.")
             lines.append(f"<b>Not added:</b> Seamless found {_esc(sl['phone'])}, a {_esc(kind or 'direct')} line, not a mobile.<br>")
             result = Outcome("done", "not_written", f"Seamless found a {kind or 'direct'} line, not a mobile, so nothing was added. The note on this contact has it.")
     elif sl.get("phone_rejected") and sl["phone_rejected"] != "no phone returned":
@@ -339,7 +370,9 @@ def _find_mobile(hs, contact_id: str, contact: dict, requested_by: str) -> Outco
 def _verify_email(hs, contact_id: str, contact: dict, requested_by: str) -> Outcome:
     email = contact.get("email", "")
     if not email:
+        run_trail.note("service", "No email on the contact, so nothing was checked.", "skipped")
         return Outcome("done", "skipped", "No email to check.")
+    run_trail.note("service", "Checking the email on file.")
     ev = verify_email_millionverifier(email)
     props = _verification_props(ev)
     if not props:
@@ -349,6 +382,7 @@ def _verify_email(hs, contact_id: str, contact: dict, requested_by: str) -> Outc
     except HubSpotError as exc:
         logger.warning("HubSpot would not save the check on contact %s: %s", contact_id, exc)
         return Outcome("failed", "error", "The email was checked, but HubSpot would not save the answer. Try again later.")
+    run_trail.note("hubspot", "Saved the check on the contact.", "ok")
     phrase = _phrase(ev.get("result", ""))
     _note(hs, contact_id, "verify_email", requested_by, [f"<b>Checked:</b> {_esc(email)} is {_esc(phrase)} (MillionVerifier: {_esc(ev.get('result', ''))}).<br>"])
     return Outcome("done", "verified", f"Checked: the email is {phrase}.", list(props))

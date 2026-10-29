@@ -55,7 +55,7 @@ card -- hubspot.serverless --> service function (adds who is asking from HubSpot
          service function -- https --> GET  /app/contact/status?contactId=...   what the contact has, quota, recent runs
          service function -- https --> POST /app/contact/run                    accepts a run, queues a Cloud Task
 Cloud Tasks (Google-signed) ---------> POST /app/run                           does the work, updates the run record
-card polls /app/contact/status every 5 s while a run is queued or running
+card polls /app/contact/status every 2 s while a run is queued or running (it brings the steps done so far)
 ```
 
 A run takes from a few seconds to over a minute, and HubSpot cuts a fetch off at 15 seconds by default and retries a
@@ -129,11 +129,34 @@ Firestore collection `app_runs` (ids, statuses, short messages, `expire_at` 30 d
 (`<day>_<userId>` counters, `expire_at` 2 days out). The cap is taken in a transaction, so two requests at once cannot
 both take the last place. `setup_firestore.sh` gains the two TTL policies (dry run by default; not applied).
 
+## What a run shows: the trail
+
+Every run keeps a step-by-step trail of what it did and what each vendor said back (`run_trail.py`; `steps` on the run
+as the card receives it). The vendor clients note a step where a vendor answers: a search that returned 3 people, a
+credit balance, a result word from MillionVerifier, a rejected key, the reason a person was not used (no location on
+their profile, listed in another state, an IT role). While a run is being done each step is saved on the run record at
+once, so the card, asking again every 2 seconds, shows it within moments: a spinner with the newest step and the seconds
+since the rep asked while the run is going, and a "What happened (N steps, T s)" section (open while going, closed after)
+listing every step with its vendor, how it went (green answer, red failure, amber not asked, grey nothing) and how long
+after the start it happened.
+
+- **Nothing personal.** A step holds counts, statuses, titles searched, company names and reasons, never an email
+  address, a phone number or a person's name (the values stay in the note on the HubSpot contact). A filter hides anything
+  shaped like an address or a number as a second line of defence. At most 30 steps of 160 characters a run, kept 30 days
+  with the run.
+- **Failed is not empty.** A lookup that could not be done (a rejected key, no credits, a vendor that was down, a vendor
+  that is not set up or is paused) is not a finding. A title search that found nobody and could not be done ends
+  `failed` and keeps no results; one that found people and could not search a title says so beside them. Find email where
+  neither vendor could be asked ends `failed` and writes nothing; where one could not be asked, the message says which.
+  Find mobile where Seamless could not be asked ends `failed`. A clean empty answer is still "nothing found".
+- **Outside a run nothing is recorded.** The company workflows and webhooks call the same vendor code and are unchanged.
+- **Recording never breaks a run.** A step that cannot be saved is logged and skipped.
+
 ## When it goes wrong
 
 | What | What the rep sees |
 | --- | --- |
-| Vendor key missing or vendor down | Run ends `error` with a plain message; the cap place is kept (the call was made) |
+| Vendor key missing or vendor down | A lookup where no vendor could be asked ends `error` ("could not be asked ... see What happened") and writes nothing; if only one could not be asked, the not-found message says which. The cap place is kept (the call was made) |
 | Contact has no name, or is linked to no company | The objective is shown as unavailable with the reason; a run that finds this late ends `skipped` |
 | Cloud Tasks cannot be reached | 502, the place in the cap is given back, no run record is left running |
 | Task delivered twice | The second delivery sees the run already claimed and does nothing |

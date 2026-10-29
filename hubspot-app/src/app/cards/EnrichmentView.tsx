@@ -6,6 +6,7 @@ import type { CrmContext, ExtensionPointApiActions, ServerlessRunnerParams } fro
 import { CrmPropertyList } from '@hubspot/ui-extensions/crm';
 import { COMPANY_TYPE_ID, COMPANY_TYPE_PROPERTY, FUNCTION_NAME, SENT_PROPERTIES, TYPE_NEEDED_TAG, emailCheckTag, formatDay, groupContacts, messageOf, readResult, statusTag } from './model.ts';
 import type { ContactRow, RequestResult, StatusResult } from './model.ts';
+import { RUN_MAX_POLLS, RUN_POLL_EVERY_MS } from './contact-model.ts';
 import type { Service } from './contact-model.ts';
 import { PickPanel } from './PickPanel.tsx';
 import { TitlePanel } from './TitlePanel.tsx';
@@ -62,7 +63,7 @@ function ContactBlock({ contact, pick }: { contact: ContactRow; pick?: Pick }) {
   );
 }
 
-export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, maxPolls = 60, service, runPollEveryMs = 5000, runMaxPolls = 36, now = Date.now }: EnrichmentViewProps) {
+export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, maxPolls = 60, service, runPollEveryMs = RUN_POLL_EVERY_MS, runMaxPolls = RUN_MAX_POLLS, now = Date.now }: EnrichmentViewProps) {
   const objectId = String(context.crm.objectId);
   const objectTypeId = context.crm.objectTypeId;
   const isCompany = objectTypeId === COMPANY_TYPE_ID;
@@ -194,6 +195,8 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
   const { enriched, others } = groupContacts(contacts);
   const note = message ?? (company.lastEnrichedOn ? `Last enriched ${formatDay(company.lastEnrichedOn)}.` : 'No enrichment run on record for this company.');
   const names = Object.fromEntries(contacts.map((c) => [c.id, c.name]));
+  // The title panel shows the steps of the search it is showing and of the adds from it, so the recent runs leave those out.
+  const shownInTitlePanel = titleSearch.search ? [titleSearch.search.runId, ...titleSearch.search.candidates.flatMap((c) => (c.added ? [c.added.runId] : []))] : [];
   const pickFor = (c: ContactRow): Pick | undefined =>
     picker.enabled && picker.data && !needsType
       ? { checked: picker.picked.includes(c.id), readOnly: picker.atLimit && !picker.picked.includes(c.id), onChange: (checked) => picker.toggle(c.id, checked) }
@@ -232,8 +235,8 @@ export function EnrichmentView({ context, actions, run, pollEveryMs = 10000, max
         </Accordion>
       ) : null}
       {moreContacts ? <Text variant="microcopy">Showing the first 100 contacts. This company has more.</Text> : null}
-      {picker.enabled && !needsType ? <PickPanel picker={picker} names={names} nowMs={now()} /> : null}
-      {picker.enabled && picker.data && !needsType ? <TitlePanel data={picker.data} titles={titleSearch} /> : null}
+      {picker.enabled && !needsType ? <PickPanel picker={picker} names={names} nowMs={now()} shownElsewhere={shownInTitlePanel} /> : null}
+      {picker.enabled && picker.data && !needsType ? <TitlePanel data={picker.data} titles={titleSearch} nowMs={now()} /> : null}
       <Button size="xs" variant="secondary" disabled={refreshing} onClick={refresh}>
         {refreshing ? 'Refreshing' : 'Refresh'}
       </Button>

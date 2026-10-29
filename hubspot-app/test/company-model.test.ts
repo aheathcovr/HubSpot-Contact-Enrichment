@@ -166,7 +166,7 @@ describe('job titles', () => {
 const find = (reused: boolean): FindResult => ({
   ok: true,
   reused,
-  run: { runId: 'f'.repeat(32), contactId: '', objective: 'find_by_title', status: 'queued', outcome: null, message: null, wrote: [], requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: '500', batchId: null },
+  run: { runId: 'f'.repeat(32), contactId: '', objective: 'find_by_title', status: 'queued', outcome: null, message: null, wrote: [], requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: '500', batchId: null, steps: [] },
   quota: { cap: 25, used: 4, remaining: 21 },
 });
 

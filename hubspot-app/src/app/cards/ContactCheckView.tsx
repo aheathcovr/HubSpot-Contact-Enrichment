@@ -6,6 +6,8 @@ import type { CrmContext, ExtensionPointApiActions } from '@hubspot/ui-extension
 import { emailCheckTag, formatDay, messageOf } from './model.ts';
 import {
   CONTACT_TYPE_ID,
+  RUN_MAX_POLLS,
+  RUN_POLL_EVERY_MS,
   ServiceError,
   agoText,
   objectiveLabel,
@@ -14,13 +16,15 @@ import {
   runTag,
 } from './contact-model.ts';
 import type { ContactInfo, ContactStatus, ObjectiveId, RunView, Service, StartResult } from './contact-model.ts';
+import { RunDetails } from './RunDetails.tsx';
 
 export interface ContactCheckViewProps {
   context: CrmContext;
   actions: ExtensionPointApiActions<'crm.record.sidebar'>;
   service: Service;
   // While a run is going the card asks for the status again this often (milliseconds; 0 turns it off), and gives up
-  // after maxPolls asks. A run takes from a few seconds to a couple of minutes.
+  // after maxPolls asks. A run takes from a few seconds to a couple of minutes, and each ask brings the steps it has done
+  // so far, so two seconds keeps what the card shows close to what the service is doing (three minutes in all).
   pollEveryMs?: number;
   maxPolls?: number;
   now?: () => number;
@@ -37,6 +41,7 @@ function RunBlock({ run, nowMs }: { run: RunView; nowMs: number }) {
         <Text format={{ fontWeight: 'bold' }}>{objectiveLabel(run.objective)}</Text>
       </Flex>
       {run.message ? <Text>{run.message}</Text> : null}
+      <RunDetails run={run} nowMs={nowMs} />
       <Text variant="microcopy">{`Asked by ${run.requestedBy}, ${agoText(run.createdAt, nowMs)}`}</Text>
     </Flex>
   );
@@ -62,7 +67,7 @@ function ContactBlock({ contact }: { contact: ContactInfo }) {
   );
 }
 
-export function ContactCheckView({ context, actions, service, pollEveryMs = 5000, maxPolls = 36, now = Date.now }: ContactCheckViewProps) {
+export function ContactCheckView({ context, actions, service, pollEveryMs = RUN_POLL_EVERY_MS, maxPolls = RUN_MAX_POLLS, now = Date.now }: ContactCheckViewProps) {
   const contactId = String(context.crm.objectId);
   const isContact = context.crm.objectTypeId === CONTACT_TYPE_ID;
 

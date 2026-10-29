@@ -45,6 +45,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import bounceban_client
+import run_trail
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,16 @@ def _report_account_state(data: dict) -> None:
         )
 
 
+# What each result word means to a rep, and whether it settles anything (run_trail.py says what a step's result is).
+_SAYS = {
+    "ok":         ("the address is deliverable", "ok"),
+    "invalid":    ("the address is not deliverable", "ok"),
+    "disposable": ("the address is a disposable one", "ok"),
+    "catch_all":  ("the domain accepts every address (catch-all), so the check proves nothing", "info"),
+    "unknown":    ("the mail server would not answer", "info"),
+}
+
+
 def verify_email_millionverifier(email: str) -> dict:
     """
     Validate *email* against the MillionVerifier API.
@@ -154,6 +165,7 @@ def verify_email_millionverifier(email: str) -> dict:
     api_key = os.getenv("MILLIONVERIFIER_API_KEY", "").strip()
     if not api_key:
         logger.debug("MILLIONVERIFIER_API_KEY not set — skipping email validation")
+        run_trail.note("millionverifier", "MillionVerifier is not set up on the service, so the address was not checked.", "skipped")
         return dict(_UNVERIFIED)
 
     if not email or "@" not in email:
@@ -169,11 +181,13 @@ def verify_email_millionverifier(email: str) -> dict:
         data = resp.json()
     except Exception as exc:
         logger.warning("MillionVerifier request failed for %r: %s", email, exc)
+        run_trail.note("millionverifier", f"MillionVerifier could not be reached: {run_trail.why(exc)}.", "failed")
         return dict(_ERROR)
 
     # An account-level refusal arrives as HTTP 200 with an empty result.
     if data.get("error"):
         logger.warning("MillionVerifier refused %r: %s", email, data["error"])
+        run_trail.note("millionverifier", f"MillionVerifier refused the check: {data['error']}.", "failed")
         return dict(_ERROR)
 
     mv_result  = str(data.get("result",  "")).lower()
@@ -196,6 +210,12 @@ def verify_email_millionverifier(email: str) -> dict:
         "role":       bool(data.get("role", False)),
         "didyoumean": str(data.get("didyoumean", "") or ""),
     }
+
+    says, settled = _SAYS.get(mv_result, ("it could not verify the address", "info"))
+    detail = f" ({out['subresult'].replace('_', ' ')})" if out["subresult"] else ""
+    credits = data.get("credits")
+    left = f" {credits:,.0f} credits left." if isinstance(credits, (int, float)) and not isinstance(credits, bool) else ""
+    run_trail.note("millionverifier", f"MillionVerifier says {says}{detail}.{left}", settled)
 
     if mv_result in _UNSETTLED:
         second = bounceban_client.second_opinion(email)

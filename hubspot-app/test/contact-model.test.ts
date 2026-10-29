@@ -4,11 +4,20 @@ import {
   SERVICE_FUNCTION,
   ServiceError,
   agoText,
+  elapsedText,
+  liveText,
   makeService,
   objectiveLabel,
+  RUN_MAX_POLLS,
+  RUN_POLL_EVERY_MS,
   readReply,
   runIsOpen,
   runTag,
+  stepVariant,
+  stepsOf,
+  stepsTitle,
+  vendorLabel,
+  type RunStep,
   type RunView,
 } from '../src/app/cards/contact-model.ts';
 
@@ -25,8 +34,11 @@ const run = (over: Partial<RunView> = {}): RunView => ({
   finishedAt: '2026-10-26T16:00:09Z',
   companyId: null,
   batchId: null,
+  steps: [],
   ...over,
 });
+
+const step = (over: Partial<RunStep> = {}): RunStep => ({ at: '2026-10-26T16:00:02.000Z', vendor: 'fullenrich', result: 'ok', text: 'Searched FullEnrich: 3 people.', ...over });
 
 describe('where the card calls', () => {
   it('is the app function that carries its requests to the service', () => {
@@ -256,5 +268,88 @@ describe('calling the service', () => {
     const service = makeService((async () => { throw new Error('Function execution timed out'); }) as never);
 
     await expect(service('GET', '/x')).rejects.toThrow('Function execution timed out');
+  });
+});
+
+
+describe('the trail of a run', () => {
+  it.each([
+    ['fullenrich', 'FullEnrich'],
+    ['seamless', 'Seamless'],
+    ['millionverifier', 'MillionVerifier'],
+    ['bounceban', 'BounceBan'],
+    ['hubspot', 'HubSpot'],
+    ['service', 'Service'],
+  ])('names %s as %s', (vendor, label) => {
+    expect(vendorLabel(vendor)).toBe(label);
+  });
+
+  it('shows a vendor it has no name for as the service sent it', () => {
+    expect(vendorLabel('somenewvendor')).toBe('somenewvendor');
+  });
+
+  it.each([
+    ['ok', 'success'],
+    ['failed', 'error'],
+    ['skipped', 'warning'],
+    ['empty', 'default'],
+    ['info', 'default'],
+  ] as const)('colours a step that is %s as %s', (result, variant) => {
+    expect(stepVariant(result)).toBe(variant);
+  });
+
+  it('says how long after a moment another happened, in seconds and then minutes', () => {
+    expect(elapsedText('2026-10-26T16:00:00Z', '2026-10-26T16:00:00.900Z')).toBe('0 s');
+    expect(elapsedText('2026-10-26T16:00:00Z', '2026-10-26T16:00:14.250Z')).toBe('14 s');
+    expect(elapsedText('2026-10-26T16:00:00Z', '2026-10-26T16:01:05Z')).toBe('1 min 5 s');
+    expect(elapsedText('2026-10-26T16:00:00Z', Date.parse('2026-10-26T16:00:04Z'))).toBe('4 s');
+  });
+
+  it('never says a negative time, and says nothing for a time it cannot read', () => {
+    expect(elapsedText('2026-10-26T16:00:10Z', '2026-10-26T16:00:00Z')).toBe('0 s');
+    expect(elapsedText('not a time', '2026-10-26T16:00:00Z')).toBe('');
+    expect(elapsedText('2026-10-26T16:00:00Z', 'not a time')).toBe('');
+  });
+
+  it('treats a run that came with no steps (an older service) as having none', () => {
+    expect(stepsOf(run({ steps: undefined as never }))).toEqual([]);
+    expect(stepsOf(run({ steps: [step()] }))).toHaveLength(1);
+  });
+
+  it('says what a run is doing now from its newest step and how long it has been going', () => {
+    const going = run({ status: 'running', outcome: null, finishedAt: null, steps: [step({ text: 'Asked FullEnrich.' }), step({ text: 'Waiting for FullEnrich to finish the lookup (usually under a minute).' })] });
+
+    expect(liveText(going, Date.parse('2026-10-26T16:00:14Z'))).toBe('Waiting for FullEnrich to finish the lookup (usually under a minute) · 14 s');
+  });
+
+  it('says a run that has done nothing yet is waiting, or is starting', () => {
+    const at = Date.parse('2026-10-26T16:00:04Z');
+
+    expect(liveText(run({ status: 'queued', steps: [] }), at)).toBe('Waiting for the service to pick this up · 4 s');
+    expect(liveText(run({ status: 'running', steps: [] }), at)).toBe('Working on it · 4 s');
+  });
+
+  it('titles the steps of a finished run with how many there were and how long it took', () => {
+    const done = run({ steps: [step(), step(), step()], finishedAt: '2026-10-26T16:00:09Z' });
+
+    expect(stepsTitle(done)).toBe('What happened (3 steps, 9 s)');
+    expect(stepsTitle(run({ steps: [step()] }))).toBe('What happened (1 step, 9 s)');
+    expect(stepsTitle(run({ steps: [step()], finishedAt: null }))).toBe('What happened (1 step)');
+  });
+
+  it('titles the steps of a run that is still going as so far', () => {
+    expect(stepsTitle(run({ status: 'running', finishedAt: null, steps: [step(), step()] }))).toBe('What is happening (2 steps so far)');
+    expect(stepsTitle(run({ status: 'queued', finishedAt: null, steps: [] }))).toBe('What is happening (0 steps so far)');
+  });
+});
+
+
+describe('how closely the cards follow a run', () => {
+  it('asks every two seconds, so what the card shows is never far behind what the service is doing', () => {
+    expect(RUN_POLL_EVERY_MS).toBe(2000);
+  });
+
+  it('keeps asking for at least three minutes, as long as the cards always did before giving up', () => {
+    expect(RUN_POLL_EVERY_MS * RUN_MAX_POLLS).toBeGreaterThanOrEqual(180_000);
   });
 });

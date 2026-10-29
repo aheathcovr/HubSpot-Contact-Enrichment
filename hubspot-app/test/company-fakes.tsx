@@ -36,7 +36,7 @@ export const quota = (remaining = 22, cap = 25): Quota => ({ cap, used: cap - re
 
 export const run = (over: Partial<RunView> = {}): RunView => ({
   runId: 'a'.repeat(32), contactId: '1', objective: 'find_email', status: 'queued', outcome: null, message: null, wrote: [],
-  requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: COMPANY_ID, batchId: 'b'.repeat(32), ...over,
+  requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: COMPANY_ID, batchId: 'b'.repeat(32), steps: [], ...over,
 });
 
 export const serviceStatus = (over: Partial<CompanyStatus> = {}): CompanyStatus => ({

@@ -38,8 +38,8 @@ entry per build.
   asking from HubSpot's own context, forwards only the seven requests the cards make, and signs each with a secret it
   shares with the service; the service (`app_request_auth.py`, `contact_objectives.py`, `app_run_store.py` and the
   `/app` routes in `webhook_server.py`) checks the signature, takes a place in the rep's daily cap, queues a Cloud
-  Task and answers at once. The card then asks for the status every 5 seconds while a run is going, for up to
-  3 minutes. The service does the looking and the writing with its own HubSpot token, under the company runs' rules:
+  Task and answers at once. The card then asks for the status every 2 seconds while a run is going, for up to
+  3 minutes, and shows the steps the run has done so far (what each vendor said back). The service does the looking and the writing with its own HubSpot token, under the company runs' rules:
   fill blanks only, never delete, no invalid email, a mobile only if Seamless says it is one. The app itself writes
   nothing for this card.
 - **The Enrichment card's picking and title search** call the enrichment service through the same function, like the

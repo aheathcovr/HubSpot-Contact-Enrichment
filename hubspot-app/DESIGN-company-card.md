@@ -75,6 +75,13 @@ passed, 502 when HubSpot or the queue is down.
   short messages only (no names, emails or numbers), for 30 days.
 - **The card brings back** the newest search made in the last 24 hours that did not fail, when it is opened again.
 
+## What a run shows
+
+Every run, on this card and the contact card, keeps a trail of steps (what each vendor said back) that the card shows live and
+afterwards; see "What a run shows: the trail" in DESIGN-contact-card.md. On this card the title search's steps sit with the
+search, each added person's with that person, and the recent runs show the rest (so no run is shown twice). The card asks again
+every 2 seconds, for up to 3 minutes.
+
 ## When something goes wrong
 
 | What happened | What the rep sees |
@@ -82,7 +89,8 @@ passed, 502 when HubSpot or the queue is down.
 | The company's Company Type is blank, or is not Facility or Corporation | The card says so and shows HubSpot's own editor for Company Type; the request and the contact tools wait until the rep sets it and presses Refresh. A request that slips through (a workflow, an import) gets a note asking for the type, no research, and its enrichment date is left alone |
 | The service is not set up (no secret) | "Picking contacts is not available" and the rest of the card works |
 | No FullEnrich key, or no credits | The search run fails with that reason in words |
-| Nobody found | "No one found for these titles at this company." |
+| A search that could not be done (a rejected key, a vendor that was down) and found nobody | The run is failed: "FullEnrich could not be searched, so this is not a finding that no one is there: see What happened." Nothing is kept. One that found people but could not search a title says "Part of the search could not be done" beside them |
+| Nobody found | "No one found for these titles at this company.", with the searches made and why each person who came back was not used under "What happened" |
 | The results expired | "Those search results are no longer available. Search again." |
 | The cap would be passed | "This needs N runs and you have M left today." and nothing starts |
 | A person in a request is not in the results, or a contact is not on the company | Skipped, named, with the reason |
