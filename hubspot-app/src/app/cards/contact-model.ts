@@ -37,6 +37,29 @@ export interface Quota {
   remaining: number;
 }
 
+// How one step of a run went (run_trail.RESULTS in the service): ok and empty are answers, failed is a call that could not
+// be made or did not work, skipped is a vendor that was not asked, info is neither.
+export type StepResult = 'ok' | 'empty' | 'failed' | 'skipped' | 'info';
+
+// One thing a run did and what came back, as the service wrote it (app_run_store.STEP_FIELDS). It holds counts, statuses
+// and reasons, never an email address, a phone number or a name.
+export interface RunStep {
+  at: string;
+  vendor: string;
+  result: StepResult;
+  text: string;
+}
+
+// The vendors a step can name (run_trail.VENDORS in the service), as people say them.
+export const VENDOR_LABELS: Record<string, string> = {
+  fullenrich: 'FullEnrich',
+  seamless: 'Seamless',
+  millionverifier: 'MillionVerifier',
+  bounceban: 'BounceBan',
+  hubspot: 'HubSpot',
+  service: 'Service',
+};
+
 export interface RunView {
   runId: string;
   contactId: string;
@@ -51,6 +74,8 @@ export interface RunView {
   // Set for a run started from a company card; the contact card's own runs have neither.
   companyId: string | null;
   batchId: string | null;
+  // What the run has done so far, oldest first. It grows while the run is going.
+  steps: RunStep[];
 }
 
 export interface ContactStatus {
@@ -179,4 +204,47 @@ export function agoText(iso: string | null, nowMs: number): string {
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min ago`;
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} h ago`;
   return day;
+}
+
+// How closely the cards follow a run: they ask the service for the run again this often while it is going, and give up
+// after this many asks (three minutes in all). Each ask brings the steps the run has done so far.
+export const RUN_POLL_EVERY_MS = 2000;
+export const RUN_MAX_POLLS = 90;
+
+export const vendorLabel = (vendor: string): string => VENDOR_LABELS[vendor] ?? vendor;
+
+export function stepVariant(result: StepResult): TagVariant {
+  if (result === 'ok') return 'success';
+  if (result === 'failed') return 'error';
+  if (result === 'skipped') return 'warning';
+  return 'default';
+}
+
+// The steps of a run. A service older than the card sends none, so a missing list is an empty one.
+export const stepsOf = (run: RunView): RunStep[] => run.steps ?? [];
+
+// How long after `from` the moment `to` is: "0 s", "14 s", "1 min 5 s". Nothing for a time that cannot be read.
+export function elapsedText(from: string, to: string | number): string {
+  const start = Date.parse(from);
+  const end = typeof to === 'number' ? to : Date.parse(to);
+  if (Number.isNaN(start) || Number.isNaN(end)) return '';
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+}
+
+// What a run that is going is doing right now: its newest step, and how long since the rep asked.
+export function liveText(run: RunView, nowMs: number): string {
+  const steps = stepsOf(run);
+  const doing = steps.length > 0 ? steps[steps.length - 1].text.replace(/\.$/, '') : run.status === 'queued' ? 'Waiting for the service to pick this up' : 'Working on it';
+  const took = elapsedText(run.createdAt, nowMs);
+  return took ? `${doing} · ${took}` : doing;
+}
+
+// The heading over a run's steps: how many there are and, once it has finished, how long it took.
+export function stepsTitle(run: RunView): string {
+  const count = stepsOf(run).length;
+  const steps = `${count} ${count === 1 ? 'step' : 'steps'}`;
+  if (runIsOpen(run)) return `What is happening (${steps} so far)`;
+  const took = run.finishedAt ? elapsedText(run.createdAt, run.finishedAt) : '';
+  return `What happened (${took ? `${steps}, ${took}` : steps})`;
 }

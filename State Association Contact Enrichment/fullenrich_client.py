@@ -50,6 +50,8 @@ import time
 import uuid
 
 import requests
+
+import run_trail
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -79,6 +81,11 @@ _credits_cache: dict = {}           # "checked" -> (monotonic time, balance or N
 _credits_lock = threading.Lock()
 
 _sleep = time.sleep                 # replaced in tests so waits are recorded, not slept
+
+
+def _people(count: int) -> str:
+    """A count of people in words, for the trail of a run: "no one", "1 person", "3 people"."""
+    return "no one" if count == 0 else "1 person" if count == 1 else f"{count} people"
 
 
 def _build_session() -> requests.Session:
@@ -183,7 +190,10 @@ def _credits_exhausted(api_key: str) -> bool:
             balance,
             extra={"json_fields": {"alert": "fullenrich_credits_exhausted", "balance": balance}},
         )
+        run_trail.note("fullenrich", f"FullEnrich has no credits left ({balance:g}), so lookups are stopped.", "failed")
         return True
+    if balance is not None:
+        run_trail.note("fullenrich", f"FullEnrich credits left: {balance:,.0f}")
     return False
 
 def search_unavailable_reason() -> "str | None":
@@ -193,6 +203,7 @@ def search_unavailable_reason() -> "str | None":
     """
     api_key = os.getenv("FULLENRICH_API_KEY", "").strip()
     if not api_key:
+        run_trail.note("fullenrich", "FullEnrich is not set up on the service, so no search was made.", "skipped")
         return "FullEnrich is not set up on the service, so people cannot be searched for."
     if _credits_exhausted(api_key):
         return "FullEnrich has no credits left, so people cannot be searched for."
@@ -365,9 +376,11 @@ def _search_one_title(
     if domain:
         payload["current_company_domains"] = [{"value": domain, "exact_match": True}]
         identifier = domain
+        where = f"at {domain}"
     else:
         payload["current_company_names"] = [{"value": company_name, "exact_match": False}]
         identifier = company_name
+        where = f'at "{company_name}" (by company name)'
 
     try:
         resp = _post_waiting_out_rate_limit(_SEARCH_URL, payload, api_key)
@@ -378,12 +391,16 @@ def _search_one_title(
             "FullEnrich search failed (identifier=%r, title=%r): %s",
             identifier, title, exc,
         )
+        # A search that could not be done is not one that found no one: the trail says which.
+        run_trail.note("fullenrich", f'Search for "{title}" {where} failed: {run_trail.why(exc)}.', "failed")
         return []
 
     people = data.get("people") or []
     if not isinstance(people, list):
         logger.debug("FullEnrich unexpected response shape: %s", list(data.keys()))
+        run_trail.note("fullenrich", f'Search for "{title}" {where} failed: FullEnrich sent back something unreadable.', "failed")
         return []
+    run_trail.note("fullenrich", f'Searched FullEnrich for "{title}" {where}: {_people(len(people))}.', "ok" if people else "empty")
     return people
 
 
@@ -469,6 +486,7 @@ def _best_candidate(
     """
     if not people:
         return None
+    place = ", ".join(part for part in (city, state) if part) or "the facility"
 
     # Filter out tech/IT roles before scoring
     eligible = []
@@ -487,6 +505,7 @@ def _best_candidate(
             "FullEnrich: all candidates for %r/title=%r were tech roles — skipping",
             identifier, title_filter,
         )
+        run_trail.note("fullenrich", f'All {len(people)} people for "{title_filter}" were IT roles, so none were used.', "empty")
         return None
 
     scored = [(p, _location_score(p, city, state)) for p in eligible]
@@ -504,12 +523,16 @@ def _best_candidate(
             "facility is %r, %r — rejecting to avoid wrong-facility match",
             identifier, title_filter, contact["full_name"], score_label, city, state,
         )
+        reason = f"is listed in another state than {place}" if best_score < 0 else f"has no location on their profile, so they cannot be tied to {place}"
+        run_trail.note("fullenrich", f'The best match for "{title_filter}" {reason}; not used.', "empty")
         return None
 
     logger.info(
         "FullEnrich found: %r (%r) at %r via title=%r [location match: %s]",
         contact["full_name"], contact["title"], identifier, title_filter, score_label,
     )
+    where_matched = {2: "city and state match", 1: "state matches", 0: "no location given"}.get(best_score, "location unclear")
+    run_trail.note("fullenrich", f'Kept the best match for "{title_filter}" ({where_matched}).', "ok")
     if best_score == 0 and len(eligible) > 1 and (city or state):
         logger.warning(
             "FullEnrich name search for %r matched %d candidate(s) but none had "
@@ -569,6 +592,7 @@ def search_facility_contacts(
     api_key = os.getenv("FULLENRICH_API_KEY", "").strip()
     if not api_key:
         logger.debug("FULLENRICH_API_KEY not set — skipping FullEnrich search")
+        run_trail.note("fullenrich", "FullEnrich is not set up on the service, so no search was made.", "skipped")
         return []
 
     if not titles or (not company_name and not domain):
@@ -633,6 +657,7 @@ def search_facility_contacts(
                     "none matched target location (%s, %s) — retrying by company name",
                     bare_domain, title_filter, len(raw_people), city, state,
                 )
+                run_trail.note("fullenrich", "Trying the company name instead of the website.")
                 raw_people = _search_one_title(
                     api_key=api_key, title=title_filter,
                     company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
@@ -646,6 +671,7 @@ def search_facility_contacts(
                     "FullEnrich domain search empty for %r/%r — retrying by company name",
                     bare_domain, title_filter,
                 )
+                run_trail.note("fullenrich", "Found no one by website. Trying the company name instead.")
                 raw_people = _search_one_title(
                     api_key=api_key, title=title_filter,
                     company_name=company_name, limit=_NAME_LIMIT, seniority_levels=seniority,
@@ -791,6 +817,7 @@ def enrich_contact_info(
     api_key = os.getenv("FULLENRICH_API_KEY", "").strip()
     if not api_key:
         logger.debug("FULLENRICH_API_KEY not set — skipping FullEnrich enrich")
+        run_trail.note("fullenrich", "FullEnrich is not set up on the service, so no lookup was made.", "skipped")
         return _empty
 
     if not firstname or not lastname:
@@ -816,6 +843,8 @@ def enrich_contact_info(
 
     # Job name must be unique enough to avoid collisions on concurrent runs
     job_name = f"revops-{firstname.lower()}-{lastname.lower()}-{uuid.uuid4().hex[:8]}"
+    basis = f"at {bare_domain}" if bare_domain else f'at "{company_name}" (by company name)' if company_name else "by name alone"
+    run_trail.note("fullenrich", f"Asked FullEnrich for a work email {basis}{', with the LinkedIn profile' if linkedin_url else ''}.")
 
     try:
         resp = _post_waiting_out_rate_limit(
@@ -828,6 +857,7 @@ def enrich_contact_info(
             "FullEnrich enrich POST failed (%r at %r): %s",
             f"{firstname} {lastname}", identifier, exc,
         )
+        run_trail.note("fullenrich", f"The FullEnrich lookup request failed: {run_trail.why(exc)}.", "failed")
         return _empty
 
     enrichment_id = data.get("enrichment_id") or data.get("id")
@@ -835,9 +865,11 @@ def enrich_contact_info(
         logger.warning(
             "FullEnrich enrich: no id in response keys: %s", list(data.keys())
         )
+        run_trail.note("fullenrich", "FullEnrich accepted the request but gave no job id.", "failed")
         return _empty
 
     poll_url = f"{_ENRICH_URL}/{enrichment_id}"
+    run_trail.note("fullenrich", "Waiting for FullEnrich to finish the lookup (usually under a minute).")
     attempt = 0
     rate_limit_waited = 0.0
     while attempt < _POLL_MAX:
@@ -859,11 +891,13 @@ def enrich_contact_info(
                         "It is already paid for: its result can be read back with this id.",
                         enrichment_id, rate_limit_waited - wait,
                     )
+                    run_trail.note("fullenrich", f"FullEnrich is still rate limited after {rate_limit_waited - wait:.0f} s, so the wait was given up. The lookup is already paid for.", "failed")
                     return _empty
                 logger.warning(
                     "FullEnrich enrich poll rate limited (id=%r): waiting %.0fs, the job is already paid for",
                     enrichment_id, wait,
                 )
+                run_trail.note("fullenrich", f"FullEnrich rate limited the status check; waiting {wait:.0f} s. The lookup is already paid for.")
                 _sleep(wait)
                 continue
             poll_resp.raise_for_status()
@@ -889,15 +923,22 @@ def enrich_contact_info(
                 f"{firstname} {lastname}", identifier,
                 result["email"], result["email_status"], result["phone"],
             )
+            if result["email"]:
+                status_word = f" ({result['email_status'].lower().replace('_', ' ')})" if result["email_status"] else ""
+                run_trail.note("fullenrich", f"FullEnrich found a work email{status_word}.", "ok")
+            else:
+                run_trail.note("fullenrich", "FullEnrich finished and found no work email.", "empty")
             return result
         if status in ("ERROR", "FAILED", "CANCELLED"):
             logger.warning(
                 "FullEnrich enrich job %r ended with status=%r", enrichment_id, status
             )
+            run_trail.note("fullenrich", f"FullEnrich ended the lookup with status {status}.", "failed")
             return _empty
 
     logger.warning(
         "FullEnrich enrich job %r timed out after %ds",
         enrichment_id, _POLL_MAX * _POLL_INTERVAL,
     )
+    run_trail.note("fullenrich", f"FullEnrich had not finished after {_POLL_MAX * _POLL_INTERVAL} s. The lookup may still complete on their side.", "failed")
     return _empty

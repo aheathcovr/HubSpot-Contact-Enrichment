@@ -153,6 +153,56 @@ def test_the_contact_card_reads_the_run_fields_the_service_sends():
     assert set(re.findall(r"^\s+(\w+)\??:", declared, re.M)) == set(sent)
 
 
+def test_both_cards_ask_again_at_the_shared_pace_and_for_the_shared_patience_unless_told_otherwise():
+    """The pace and the patience are one pair of constants; each card must take its defaults from them, not carry its own."""
+    model = _card_source("contact-model.ts")
+    assert re.search(r"export const RUN_POLL_EVERY_MS = 2000;", model) and re.search(r"export const RUN_MAX_POLLS = 90;", model)
+    assert re.search(r"pollEveryMs = RUN_POLL_EVERY_MS, maxPolls = RUN_MAX_POLLS,", _card_source("ContactCheckView.tsx"))
+    assert re.search(r"runPollEveryMs = RUN_POLL_EVERY_MS, runMaxPolls = RUN_MAX_POLLS,", _card_source("EnrichmentView.tsx"))
+
+
+def test_the_card_reads_the_step_fields_the_service_sends():
+    import app_run_store
+
+    declared = re.search(r"export interface RunStep \{(.*?)\n\}", _card_source("contact-model.ts"), re.S).group(1)
+
+    assert set(re.findall(r"^\s+(\w+)\??:", declared, re.M)) == set(app_run_store.STEP_FIELDS)
+
+
+def test_the_card_knows_every_result_a_step_can_have():
+    import run_trail
+
+    declared = re.search(r"export type StepResult = ([^;]+);", _card_source("contact-model.ts")).group(1)
+    colours = set(re.findall(r"result === '(\w+)'", re.search(r"export function stepVariant.*?\n\}", _card_source("contact-model.ts"), re.S).group(0)))
+
+    assert set(re.findall(r"'(\w+)'", declared)) == set(run_trail.RESULTS)
+    assert colours <= set(run_trail.RESULTS)
+
+
+def test_the_card_names_every_vendor_a_step_can_be_about():
+    import run_trail
+
+    labels = re.search(r"VENDOR_LABELS[^=]*= \{(.*?)\};", _card_source("contact-model.ts"), re.S).group(1)
+
+    assert set(re.findall(r"^\s+(\w+):\s*'", labels, re.M)) == set(run_trail.VENDORS)
+
+
+def test_every_step_the_service_can_write_is_a_run_view_the_card_can_show():
+    import app_run_store
+    import run_trail
+    from datetime import datetime, timezone
+
+    steps = []
+    with run_trail.recording(steps.append):
+        for vendor in run_trail.VENDORS:
+            for result in run_trail.RESULTS:
+                run_trail.note(vendor, "x", result)
+    shown = app_run_store.run_view({"run_id": "r", "contact_id": "1", "objective": "find_email", "status": "running",
+                                    "created_at": datetime(2026, 10, 26, tzinfo=timezone.utc), "steps": steps[: run_trail.STEP_CAP]})
+
+    assert all(set(step) == set(app_run_store.STEP_FIELDS) for step in shown["steps"])
+
+
 def test_the_contact_card_knows_the_run_statuses_the_service_writes():
     declared = re.search(r"status: ([^;]+);", re.search(r"export interface RunView \{(.*?)\n\}", _card_source("contact-model.ts"), re.S).group(1)).group(1)
     card = set(re.findall(r"'([^']+)'", declared))

@@ -25,6 +25,7 @@ from typing import Optional
 
 import config
 from contact_objectives import Outcome, company_kind
+import run_trail
 from fullenrich_client import search_facility_contacts, search_unavailable_reason
 from hubspot_client import HubSpotError
 
@@ -131,13 +132,20 @@ def find_candidates(hs, company_id: str, props: dict, kind: str, titles: list[st
 
 def run_find_by_title(run: dict, *, hs, store, now) -> Outcome:
     """Search for the run's titles at its company and keep what is found for the rep to choose from. Never raises."""
+    trouble = 0
     try:
         reason = search_unavailable_reason()
         if reason:
             return Outcome("failed", "error", reason)
         company_id = run["company_id"]
         props = hs.get_company_properties(company_id)
-        found = find_candidates(hs, company_id, props, _kind(props), run.get("titles") or [])
+        titles = run.get("titles") or []
+        run_trail.note("service", f"Searching FullEnrich for {len(titles)} title{'' if len(titles) == 1 else 's'} at {props.get('name') or 'the company'}: {', '.join(titles)}.")
+        found = find_candidates(hs, company_id, props, _kind(props), titles)
+        trouble = run_trail.failures("fullenrich")
+        if not found and trouble:
+            # A search that could not be done is not a finding that no one is there, and nothing is kept for the rep to choose from.
+            return Outcome("failed", "error", "FullEnrich could not be searched, so this is not a finding that no one is there: see What happened. Try again later.")
         store.save_candidates(run["run_id"], company_id, found, now)
     except Exception:
         logger.exception("The title search %s failed", run.get("run_id"))
@@ -145,7 +153,8 @@ def run_find_by_title(run: dict, *, hs, store, now) -> Outcome:
     if not found:
         return Outcome("done", "not_found", "No one found for these titles at this company.")
     count = f"{len(found)} person" if len(found) == 1 else f"{len(found)} people"
-    return Outcome("done", "found", f"Found {count}. Choose who to add.")
+    partial = " Part of the search could not be done: see What happened." if trouble else ""
+    return Outcome("done", "found", f"Found {count}. Choose who to add.{partial}")
 
 
 def _kind(props: dict) -> str:
@@ -200,6 +209,7 @@ def run_add_candidate(run: dict, *, hs, store) -> Outcome:
             related_company_ids=tuple(x for x in (company_id, parent_id) if x),
         )
         outcome = _outcome_of(action, _name_of(hs, target))
+        run_trail.note("hubspot", outcome.message, {"found": "ok", "not_found": "empty"}.get(outcome.outcome, "failed" if outcome.status == "failed" else "info"))
         if outcome.contact_id:
             started = store.get_run(run["source_run_id"]) or {}
             requested_by = run.get("requested_by") or f"HubSpot user {run.get('requested_by_id', '')}"

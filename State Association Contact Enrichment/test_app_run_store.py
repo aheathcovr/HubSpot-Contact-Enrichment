@@ -16,6 +16,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from google.cloud.firestore_v1.transforms import ArrayUnion
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,7 +54,13 @@ class _Doc:
     def update(self, fields):
         if self.id not in self._docs:
             raise KeyError(self.id)
-        self._docs[self.id].update(fields)
+        for key, value in fields.items():
+            if isinstance(value, ArrayUnion):
+                # Firestore appends the values the array does not hold yet, in order, as one atomic write.
+                held = self._docs[self.id].setdefault(key, [])
+                held.extend(v for v in value.values if v not in held)
+            else:
+                self._docs[self.id][key] = value
 
 
 class _Query:
@@ -390,7 +397,115 @@ def test_a_run_is_shown_to_the_card_with_camel_case_names_and_text_dates():
         "runId": "r1", "contactId": "42", "objective": "find_email", "status": "done", "outcome": "found",
         "message": "Mobile number added.", "wrote": ["mobilephone"], "requestedBy": "rep@example.org",
         "createdAt": "2026-10-26T16:00:00Z", "finishedAt": "2026-10-26T16:00:09Z", "companyId": None, "batchId": None,
+        "steps": [],
     }
+
+
+# ── The trail of what a run did ───────────────────────────────────────────────
+
+def _step(n, text=None, **over):
+    return {"at": f"2026-10-26T16:00:0{n}.000Z", "vendor": "fullenrich", "result": "ok", "text": text or f"step {n}", **over}
+
+
+def test_a_new_run_has_no_steps(store):
+    store.create_run(_run())
+
+    assert store.get_run("r1")["steps"] == []
+
+
+def test_steps_are_kept_in_the_order_they_were_added(store):
+    store.create_run(_run())
+
+    for n in (1, 2, 3):
+        store.append_step("r1", _step(n))
+
+    assert [s["text"] for s in store.get_run("r1")["steps"]] == ["step 1", "step 2", "step 3"]
+
+
+def test_a_step_keeps_all_four_of_its_fields(store):
+    store.create_run(_run())
+    store.append_step("r1", _step(1, vendor="seamless", result="empty"))
+
+    assert store.get_run("r1")["steps"] == [{"at": "2026-10-26T16:00:01.000Z", "vendor": "seamless", "result": "empty", "text": "step 1"}]
+
+
+def test_adding_a_step_leaves_the_rest_of_the_run_alone(store):
+    store.create_run(_run())
+    store.claim_run("r1", T0)
+
+    store.append_step("r1", _step(1))
+
+    got = store.get_run("r1")
+    assert got["status"] == "running" and got["contact_id"] == "42" and got["started_at"] == T0
+
+
+def test_steps_survive_the_run_being_claimed_and_finished(store):
+    store.create_run(_run())
+    store.append_step("r1", _step(1))
+    store.claim_run("r1", T0)
+    store.append_step("r1", _step(2))
+
+    store.finish_run("r1", T0 + timedelta(seconds=5), status="done", outcome="found", message="ok", wrote=[])
+
+    got = store.get_run("r1")
+    assert [s["text"] for s in got["steps"]] == ["step 1", "step 2"] and got["status"] == "done"
+
+
+def test_each_run_keeps_its_own_steps(store):
+    store.create_run(_run("r1"))
+    store.create_run(_run("r2", contact="43"))
+
+    store.append_step("r1", _step(1, "only the first"))
+    store.append_step("r2", _step(2, "only the second"))
+
+    assert [s["text"] for s in store.get_run("r1")["steps"]] == ["only the first"]
+    assert [s["text"] for s in store.get_run("r2")["steps"]] == ["only the second"]
+
+
+def test_a_run_read_earlier_does_not_change_when_a_step_is_added_later():
+    """In memory the stored run and a copy handed out must not share their list of steps (Firestore hands out fresh data)."""
+    store = rs.MemoryRunStore()
+    store.create_run(_run())
+    store.append_step("r1", _step(1))
+
+    held = store.get_run("r1")
+    listed = store.recent_runs("42")[0]
+    for_company = store.runs_for_company("500")
+    store.append_step("r1", _step(2))
+
+    assert [s["text"] for s in held["steps"]] == ["step 1"]
+    assert [s["text"] for s in listed["steps"]] == ["step 1"]
+    assert for_company == []
+
+
+def test_a_step_changed_after_it_was_added_does_not_change_the_stored_one():
+    store = rs.MemoryRunStore()
+    store.create_run(_run())
+    step = _step(1)
+
+    store.append_step("r1", step)
+    step["text"] = "changed afterwards"
+
+    assert store.get_run("r1")["steps"][0]["text"] == "step 1"
+
+
+def test_a_run_is_shown_with_its_steps_and_only_their_four_fields():
+    record = _run()
+    record["steps"] = [_step(1, extra="not for the card"), _step(2, vendor="bounceban", result="failed")]
+
+    shown = rs.run_view(record)
+
+    assert shown["steps"] == [
+        {"at": "2026-10-26T16:00:01.000Z", "vendor": "fullenrich", "result": "ok", "text": "step 1"},
+        {"at": "2026-10-26T16:00:02.000Z", "vendor": "bounceban", "result": "failed", "text": "step 2"},
+    ]
+
+
+def test_a_run_made_before_steps_existed_is_shown_with_none():
+    record = _run()
+    assert "steps" not in record
+
+    assert rs.run_view(record)["steps"] == []
 
 
 def test_a_run_started_from_a_company_is_shown_with_its_company_and_batch():

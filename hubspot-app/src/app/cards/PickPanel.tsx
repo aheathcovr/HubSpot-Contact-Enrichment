@@ -5,11 +5,12 @@ import { agoText, objectiveLabel, runIsOpen, runTag } from './contact-model.ts';
 import type { RunView } from './contact-model.ts';
 import { quotaWarning, startButtonText } from './company-model.ts';
 import type { Picker } from './usePicker.ts';
+import { RunDetails } from './RunDetails.tsx';
 
 // The runs shown under the controls. The service sends more; these are the newest.
 const SHOWN_RUNS = 5;
 
-function RunBlock({ run, name, nowMs }: { run: RunView; name: string; nowMs: number }) {
+function RunBlock({ run, name, nowMs, details }: { run: RunView; name: string; nowMs: number; details: boolean }) {
   const tag = runTag(run);
   return (
     <Flex direction="column" gap="flush">
@@ -18,6 +19,7 @@ function RunBlock({ run, name, nowMs }: { run: RunView; name: string; nowMs: num
         <Text format={{ fontWeight: 'bold' }}>{name ? `${name} · ${objectiveLabel(run.objective)}` : objectiveLabel(run.objective)}</Text>
       </Flex>
       {run.message ? <Text>{run.message}</Text> : null}
+      {details ? <RunDetails run={run} nowMs={nowMs} /> : null}
       <Text variant="microcopy">{`Asked by ${run.requestedBy}, ${agoText(run.createdAt, nowMs)}`}</Text>
     </Flex>
   );
@@ -29,9 +31,11 @@ export interface PickPanelProps {
   // (a search by job title, an add that has not made its contact yet) is shown by what it is.
   names: Record<string, string>;
   nowMs: number;
+  // Runs whose steps are shown somewhere else on the card (the search and the adds below), so they are not shown twice.
+  shownElsewhere?: string[];
 }
 
-export function PickPanel({ picker, names, nowMs }: PickPanelProps) {
+export function PickPanel({ picker, names, nowMs, shownElsewhere = [] }: PickPanelProps) {
   const { data, unavailable } = picker;
   if (!data) return unavailable ? <Text>{`Picking contacts is not available: ${unavailable}`}</Text> : null;
 
@@ -63,7 +67,7 @@ export function PickPanel({ picker, names, nowMs }: PickPanelProps) {
         <Flex direction="column" gap="sm">
           <Text format={{ fontWeight: 'bold' }}>Recent runs</Text>
           {runs.slice(0, SHOWN_RUNS).map((r) => (
-            <RunBlock key={r.runId} run={r} name={r.contactId ? (names[r.contactId] ?? `Contact ${r.contactId}`) : ''} nowMs={nowMs} />
+            <RunBlock key={r.runId} run={r} name={r.contactId ? (names[r.contactId] ?? `Contact ${r.contactId}`) : ''} nowMs={nowMs} details={!shownElsewhere.includes(r.runId)} />
           ))}
         </Flex>
       ) : null}

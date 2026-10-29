@@ -6,20 +6,22 @@ import { runTag } from './contact-model.ts';
 import type { RunView } from './contact-model.ts';
 import { addButtonText, quotaWarning, searchButtonText } from './company-model.ts';
 import type { Candidate, CompanyStatus } from './company-model.ts';
+import { RunDetails } from './RunDetails.tsx';
 import { isBeingAdded } from './useTitleSearch.ts';
 import type { TitleSearch } from './useTitleSearch.ts';
 
-function AddedLine({ run }: { run: RunView }) {
+function AddedLine({ run, nowMs }: { run: RunView; nowMs: number }) {
   const tag = runTag(run);
   return (
     <Flex direction="column" gap="flush">
       <Tag variant={tag.variant}>{tag.label}</Tag>
       {run.message ? <Text variant="microcopy">{run.message}</Text> : null}
+      <RunDetails run={run} nowMs={nowMs} />
     </Flex>
   );
 }
 
-function Person({ candidate, ticked, readOnly, onChange }: { candidate: Candidate; ticked: boolean; readOnly: boolean; onChange: (checked: boolean) => void }) {
+function Person({ candidate, ticked, readOnly, nowMs, onChange }: { candidate: Candidate; ticked: boolean; readOnly: boolean; nowMs: number; onChange: (checked: boolean) => void }) {
   return (
     <Flex direction="column" gap="flush">
       <Checkbox name={`cand-${candidate.candidateId}`} checked={ticked} readOnly={readOnly} onChange={(checked) => onChange(checked)}>
@@ -27,7 +29,7 @@ function Person({ candidate, ticked, readOnly, onChange }: { candidate: Candidat
       </Checkbox>
       {candidate.title ? <Text variant="microcopy">{candidate.title}</Text> : null}
       {candidate.linkedContactId ? <Text variant="microcopy">Already a contact here.</Text> : null}
-      {candidate.added ? <AddedLine run={candidate.added} /> : null}
+      {candidate.added ? <AddedLine run={candidate.added} nowMs={nowMs} /> : null}
     </Flex>
   );
 }
@@ -35,9 +37,11 @@ function Person({ candidate, ticked, readOnly, onChange }: { candidate: Candidat
 export interface TitlePanelProps {
   data: CompanyStatus;
   titles: TitleSearch;
+  // The time the card shows how long a run has been going against.
+  nowMs: number;
 }
 
-export function TitlePanel({ data, titles: t }: TitlePanelProps) {
+export function TitlePanel({ data, titles: t, nowMs }: TitlePanelProps) {
   const { quota, limits, titlePresets } = data;
   const tooMany = t.titles.length > limits.maxTitles;
   const search = t.search;
@@ -65,6 +69,7 @@ export function TitlePanel({ data, titles: t }: TitlePanelProps) {
       {t.gone ? <Text>{t.gone}</Text> : null}
       {search && !search.ready ? <Text>{search.run.status === 'failed' ? (search.run.message ?? 'The search did not finish.') : 'Searching for people. This card updates when it finishes.'}</Text> : null}
       {search?.ready && candidates.length === 0 ? <Text>{search.run.message ?? 'No one found for these titles at this company.'}</Text> : null}
+      {search ? <RunDetails run={search.run} nowMs={nowMs} /> : null}
       {candidates.length > 0 ? (
         <Flex direction="column" gap="sm">
           <Text format={{ fontWeight: 'bold' }}>{`Found ${candidates.length} ${candidates.length === 1 ? 'person' : 'people'}`}</Text>
@@ -74,6 +79,7 @@ export function TitlePanel({ data, titles: t }: TitlePanelProps) {
               candidate={c}
               ticked={t.chosen.includes(c.candidateId)}
               readOnly={isBeingAdded(c) || (atLimit && !t.chosen.includes(c.candidateId))}
+              nowMs={nowMs}
               onChange={(checked) => t.toggle(c.candidateId, checked)}
             />
           ))}

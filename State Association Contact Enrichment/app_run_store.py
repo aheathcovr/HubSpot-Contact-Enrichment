@@ -26,6 +26,8 @@ QUOTA_TTL = timedelta(days=2)
 CANDIDATES_TTL = timedelta(days=2)
 # A contact's runs read to find the latest ones. A contact has a handful in 30 days; this is a safety limit.
 _RUNS_READ = 100
+# What a step of a run's trail carries (run_trail.py), and all the card is shown of it.
+STEP_FIELDS = ("at", "vendor", "result", "text")
 
 
 def day_of(moment: datetime) -> str:
@@ -52,16 +54,23 @@ def run_view(record: dict) -> dict:
         "finishedAt": _text(record.get("finished_at")),
         "companyId": record.get("company_id") or None,
         "batchId": record.get("batch_id") or None,
+        "steps": [{key: step[key] for key in STEP_FIELDS if key in step} for step in record.get("steps") or []],
     }
 
 
 def _with_defaults(record: dict) -> dict:
     full = {
         "status": "queued", "outcome": None, "message": None, "wrote": [], "started_at": None, "finished_at": None,
+        "steps": [],
         **record,
     }
     full["expire_at"] = full["created_at"] + RUN_TTL
     return full
+
+
+def _copy_run(run: dict) -> dict:
+    """A run as a caller may keep it: a later step added to the stored run does not appear in what was already read."""
+    return {**run, "steps": [dict(step) for step in run.get("steps") or []]}
 
 
 def _newest_first(rows: list[dict]) -> list[dict]:
@@ -84,7 +93,7 @@ class MemoryRunStore:
     def get_run(self, run_id: str) -> Optional[dict]:
         with self._lock:
             run = self._runs.get(run_id)
-            return dict(run) if run else None
+            return _copy_run(run) if run else None
 
     def claim_run(self, run_id: str, now: datetime) -> bool:
         with self._lock:
@@ -101,6 +110,10 @@ class MemoryRunStore:
         with self._lock:
             self._runs[run_id].update(fields)
 
+    def append_step(self, run_id: str, step: dict) -> None:
+        with self._lock:
+            self._runs[run_id].setdefault("steps", []).append(dict(step))
+
     def save_candidates(self, run_id: str, company_id: str, candidates: list, now: datetime) -> None:
         with self._lock:
             self._candidates[run_id] = {"run_id": run_id, "company_id": company_id, "candidates": list(candidates), "expire_at": now + CANDIDATES_TTL}
@@ -112,12 +125,12 @@ class MemoryRunStore:
 
     def recent_runs(self, contact_id: str, limit: int = 5) -> list[dict]:
         with self._lock:
-            rows = [dict(r) for r in self._runs.values() if r["contact_id"] == contact_id]
+            rows = [_copy_run(r) for r in self._runs.values() if r["contact_id"] == contact_id]
         return _newest_first(rows)[:limit]
 
     def runs_for_company(self, company_id: str, limit: int = 20) -> list[dict]:
         with self._lock:
-            rows = [dict(r) for r in self._runs.values() if r.get("company_id") == company_id]
+            rows = [_copy_run(r) for r in self._runs.values() if r.get("company_id") == company_id]
         return _newest_first(rows)[:limit]
 
     def find_recent_run(self, contact_id: str, objective: str, since: datetime) -> Optional[dict]:
@@ -194,6 +207,11 @@ class FirestoreRunStore:
         if contact_id:
             fields["contact_id"] = contact_id
         self._run_ref(run_id).update(fields)
+
+    def append_step(self, run_id: str, step: dict) -> None:
+        # An array union appends in one atomic write, with no read first, so a step costs one write however long the run is.
+        from google.cloud import firestore
+        self._run_ref(run_id).update({"steps": firestore.ArrayUnion([dict(step)])})
 
     def save_candidates(self, run_id: str, company_id: str, candidates: list, now: datetime) -> None:
         self._db().collection(CANDIDATES_COLLECTION).document(run_id).set(

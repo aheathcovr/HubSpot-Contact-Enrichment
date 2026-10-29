@@ -38,6 +38,7 @@ import time
 
 import requests
 
+import run_trail
 from identity_gate import (
     bare_domain,
     names_share_a_distinctive_word,
@@ -275,6 +276,7 @@ def _request(method: str, path: str, key: str, **kw):
             )
         except Exception as exc:
             logger.warning("Seamless request to %s failed: %s", path, exc)
+            run_trail.note("seamless", f"Seamless could not be reached: {run_trail.why(exc)}.", "failed")
             return None
         _read_credits(resp)
         code = resp.status_code
@@ -283,18 +285,24 @@ def _request(method: str, path: str, key: str, **kw):
                 return resp.json()
             except Exception as exc:
                 logger.warning("Seamless returned unreadable JSON from %s: %s", path, exc)
+                run_trail.note("seamless", "Seamless sent back something unreadable.", "failed")
                 return None
         if code in (401, 403):
             _stop(f"{code} from {path}: bad or unauthorised key", status=code)
+            run_trail.note("seamless", f"Seamless rejected the key ({run_trail.http_words(code)}); lookups are paused for {_STOP_FOR_S // 60} minutes.", "failed")
             return None
         if code == 422 and "insufficientcredits" in (resp.text or "").lower():
             _stop("out of credits", status=code)
+            run_trail.note("seamless", f"Seamless is out of credits; lookups are paused for {_STOP_FOR_S // 60} minutes.", "failed")
             return None
         if code == 429 and limited < _RATE_LIMIT_RETRIES:
             limited += 1       # not processed, so repeating a submit is safe
-            _sleep(_reset_wait(resp))
+            wait = _reset_wait(resp)
+            run_trail.note("seamless", f"Seamless rate limited the request; waiting {wait:.0f} s.")
+            _sleep(wait)
             continue
         logger.warning("Seamless returned %d from %s: %s", code, path, (resp.text or "")[:200])
+        run_trail.note("seamless", f"Seamless answered {run_trail.http_words(code)}.", "failed")
         return None
 
 
@@ -313,6 +321,7 @@ def _poll(request_ids: list, key: str):
                 return row["contact"]
             if status == _OUT_OF_CREDITS:
                 _stop("out of credits", status=status)
+                run_trail.note("seamless", f"Seamless is out of credits; lookups are paused for {_STOP_FOR_S // 60} minutes.", "failed")
                 return None
             if status in ("duplicate", "contact-already-researched"):
                 # Researched before: the record lives under the request id this stub names.
@@ -322,9 +331,11 @@ def _poll(request_ids: list, key: str):
                     pending.append(original)
                     continue
                 logger.info("Seamless already researched this person and names no request to read it from")
+                run_trail.note("seamless", "Seamless already researched this person but gave no record to read.", "empty")
                 return None
             if status in _TERMINAL:
                 logger.info("Seamless research %s ended with status %r: nothing to take", row.get("requestId", ""), status)
+                run_trail.note("seamless", f"Seamless ended the research with status {status}; nothing to use.", "empty")
                 return None
         _sleep(_POLL_INTERVAL_S)
         waited += _POLL_INTERVAL_S
@@ -332,6 +343,7 @@ def _poll(request_ids: list, key: str):
         "Seamless research %s was not finished after %.0fs. The credit is spent; it is not resubmitted.",
         ",".join(request_ids), _POLL_TIMEOUT_S,
     )
+    run_trail.note("seamless", f"Seamless had not finished after {_POLL_TIMEOUT_S:.0f} s. The credit is spent; it is not asked again.", "failed")
     return None
 
 
@@ -363,23 +375,32 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
     key = os.getenv("SEAMLESS_API_KEY", "").strip()
     first, last = (first or "").strip(), (last or "").strip()
     domain = bare_domain(domain)
-    if not key or not first or not last or not (domain or company):
+    if not key:
+        run_trail.note("seamless", "Seamless is not set up on the service, so it was not asked.", "skipped")
+        return None
+    if not first or not last or not (domain or company):
+        run_trail.note("seamless", "Seamless was not asked: it needs a name and the facility's website or name.", "skipped")
         return None
 
     now = time.monotonic()
     where = domain or company.strip().lower()
     with _lock:
-        if now < _stopped_until:
-            return None
-        cached = _answers.get((first.lower(), last.lower(), where))
-        if cached and now - cached[0] < _ANSWER_TTL_S:
-            return cached[1]
+        paused = now < _stopped_until
+        cached = None if paused else _answers.get((first.lower(), last.lower(), where))
+        remembered = bool(cached and now - cached[0] < _ANSWER_TTL_S)
         credits = _credits
         warn = credits is not None and credits < _MIN_CREDITS and (
             _last_low_credits_warning is None or now - _last_low_credits_warning >= _WARNING_INTERVAL_S)
-        if warn:
+        if warn and not paused and not remembered:
             _last_low_credits_warning = now
+    if paused:
+        run_trail.note("seamless", "Seamless is paused for a while after an earlier problem, so it was not asked.", "skipped")
+        return None
+    if remembered:
+        run_trail.note("seamless", "Used Seamless's answer from earlier today.")
+        return cached[1]
     if credits is not None and credits < _MIN_CREDITS:
+        run_trail.note("seamless", f"Seamless has {credits} credits left, below its floor of {_MIN_CREDITS}, so it was not asked.", "skipped")
         if warn:
             logger.warning(
                 "Seamless has %d credits left (floor %d): lookups are skipped", credits, _MIN_CREDITS,
@@ -389,12 +410,18 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
 
     target = {"contactName": f"{first} {last}"}
     target.update({"domain": domain} if domain else {"companyName": company})
+    run_trail.note("seamless", f"Asked Seamless to research the person at {where}.")
     submitted = _request("POST", _RESEARCH, key, json={"contacts": [target]})
     if submitted is None:
         return None
+    with _lock:
+        left = _credits
+    if left is not None:
+        run_trail.note("seamless", f"Seamless credits left: {left:,}")
     ids = submitted.get("requestIds") or submitted.get("data") or []
     if not ids or not isinstance(ids, list):
         logger.warning("Seamless accepted the request but returned no request id")
+        run_trail.note("seamless", "Seamless accepted the request but gave no request id.", "failed")
         return None
 
     contact = _poll([str(i) for i in ids], key)
@@ -406,6 +433,7 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
             "Seamless returned a different person (%s %s) for %s %s; nothing used",
             contact.get("firstName", ""), contact.get("lastName", ""), first, last,
         )
+        run_trail.note("seamless", "Seamless returned a different person than the one asked about, so nothing was used.", "empty")
         return None
 
     same_org = _same_organisation(contact, domain, company, operator_name)
@@ -426,6 +454,7 @@ def lookup_person(first: str, last: str, *, domain: str = "", company: str = "",
         answer = {**base, "phone": "", "phone_type": "", "phone_confidence": None, "phone_rejected": reason,
                   "email": "", "email_confidence": None, "email_rejected": reason}
     logger.info("Seamless: %s %s: %s", first, last, _describe(answer))
+    run_trail.note("seamless", f"Seamless: {_describe(answer)}.", "ok" if answer.get("phone") or answer.get("email") else "empty")
     with _lock:
         _answers[(first.lower(), last.lower(), where)] = (now, answer)
     return answer

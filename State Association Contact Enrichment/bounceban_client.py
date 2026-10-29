@@ -44,6 +44,8 @@ import time
 
 import requests
 
+import run_trail
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_WATERFALL_URL = "https://api-waterfall.bounceban.com/v1/verify/single"
@@ -111,6 +113,7 @@ def _ask(address: str, key: str):
             )
         except Exception as exc:
             logger.warning("BounceBan request failed for %r: %s", address, exc)
+            run_trail.note("bounceban", f"BounceBan could not be reached: {run_trail.why(exc)}.", "failed")
             return None
         code = resp.status_code
         if code == 200:
@@ -118,6 +121,7 @@ def _ask(address: str, key: str):
                 return resp.json()
             except Exception as exc:
                 logger.warning("BounceBan returned unreadable JSON for %r: %s", address, exc)
+                run_trail.note("bounceban", "BounceBan sent back something unreadable.", "failed")
                 return None
         if code in _STOP_STATUSES:
             with _lock:
@@ -127,17 +131,23 @@ def _ask(address: str, key: str):
                 code, _STOP_STATUSES[code], _STOP_FOR_S // 60,
                 extra={"json_fields": {"alert": "bounceban_unavailable", "status": code}},
             )
+            run_trail.note("bounceban", f"BounceBan is unavailable ({_STOP_STATUSES[code]}, HTTP {code}); second opinions are paused for {_STOP_FOR_S // 60} minutes.", "failed")
             return None
         if code == 408:
             asked += 1          # slow check; the retry inside the 30-minute window is free
+            run_trail.note("bounceban", "BounceBan's check was slow to answer (HTTP 408).")
             continue
         if code == 429 and limited < _RATE_LIMIT_RETRIES:
             limited += 1
-            _sleep(float(min(2 ** limited, 30)))
+            wait = float(min(2 ** limited, 30))
+            run_trail.note("bounceban", f"BounceBan rate limited the request; waiting {wait:.0f} s.")
+            _sleep(wait)
             continue
         logger.warning("BounceBan returned %d for %r", code, address)
+        run_trail.note("bounceban", f"BounceBan answered {run_trail.http_words(code)}.", "failed")
         return None
     logger.info("BounceBan did not finish checking %r in time", address)
+    run_trail.note("bounceban", "BounceBan did not finish the check in time.", "failed")
     return None
 
 
@@ -168,17 +178,23 @@ def second_opinion(email: str):
     key, no usable answer, or the service is unavailable.
     """
     key = os.getenv("BOUNCEBAN_API_KEY", "").strip()
-    if not key or not email or "@" not in email:
+    if not key:
+        run_trail.note("bounceban", "BounceBan is not set up on the service, so there is no second opinion.", "skipped")
+        return None
+    if not email or "@" not in email:
         return None
     address = email.strip().lower()
 
     now = time.monotonic()
     with _lock:
-        if now < _stopped_until:
-            return None
-        cached = _answers.get(address)
-        if cached and now - cached[0] < _ANSWER_TTL_S:
-            return cached[1]
+        paused = now < _stopped_until
+        cached = None if paused else _answers.get(address)
+    if paused:
+        run_trail.note("bounceban", "BounceBan is paused after an earlier problem, so there is no second opinion.", "skipped")
+        return None
+    if cached and now - cached[0] < _ANSWER_TTL_S:
+        run_trail.note("bounceban", "Used BounceBan's answer from earlier today.")
+        return cached[1]
 
     row = _ask(address, key)
     if row is None:
@@ -189,6 +205,15 @@ def second_opinion(email: str):
         "score": _score(row),
         "bounceban_result": str(row.get("result") or ""),
     }
+    remaining = row.get("credits_remaining")
+    left = f" {remaining:,.0f} credits left." if isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and remaining >= 0 else ""
+    score = f" (score {answer['score']})" if answer["score"] >= 0 else ""
+    says, settled = {
+        "ok": (f"the address is deliverable{score}", "ok"),
+        "catch_all": (f"deliverable but not guaranteed{score}", "info"),
+        "invalid": ("the address is not deliverable", "ok"),
+    }.get(answer["result"], ("BounceBan could not settle it either", "empty"))
+    run_trail.note("bounceban", (f"BounceBan's second opinion: {says}." if settled != "empty" else f"{says}.") + left, settled)
     if answer["result"] != "unknown":
         with _lock:
             _answers[address] = (now, answer)

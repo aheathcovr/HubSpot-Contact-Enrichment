@@ -1,10 +1,10 @@
 // Renders the Contact check card with HubSpot's test renderer and a fake service.
 import { useState } from 'react';
 import { describe, expect, it } from 'vitest';
-import { Button, EmptyState, ErrorState, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
+import { Accordion, Button, EmptyState, ErrorState, LoadingSpinner, Tag, Text } from '@hubspot/ui-extensions';
 import { createRenderer } from '@hubspot/ui-extensions/testing';
 import { ContactCheckView } from '../src/app/cards/ContactCheckView.tsx';
-import type { ContactInfo, ContactStatus, ObjectiveView, Quota, RunView, Service, ServiceReply } from '../src/app/cards/contact-model.ts';
+import type { ContactInfo, ContactStatus, ObjectiveView, Quota, RunStep, RunView, Service, ServiceReply } from '../src/app/cards/contact-model.ts';
 
 const NOW = Date.parse('2026-10-26T16:10:00Z');
 const CONTACT_ID = '42';
@@ -21,7 +21,7 @@ const contact = (over: Partial<ContactInfo> = {}): ContactInfo => ({
 
 const run = (over: Partial<RunView> = {}): RunView => ({
   runId: 'a'.repeat(32), contactId: CONTACT_ID, objective: 'find_email', status: 'queued', outcome: null, message: null, wrote: [],
-  requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: null, batchId: null, ...over,
+  requestedBy: 'rep@example.org', createdAt: '2026-10-26T16:09:00Z', finishedAt: null, companyId: null, batchId: null, steps: [], ...over,
 });
 
 const quota = (remaining = 22, cap = 25): Quota => ({ cap, used: cap - remaining, remaining });
@@ -483,5 +483,111 @@ describe('Contact check card: waiting and failing', () => {
     expect(texts(r)).toContain('The Contact check works on contact records.');
     await settle();
     expect(f.calls).toEqual([]);
+  });
+});
+
+
+// ── What a run did, step by step ──────────────────────────────────────────────
+
+const step = (over: Partial<RunStep> = {}): RunStep => ({
+  at: '2026-10-26T16:09:02.000Z', vendor: 'fullenrich', result: 'ok', text: 'Asked FullEnrich for a work email at elmcourt.example.org.', ...over,
+});
+const spinners = (r: Rendered) => r.findAll(LoadingSpinner).map((s) => s.props.label);
+const headings = (r: Rendered) => r.findAll(Accordion).map((a) => [a.props.title, a.props.defaultOpen]);
+const statusWith = (runs: RunView[]) => () => reply(status({ runs }));
+
+describe('Contact check card: what a run did', () => {
+  it('says what a run that is going is doing right now, and for how long, beside a spinner', async () => {
+    const going = run({
+      status: 'running',
+      steps: [step(), step({ at: '2026-10-26T16:09:03.000Z', text: 'Waiting for FullEnrich to finish the lookup (usually under a minute).' })],
+    });
+    const r = setup(fakeService({ status: statusWith([going]) }).service);
+
+    await r.waitFor(() => expect(spinners(r)).toContain('Waiting for FullEnrich to finish the lookup (usually under a minute) · 1 min 0 s'));
+  });
+
+  it('says a run that has done nothing yet is waiting for the service', async () => {
+    const r = setup(fakeService({ status: statusWith([run({ status: 'queued', createdAt: '2026-10-26T16:09:56Z' })]) }).service);
+
+    await r.waitFor(() => expect(spinners(r)).toContain('Waiting for the service to pick this up · 4 s'));
+  });
+
+  it('lists what a run that is going has done, open, each step with its vendor and how long after the start', async () => {
+    const going = run({
+      status: 'running',
+      steps: [step(), step({ at: '2026-10-26T16:09:03.000Z', vendor: 'seamless', result: 'info', text: 'Asked Seamless to research the person at elmcourt.example.org.' })],
+    });
+    const r = setup(fakeService({ status: statusWith([going]) }).service);
+
+    await r.waitFor(() => expect(headings(r)).toEqual([['What is happening (2 steps so far)', true]]));
+    expect(texts(r)).toEqual(expect.arrayContaining(['Asked FullEnrich for a work email at elmcourt.example.org.', 'Asked Seamless to research the person at elmcourt.example.org.', '+2 s', '+3 s']));
+    expect(tags(r)).toEqual(expect.arrayContaining([['FullEnrich', 'success'], ['Seamless', 'default']]));
+  });
+
+  it('keeps the steps of a run that has finished under a heading that is closed, with how many and how long', async () => {
+    const done = run({
+      status: 'done', outcome: 'not_found', message: 'No email found.', finishedAt: '2026-10-26T16:09:09Z',
+      steps: [step(), step({ result: 'empty', text: 'FullEnrich finished and found no work email.' }), step({ vendor: 'seamless', result: 'empty', text: 'Seamless ended the research with status notfound; nothing to use.' })],
+    });
+    const r = setup(fakeService({ status: statusWith([done]) }).service);
+
+    await r.waitFor(() => expect(headings(r)).toEqual([['What happened (3 steps, 9 s)', false]]));
+    expect(spinners(r)).toEqual([]);
+    expect(texts(r)).toContain('FullEnrich finished and found no work email.');
+  });
+
+  it('shows a step that failed in red and a vendor that was not asked in amber, so "nothing found" is not misread', async () => {
+    const done = run({
+      status: 'failed', outcome: 'error', message: 'FullEnrich and Seamless could not be asked, so nothing was looked up. See What happened. Try again later.', finishedAt: '2026-10-26T16:09:04Z',
+      steps: [
+        step({ result: 'failed', text: 'The FullEnrich lookup request failed: HTTP 503 (the vendor had a problem).' }),
+        step({ vendor: 'seamless', result: 'skipped', text: 'Seamless is paused for a while after an earlier problem, so it was not asked.' }),
+      ],
+    });
+    const r = setup(fakeService({ status: statusWith([done]) }).service);
+
+    await r.waitFor(() => expect(tags(r)).toEqual(expect.arrayContaining([['Failed', 'error'], ['FullEnrich', 'error'], ['Seamless', 'warning']])));
+  });
+
+  it('shows no steps heading for a run that has none', async () => {
+    const r = setup(fakeService({ status: statusWith([run({ status: 'done', outcome: 'found', message: 'Email added.', finishedAt: '2026-10-26T16:09:09Z' })]) }).service);
+
+    await r.waitFor(() => expect(texts(r)).toContain('Email added.'));
+    expect(headings(r)).toEqual([]);
+    expect(spinners(r)).toEqual([]);
+  });
+
+  it('shows each new step as the card asks again, and stops the spinner when the run is done', async () => {
+    const one = [step()];
+    const two = [...one, step({ at: '2026-10-26T16:09:04.000Z', vendor: 'millionverifier', text: 'MillionVerifier says the address is deliverable.' })];
+    const f = fakeService({
+      status: (n) => {
+        if (n === 1) return reply(status({ runs: [run({ status: 'running', steps: one })] }));
+        if (n === 2) return reply(status({ runs: [run({ status: 'running', steps: two })] }));
+        return reply(status({ runs: [run({ status: 'done', outcome: 'found', message: 'Email added.', finishedAt: '2026-10-26T16:09:09Z', steps: two })] }));
+      },
+    });
+    const r = setup(f.service, { pollEveryMs: 15 });
+
+    await r.waitFor(() => expect(headings(r)).toEqual([['What is happening (1 step so far)', true]]));
+    expect(texts(r)).not.toContain('MillionVerifier says the address is deliverable.');
+    await r.waitFor(() => expect(texts(r)).toContain('MillionVerifier says the address is deliverable.'));
+    await r.waitFor(() => expect(spinners(r)).toEqual([]));
+    expect(texts(r)).toContain('Email added.');
+    expect(headings(r)[0][0]).toBe('What happened (2 steps, 9 s)');
+  });
+
+  it('asks again every two seconds by default while a run is going', async () => {
+    const f = fakeService({ status: () => reply(status({ runs: [run({ status: 'running' })] })) });
+    const r = createRenderer('crm.record.sidebar');
+    r.mocks.context.crm.objectId = Number(CONTACT_ID);
+    r.mocks.context.crm.objectTypeId = '0-1';
+    r.render(<ContactCheckView context={r.mocks.context} actions={r.mocks.actions} service={f.service} now={() => NOW} />);
+
+    await r.waitFor(() => expect(f.calls).toHaveLength(1));
+    await settle(1000);
+    expect(f.calls).toHaveLength(1);
+    await r.waitFor(() => expect(f.calls.length).toBeGreaterThanOrEqual(2), { timeoutInMs: 2500 });
   });
 });
